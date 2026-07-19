@@ -121,3 +121,37 @@ Router以降は共有します。
 Hook設定は`$TACHIKOMA_NOTIFY_TOKEN`を`allowedEnvVars`経由で参照します。
 
 Permission relay、声による承認、Claude CodeへのYes/No送信は未実装です。
+
+## Step 2.1: approval internal models
+
+`approvals.py` adds provider-neutral `ApprovalRequest` and
+`ApprovalDecision` models without adding a Hook transport or permission
+relay. The models are frozen dataclasses with strict JSON round-tripping,
+UUID4 identifiers for approval and decision records, UTC ISO-8601 timestamps, bounded safe summaries, and
+fail-closed enum and field validation.
+
+`ApprovalStatus` exposes pending, announcement, confirmation, terminal, and
+relay-failure states. `ApprovalRequest.transition_to()` enforces the allowed
+state graph, while `expire_if_needed()` uses an injected UTC time for
+deterministic timeout checks. Initial choices are only `approve_once` and
+`reject`; persistent or session-wide approval is intentionally absent.
+
+`safe_summary` is normalized and limited to 240 characters. This keeps voice
+prompts and future relay payloads short while preventing accidental retention
+of a whole command, file body, or conversation.
+
+`make_approval_dedupe_key()` hashes source, session, action, tool, and the
+normalized safe summary. It never uses `approval_id` or an event ID.
+`DecisionReplayGuard` is an in-memory one-shot guard for a future relay; it
+stores only opaque IDs and does not persist requests.
+
+Metadata is recursively bounded and removes sensitive keys such as tokens,
+authorization headers, transcript paths, tool input, commands, and file
+contents. Non-finite numbers and non-JSON metadata values are rejected. Raw
+Hook JSON, transcripts, commands, and credentials are not accepted as model
+data. Unknown JSON fields are rejected to avoid silently accepting a future
+permission-control field.
+
+Step 2.1 does not modify `settings.json`, `install_hooks.ps1`, the existing
+HTTP API, `TachikomaEvent`, Claude adapters, voice input, StackChan, or any
+permission result transport.
