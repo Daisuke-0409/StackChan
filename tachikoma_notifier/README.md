@@ -180,3 +180,141 @@ Replay identifiers are bounded to the configured store capacity multiplier.
 All operations are protected by a process-local `RLock`. Internal
 `stored_at`, `updated_at`, and `terminal_at` timestamps are store metadata and
 are not added to `ApprovalRequest` or exposed as Hook data.
+
+`ApprovalRequestStore.advance_status()` was added alongside Step 2.3 to move a
+request through the non-decision relay lifecycle (`announced`,
+`awaiting_confirmation`, `relay_failed`). Decision outcomes (`approved`,
+`rejected`, `cancelled`, `expired`, `invalid`) still only happen through
+`apply_decision`, so every terminal state stays decision-audited.
+`approvals.py`'s transition graph was extended so `relay_failed` is reachable
+from `pending` and `announced`, not only `awaiting_confirmation`, since a
+relay can fail before any confirmation is ever awaited.
+
+## Step 2.3: simulated PermissionRelay
+
+`permission_relay.py` adds `SimulatedPermissionRelay`, which drives one
+`ApprovalRequest` through `submit -> announce -> begin_confirmation ->
+resolve` on top of `ApprovalRequestStore`. It takes two caller-supplied
+callables: an announcer (`ApprovalRequest -> bool`, e.g. a TTS `speak()`) and
+a decision provider (`ApprovalRequest -> ApprovalChoice`) that stands in for a
+future confirmation source.
+
+This is a mock for internal testing, not a production relay: there is no
+voice/microphone input, no StackChan or Even G2 transport, and no Claude Code
+Hook response transport. Nothing here sends a decision back to Claude Code.
+
+Fail-closed behavior:
+
+- An announcer that raises or returns a falsy value marks the request
+  `relay_failed` and the decision provider is never called.
+- A decision provider that raises, or returns anything other than
+  `ApprovalChoice.APPROVE_ONCE` / `ApprovalChoice.REJECT`, resolves to a
+  system-issued `reject` (`ApprovalActor.SYSTEM`), never an implicit approval.
+- `resolve()` always tags its `ApprovalDecision` with
+  `ConfirmationMethod.SIMULATED`, so simulated decisions are distinguishable
+  from a real relay's output in any future audit trail.
+- Expiry, replay, and already-finalized checks are enforced by
+  `ApprovalRequestStore`; `SimulatedPermissionRelay` does not duplicate or
+  weaken them.
+
+Step 2.3 does not implement `approve_session`, "always allow", or any other
+persistent-approval choice, and does not modify `settings.json`,
+`install_hooks.ps1`, the existing HTTP API, `TachikomaEvent`, Claude adapters,
+voice input, or StackChan.
+
+## Step 2.4: does an official Claude Code approval channel exist? (investigation only)
+
+Yes. Claude Code's `PreToolUse` and `PermissionRequest` hooks can return a
+real permission decision by printing JSON to stdout and exiting 0:
+
+- `PreToolUse`: `{"hookSpecificOutput": {"permissionDecision": "allow" | "deny" | "ask", "permissionDecisionReason": "..."}}`
+- `PermissionRequest`: `{"hookSpecificOutput": {"decision": {"behavior": "allow" | "deny"}}}`
+
+registered under `hooks.PreToolUse` (with a `matcher`) in `settings.json`.
+Exit codes alone cannot carry a decision; exit 2 only signals a block, not a
+choice.
+
+The important constraint: this channel is synchronous. The hook process must
+return its decision before the tool call proceeds, bounded by that hook
+entry's `timeout`. There is no official "pause and receive a decision from an
+external async source" primitive — a hook command could itself block while
+polling an external system for a decision, but that is a property of the
+hook script, not something Claude Code provides.
+
+This step is investigation only. No hook script, `settings.json` change, or
+real connection between this relay and Claude Code's permission flow has been
+made.
+
+## Step 2.5: PC manual approval CLI
+
+`manual_approval_cli.py` adds `ManualApprovalCli`, a small interactive
+front end over `ApprovalRequestStore`: it lists the single pending request
+(or asks the caller to pick one by id when several are pending), shows
+`approve_once` / `reject` as the only two choices, and applies exactly one
+decision through `apply_decision`. A second decision on the same request
+raises `ApprovalAlreadyFinalizedError` or `DecisionReplayError`, the same as
+everywhere else in the store — the CLI does not add its own replay
+tracking, since duplicating it would risk drifting out of sync with the
+store's. `input_fn` / `output_fn` are injectable so the whole flow is
+testable without a real terminal.
+
+## Step 2.6: StackChan-voiced approval announcement
+
+`voice_announce.py` adds `build_speech_announcer()`, which adapts an
+existing `SpeechSink.speak`-shaped callable (the same `WindowsSpeechSink` /
+`LogSpeechSink` already used by `notifier.py`) into the `Announcer` shape
+`SimulatedPermissionRelay` expects. It only speaks one formatted sentence
+naming the tool and safe summary of a pending request. No microphone, no
+response channel, and no StackChan/Even G2 hardware connection are added —
+this is the same PC-side TTS voice the notifier already uses for ordinary
+status events.
+
+## Step 2.7: cloud STT dry run
+
+`cloud_transcriber.py` adds `CloudTranscriber`, a stdlib-only (`urllib`),
+OpenAI-compatible cloud speech-to-text client, and `run_dry_run()`, which
+reads one recorded audio file, transcribes it, and logs the recognized text
+through `DryRunTranscriptionLog` — nothing else. The API key is read only
+from `TACHIKOMA_STT_API_KEY` (or passed explicitly) and is never logged or
+included in exception messages; `TranscriptionError` always carries a fixed,
+safe message instead of the raw response body. The HTTP transport is
+injectable (`opener`), so tests exercise request construction, error
+handling, and the dry-run log entirely without real network calls. This
+step does not send anything to Claude Code and does not apply any approval
+decision — recognized text only reaches a log line, and, separately, the
+strictly-gated path in Step 2.8.
+
+## Step 2.8: strictly-gated voice `approve_once`
+
+`voice_approval_gate.py` adds `VoiceApprovalGate.try_approve()`, which
+applies a voice `approve_once` decision only when **every** one of these
+holds, otherwise raising `VoiceApprovalDenied` and applying nothing:
+
+1. Exactly one request is currently pending.
+2. The caller-supplied `approval_id` matches that single pending request.
+3. `risk_level` is `low`.
+4. The request is already `awaiting_confirmation` (already announced).
+5. `tool_name` is on the explicit allowlist `SAFE_VOICE_TOOL_NAMES`
+   (`Read`, `Glob`, `Grep`). This is how "no file deletion, no git push, no
+   external send, no credential access, no system config change, no
+   arbitrary command execution" is enforced mechanically: those categories
+   are simply never on the allowlist, rather than detected by inspecting
+   free-text tool input, which is deliberately stripped from metadata
+   elsewhere and can't be reliably classified after the fact.
+6. The request has not expired — enforced by `list_pending()` itself (see
+   Step 2.3/2.2 notes above), not a separate check here.
+7. The recognized utterance, after NFKC normalization and trimming of
+   whitespace/trailing punctuation, exactly matches one of a small fixed
+   set in `EXPLICIT_APPROVAL_PHRASES`. This is an exact-match allowlist, not
+   substring/keyword matching, so a misrecognized negation
+   (e.g. `"承認しません"`) cannot match just because it contains `"承認"`.
+
+There is no voice-driven `reject` path — rejection still only happens
+through expiry or the manual CLI (Step 2.5). One-shot application (replay
+guard + terminal transition) is still entirely `ApprovalRequestStore`'s
+job; this module only decides whether to call `apply_decision` at all.
+
+None of Steps 2.5–2.8 implement `approve_session`, "always allow", or any
+persistent-approval choice; none modify `settings.json`,
+`install_hooks.ps1`, the existing HTTP API, or send anything to Claude Code;
+none connect to a real microphone or StackChan/Even G2 hardware.

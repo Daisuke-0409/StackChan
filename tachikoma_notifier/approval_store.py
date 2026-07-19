@@ -42,6 +42,13 @@ _TERMINAL_STATUSES = frozenset(
         ApprovalStatus.RELAY_FAILED,
     }
 )
+_RELAY_LIFECYCLE_STATUSES = frozenset(
+    {
+        ApprovalStatus.ANNOUNCED,
+        ApprovalStatus.AWAITING_CONFIRMATION,
+        ApprovalStatus.RELAY_FAILED,
+    }
+)
 
 
 def _utc_now() -> datetime:
@@ -238,6 +245,44 @@ class ApprovalRequestStore:
             self._remember_replay_locked(decision.decision_id, decision.approval_id)
             terminal_at = current if self._is_terminal(next_request) else None
             self._records[request.approval_id] = _StoredApproval(
+                request=next_request,
+                stored_at=record.stored_at,
+                updated_at=current,
+                terminal_at=terminal_at,
+            )
+            return next_request
+
+    def advance_status(
+        self,
+        approval_id: str,
+        target_status: ApprovalStatus,
+        now: Optional[datetime] = None,
+    ) -> ApprovalRequest:
+        """Advance a request through a relay-lifecycle status.
+
+        This is for relay progress only (announced / awaiting_confirmation /
+        relay_failed), never a decision outcome. Approved, rejected,
+        cancelled, expired, and invalid must go through apply_decision so
+        every terminal state stays decision-audited.
+        """
+        if target_status not in _RELAY_LIFECYCLE_STATUSES:
+            raise InvalidApprovalStateError("advance_status only accepts relay lifecycle statuses")
+        current = _as_utc(now, "now") if now is not None else self._now()
+        with self._lock:
+            record = self._records.get(approval_id)
+            if record is None:
+                raise ApprovalNotFoundError("approval request was not found")
+            request = record.request
+            if self._is_terminal(request):
+                raise ApprovalAlreadyFinalizedError("approval request is already finalized")
+            if request.is_expired(current):
+                raise ApprovalExpiredError("approval request is expired")
+            try:
+                next_request = request.transition_to(target_status)
+            except ValueError as exc:
+                raise InvalidApprovalStateError("invalid relay status transition") from exc
+            terminal_at = current if self._is_terminal(next_request) else None
+            self._records[approval_id] = _StoredApproval(
                 request=next_request,
                 stored_at=record.stored_at,
                 updated_at=current,
