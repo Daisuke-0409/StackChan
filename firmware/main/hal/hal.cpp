@@ -12,6 +12,9 @@
 #include <stackchan/state/tachikoma_state_manager.h>
 #include <ai_gateway/ai_gateway_client.h>
 #include <ai_gateway/speech_announcer.h>
+#if defined(DEVELOPMENT_BUILD)
+#include <ai_gateway/speech_announcer_self_test.h>
+#endif
 
 static std::unique_ptr<Hal> _hal_instance;
 static const std::string_view _tag = "HAL";
@@ -84,6 +87,12 @@ void Hal::init()
     // Development-only offline request proves the AI path without requiring
     // credentials or a network. Production builds never start this mock.
     stackchan::ai_gateway::GetAiGatewayClient().StartDevelopmentMock();
+
+    static bool speech_announcer_self_test_ran = false;
+    if (!speech_announcer_self_test_ran) {
+        speech_announcer_self_test_ran = true;
+        stackchan::ai_gateway::RunSpeechAnnouncerSelfTest();
+    }
 #endif
 }
 

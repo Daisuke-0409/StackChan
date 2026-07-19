@@ -19,6 +19,7 @@
  */
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -28,6 +29,7 @@ namespace stackchan::ai_gateway {
 enum class SpeechAnnounceErrorCode : uint8_t {
     None,
     NotConfigured,
+    NetworkUnavailable,
     InvalidDeviceId,
     ConnectionFailed,
     Timeout,
@@ -76,5 +78,9 @@ private:
 };
 
 SpeechAnnouncer& GetSpeechAnnouncer();
+
+// Exposed for unit testing. See the definition in speech_announcer.cpp for
+// why a 0 interface count is treated as "network stack not ready".
+bool IsNetworkStackReady(size_t interface_count);
 
 }  // namespace stackchan::ai_gateway

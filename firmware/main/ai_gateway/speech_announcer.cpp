@@ -8,6 +8,7 @@
 #include <cstring>
 #include <esp_crt_bundle.h>
 #include <esp_http_client.h>
+#include <esp_netif.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mooncake_log.h>
@@ -70,6 +71,25 @@ std::string UrlEncode(const std::string& value)
 
 }  // namespace
 
+// esp_netif_init() (and the LWIP tcpip thread it starts) is only ever called
+// from StackChanWifiStation::Start(), which itself only runs as part of
+// xiaozhi's Application/WifiManager boot path. When the device boots
+// straight to the Launcher (startAiAgentOnBoot NVS flag off), that path
+// never runs, so no esp_netif exists yet. Calling esp_http_client_perform()
+// in that state hard-crashes (LWIP asserts on an uninitialized tcpip mbox)
+// instead of failing gracefully, so this must be checked *before* touching
+// esp_http_client at all -- a 0-interface count is used as a proxy for "the
+// network stack was never brought up", independent of which WiFi flow
+// (xiaozhi's or StackChanWifiStation's) would have brought it up.
+//
+// Takes the interface count as a parameter (rather than calling
+// esp_netif_get_nr_of_ifs() internally) so the decision logic is testable
+// without touching real ESP-IDF network state.
+bool IsNetworkStackReady(size_t interface_count)
+{
+    return interface_count > 0;
+}
+
 SpeechAnnouncer& GetSpeechAnnouncer()
 {
     static SpeechAnnouncer announcer;
@@ -128,6 +148,10 @@ void SpeechAnnouncer::Update(uint32_t now)
         next_poll_ms_ = now + kPollIntervalMs;
         if (config.endpoint.empty() || config.device_token.empty()) {
             last_error_ = SpeechAnnounceErrorCode::NotConfigured;
+            return;
+        }
+        if (!IsNetworkStackReady(esp_netif_get_nr_of_ifs())) {
+            last_error_ = SpeechAnnounceErrorCode::NetworkUnavailable;
             return;
         }
         busy_ = true;
