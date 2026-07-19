@@ -327,3 +327,92 @@ None of Steps 2.5–2.8 implement `approve_session`, "always allow", or any
 persistent-approval choice; none modify `settings.json`,
 `install_hooks.ps1`, the existing HTTP API, or send anything to Claude Code;
 none connect to a real microphone or StackChan/Even G2 hardware.
+
+## Step 3: CodexAdapter
+
+`adapters/codex.py` adds `CodexAdapter`, following `ClaudeCodeAdapter`'s
+`can_handle` / `normalize` shape. OpenAI Codex CLI's hook system (v0.114+)
+sends one JSON object per hook on stdin using a `hook_event_name` /
+`session_id` envelope that closely parallels Claude Code's own. Confirmed
+hook event names: `SessionStart`, `SubagentStart`, `PreToolUse`,
+`PermissionRequest`, `PostToolUse`, `PreCompact`, `PostCompact`,
+`UserPromptSubmit`, `SubagentStop`, `Stop`.
+
+Only two events have a confidently-confirmed, unambiguous mapping and are
+implemented: `PermissionRequest` → `approval_needed`, `Stop` →
+`task_completed`. `PreToolUse` / `PostToolUse` tool-failure detection is
+**not** implemented — public documentation doesn't confirm a stable
+success/failure field shape for `tool_response`, and guessing at an
+unconfirmed field risks silently misclassifying events. Extend this once
+verified against a live Codex instance. Everything else is safely ignored.
+
+## Step 4: GeminiCliAdapter
+
+`adapters/gemini_cli.py` adds `GeminiCliAdapter`, same shape again. Gemini
+CLI's hook envelope (`session_id`, `transcript_path`, `cwd`,
+`hook_event_name`, `timestamp`) and its `Notification` hook's fields
+(`notification_type`, `message`, `details`) also parallel Claude Code's.
+
+Only one mapping is implemented: `hook_event_name == "Notification"` with
+`notification_type == "ToolPermission"` → `approval_needed`. Public
+documentation references a separate "session complete" notification
+concept, but does not confirm its exact `notification_type` value (or
+whether it arrives via a hook at all, versus Gemini CLI's separate
+experimental terminal-notification feature) — rather than guess,
+`task_completed` / `task_failed` mappings are intentionally left
+unimplemented pending verification against a live instance.
+
+## Step 5: GitHub Actions / build notifications
+
+`adapters/github_actions.py` adds `GitHubActionsAdapter`. GitHub delivers
+its webhook event name via the `X-GitHub-Event` HTTP header, not inside the
+JSON body, so this adapter expects whatever receives the raw webhook to
+merge that header's value into the body as `github_event` before calling
+it — that receiver is out of scope here.
+
+Supported `github_event` values, using GitHub's standard (stable,
+well-documented) webhook JSON shapes:
+
+| `github_event` | condition | common event | title |
+|---|---|---|---|
+| `workflow_run` | `action=="completed"`, `conclusion=="success"` | `task_completed` | ビルド成功 |
+| `workflow_run` | `action=="completed"`, `conclusion` in `{"failure","timed_out"}` | `task_failed` | ビルド失敗 |
+| `check_run` | `action=="completed"`, `conclusion=="failure"` | `tool_failed` | テスト失敗 |
+| `pull_request` | `action=="review_requested"` | `waiting` | レビュー待ち |
+| `deployment_status` | `state=="success"` | `task_completed` | デプロイ完了 |
+| `deployment_status` | `state` in `{"failure","error"}` | `task_failed` | デプロイ失敗 |
+
+`repository.full_name` becomes `project_id`. Since these events have no
+`session_id`, `project_id` is passed into `make_dedupe_key`'s session_id
+slot instead, so the same message from two different repositories doesn't
+collapse into one deduplicated event. Anything else, or a payload missing
+the expected nested fields, is safely ignored — never raises.
+
+## Step 6: multi-PC / multi-session tracking
+
+`session_registry.py` adds `SessionRegistry`, a bounded, thread-safe,
+process-local tracker, separate from every approval-related module (it
+does not import `approval_store.py`, `permission_relay.py`, or
+`voice_approval_gate.py`, and implements no approval/rejection logic).
+
+Each session's identity is the tuple `(source, device_id, session_id,
+project_id, workspace)` — `workspace` isn't part of `TachikomaEvent` itself,
+so it's supplied by the caller alongside the event. `upsert_from_event()`
+records the latest `status` (taken directly from `event.event_type.value`,
+so no separate status vocabulary is invented) and `last_updated_at` (taken
+from `event.occurred_at`). An event older than the currently recorded state
+is ignored, so an out-of-order delivery can't regress a session's tracked
+status. `priority` is caller-supplied and persists across updates unless
+explicitly overridden on a later call.
+
+Public operations: `upsert_from_event`, `get`, `list_all`,
+`list_by_priority` (highest priority first, ties broken by most-recently-
+updated), `remove_stale`, and `count`. Registering a genuinely new session
+past `max_sessions` (default 500) raises `SessionRegistryCapacityError`;
+updating an already-tracked session never does.
+
+Steps 3–6 only generate and convert notifications. None of them touch
+`ApprovalRequest`, `ApprovalDecision`, `ApprovalRequestStore`,
+`SimulatedPermissionRelay`, or any voice-approval logic, and none modify
+`notifier.py`, `routing.py`, `events.py`, `adapters/claude_code.py`, or
+`install_hooks.ps1`.
