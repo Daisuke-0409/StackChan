@@ -12,10 +12,13 @@ import json
 import os
 import subprocess
 import threading
-import time
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Callable, Mapping, Optional
+
+from tachikoma_notifier.adapters.claude_code import ClaudeCodeAdapter, validate_hook_payload
+from tachikoma_notifier.events import TachikomaEvent
+from tachikoma_notifier.routing import EventRouter, SpeechFormatter
 
 MAX_BODY_BYTES = 64 * 1024
 DEFAULT_DEBOUNCE_SECONDS = 5.0
@@ -26,35 +29,34 @@ class NormalizedEvent:
     state: str
     phrase: str
     session_id: str
+    event: Optional[TachikomaEvent] = None
+
+    @classmethod
+    def from_event(cls, event: TachikomaEvent, phrase: str) -> "NormalizedEvent":
+        state = {
+            "task_completed": "completed",
+            "task_failed": "error",
+            "tool_failed": "error",
+        }.get(event.event_type.value, event.event_type.value)
+        return cls(state, phrase, event.session_id or "unknown", event)
 
 
 class EventNormalizer:
-    """Maps documented Claude Code hook events to a small stable vocabulary."""
+    """Backward-compatible facade around ClaudeCodeAdapter and SpeechFormatter."""
+
+    def __init__(self) -> None:
+        self.adapter = ClaudeCodeAdapter()
+        self.formatter = SpeechFormatter()
 
     def normalize(self, payload: Mapping[str, Any]) -> Optional[NormalizedEvent]:
-        event = payload.get("hook_event_name")
-        session_id = str(payload.get("session_id") or "unknown")
-
-        if event == "Notification":
-            notification_type = payload.get("notification_type")
-            if notification_type == "permission_prompt":
-                return NormalizedEvent("approval_needed", "Claude Codeが承認待ちだよ", session_id)
+        event = self.adapter.normalize(payload)
+        if event is None:
             return None
-
-        if event == "Stop":
-            # Stop may fire while background work or a scheduled wakeup remains.
-            if payload.get("background_tasks") or payload.get("session_crons"):
-                return None
-            return NormalizedEvent("completed", "タスクが終わったよ", session_id)
-
-        if event in ("PostToolUseFailure", "StopFailure"):
-            return NormalizedEvent("error", "エラーが出たみたい", session_id)
-
-        return None
+        return NormalizedEvent.from_event(event, self.formatter.format(event))
 
 
 class SpeechSink:
-    def speak(self, phrase: str) -> None:
+    def speak(self, phrase: str) -> bool:
         raise NotImplementedError
 
 
@@ -64,8 +66,9 @@ class LogSpeechSink(SpeechSink):
     def __init__(self, output: Optional[Callable[[str], None]] = None) -> None:
         self.output = output or print
 
-    def speak(self, phrase: str) -> None:
+    def speak(self, phrase: str) -> bool:
         self.output(f"[TACHIKOMA TTS] {phrase}")
+        return True
 
 
 class WindowsSpeechSink(SpeechSink):
@@ -74,10 +77,10 @@ class WindowsSpeechSink(SpeechSink):
     def __init__(self, fallback: Optional[SpeechSink] = None) -> None:
         self.fallback = fallback or LogSpeechSink()
 
-    def speak(self, phrase: str) -> None:
+    def speak(self, phrase: str) -> bool:
         if os.name != "nt":
             self.fallback.speak(phrase)
-            return
+            return False
         script = r"""
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Speech
@@ -104,38 +107,50 @@ $s.Dispose()
             )
             if completed.returncode != 0:
                 self.fallback.speak(phrase)
+                return False
+            return True
         except (OSError, subprocess.SubprocessError):
             self.fallback.speak(phrase)
+            return False
 
 
 class NotifierService:
-    def __init__(self, token: str, sink: SpeechSink, debounce_seconds: float = DEFAULT_DEBOUNCE_SECONDS) -> None:
+    def __init__(
+        self,
+        token: str,
+        sink: SpeechSink,
+        debounce_seconds: float = DEFAULT_DEBOUNCE_SECONDS,
+        logger: Optional[Callable[[str], None]] = None,
+    ) -> None:
         if not token:
             raise ValueError("TACHIKOMA_NOTIFY_TOKEN is required")
         self.token = token
         self.sink = sink
         self.debounce_seconds = debounce_seconds
         self.normalizer = EventNormalizer()
-        self._last_seen: dict[tuple[str, str], float] = {}
-        self._lock = threading.Lock()
+        self.adapter = ClaudeCodeAdapter()
+        self.router = EventRouter(
+            adapters=(self.adapter,),
+            sink=sink,
+            debounce_seconds=debounce_seconds,
+            logger=logger,
+        )
 
     def authorized(self, header: str) -> bool:
         expected = f"Bearer {self.token}".encode("utf-8")
         return hmac.compare_digest(header.encode("utf-8"), expected)
 
+    def validate_payload(self, payload: Mapping[str, Any]) -> Optional[str]:
+        return validate_hook_payload(payload)
+
     def handle(self, payload: Mapping[str, Any], now: Optional[float] = None) -> Optional[NormalizedEvent]:
-        event = self.normalizer.normalize(payload)
+        event = self.router.adapt(payload)
         if event is None:
             return None
-        current = time.monotonic() if now is None else now
-        key = (event.session_id, event.state)
-        with self._lock:
-            previous = self._last_seen.get(key)
-            if previous is not None and current - previous < self.debounce_seconds:
-                return None
-            self._last_seen[key] = current
-        self.sink.speak(event.phrase)
-        return event
+        routed = self.router.route(event, now=now)
+        if routed is None:
+            return None
+        return NormalizedEvent.from_event(routed, self.router.formatter.format(routed))
 
 
 def _json_response(handler: BaseHTTPRequestHandler, status: int, body: Mapping[str, Any]) -> None:
@@ -172,6 +187,10 @@ class NotifierHandler(BaseHTTPRequestHandler):
                 raise ValueError("payload must be an object")
         except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
             _json_response(self, 400, {"error": "invalid_json"})
+            return
+        validation_error = self.service.validate_payload(payload)
+        if validation_error:
+            _json_response(self, 400, {"error": "invalid_payload"})
             return
         event = self.service.handle(payload)
         _json_response(self, 200, {"ok": True, "notified": event is not None})
