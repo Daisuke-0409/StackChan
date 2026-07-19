@@ -105,6 +105,7 @@ _ALLOWED_TRANSITIONS = {
             ApprovalStatus.REJECTED,
             ApprovalStatus.EXPIRED,
             ApprovalStatus.CANCELLED,
+            ApprovalStatus.INVALID,
         }
     ),
     ApprovalStatus.ANNOUNCED: frozenset(
@@ -113,6 +114,7 @@ _ALLOWED_TRANSITIONS = {
             ApprovalStatus.REJECTED,
             ApprovalStatus.EXPIRED,
             ApprovalStatus.CANCELLED,
+            ApprovalStatus.INVALID,
         }
     ),
     ApprovalStatus.AWAITING_CONFIRMATION: frozenset(
@@ -122,6 +124,7 @@ _ALLOWED_TRANSITIONS = {
             ApprovalStatus.EXPIRED,
             ApprovalStatus.CANCELLED,
             ApprovalStatus.RELAY_FAILED,
+            ApprovalStatus.INVALID,
         }
     ),
     ApprovalStatus.RELAY_FAILED: frozenset(),

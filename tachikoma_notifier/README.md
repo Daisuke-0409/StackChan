@@ -155,3 +155,28 @@ permission-control field.
 Step 2.1 does not modify `settings.json`, `install_hooks.ps1`, the existing
 HTTP API, `TachikomaEvent`, Claude adapters, voice input, StackChan, or any
 permission result transport.
+
+## Step 2.2: in-memory approval request store
+
+`approval_store.py` adds `ApprovalRequestStore`, a bounded process-local
+store. The default capacity is 1000 requests and the default terminal
+dedupe-retention window is 300 seconds; both are configurable. No SQLite,
+Redis, external database, filesystem persistence, network I/O, or logging is
+used.
+
+The public operations are `register`, `get`, `require`, `list_pending`,
+`list_by_status`, `apply_decision`, `expire_due`, `remove_terminal_before`,
+`cleanup`, and `count`. Registration accepts validated active requests only.
+An active duplicate `dedupe_key` returns the existing request. A terminal
+duplicate is reused within the retention window and can be replaced after
+that window or explicit cleanup. `approval_id` remains unique.
+
+`expire_due()` uses `now >= expires_at`, accepts an injected clock for tests,
+updates only active requests, and is idempotent. `apply_decision()` performs
+validation, state transition, and one-shot decision consumption atomically.
+`approve_once` requires `awaiting_confirmation`; `invalid` is system-only.
+Replay identifiers are bounded to the configured store capacity multiplier.
+
+All operations are protected by a process-local `RLock`. Internal
+`stored_at`, `updated_at`, and `terminal_at` timestamps are store metadata and
+are not added to `ApprovalRequest` or exposed as Hook data.
