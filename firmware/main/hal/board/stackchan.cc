@@ -114,15 +114,36 @@ public:
         return true;
     }
 
-    bool IsExternalPowerConnected()
+    bool TryGetPowerStatus(bool& charging, bool& discharging, bool& external_power)
     {
-        const uint8_t power_status      = ReadReg(0x01);
+        uint8_t power_status = 0;
+        const esp_err_t ret   = TryReadRegs(0x01, &power_status, 1);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "AXP2101 power status read failed: %s", esp_err_to_name(ret));
+            return false;
+        }
+
         const uint8_t current_direction = (power_status & 0b01100000) >> 5;
         const bool is_charging_done     = (power_status & 0b00000111) == 0b00000100;
 
         // Treat any non-discharging state as externally powered so a plugged-in cable
         // still counts even after the battery is full.
-        return current_direction != 2 || is_charging_done;
+        charging      = current_direction == 1;
+        discharging   = current_direction == 2;
+        external_power = !discharging || is_charging_done;
+        return true;
+    }
+
+    bool TryGetBatteryLevel(int& level)
+    {
+        uint8_t raw_level = 0;
+        const esp_err_t ret = TryReadRegs(0xA4, &raw_level, 1);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "AXP2101 battery level read failed: %s", esp_err_to_name(ret));
+            return false;
+        }
+        level = raw_level;
+        return true;
     }
 };
 
@@ -247,6 +268,10 @@ private:
     PowerSaveTimer* power_save_timer_;
     hal_bridge::XiaozhiConfig_t xiaozhi_config_;
     bool last_power_save_enabled_      = false;
+    bool last_external_power_          = false;
+    bool last_charging_                = false;
+    bool last_discharging_             = false;
+    int last_battery_level_            = 0;
     int64_t last_power_state_check_ms_ = 0;
 
     bool ShouldEnablePowerSave(bool has_external_power, bool is_discharging) const
@@ -276,7 +301,17 @@ private:
         }
         last_power_state_check_ms_ = now_ms;
 
-        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->IsDischarging());
+        bool charging      = last_charging_;
+        bool discharging   = last_discharging_;
+        bool external_power = last_external_power_;
+        if (!pmic_->TryGetPowerStatus(charging, discharging, external_power)) {
+            return;
+        }
+
+        last_charging_       = charging;
+        last_discharging_    = discharging;
+        last_external_power_ = external_power;
+        UpdatePowerSaveEnabled(external_power, discharging);
     }
 
     void InitializePowerSaveTimer()
@@ -303,7 +338,7 @@ private:
             GetBacklight()->RestoreBrightness();
         });
         power_save_timer_->OnShutdownRequest([this]() { pmic_->PowerOff(); });
-        UpdatePowerSaveEnabled(pmic_->IsExternalPowerConnected(), pmic_->IsDischarging());
+        PollPowerSaveState();
     }
 
     void InitializeI2c()
@@ -526,15 +561,24 @@ public:
 
     virtual bool GetBatteryLevel(int& level, bool& charging, bool& discharging) override
     {
-        static bool last_discharging = false;
-        charging                     = pmic_->IsCharging();
-        discharging                  = pmic_->IsDischarging();
-        if (discharging != last_discharging) {
-            power_save_timer_->SetEnabled(discharging);
-            last_discharging = discharging;
+        bool external_power = last_external_power_;
+        bool current_charging = last_charging_;
+        bool current_discharging = last_discharging_;
+        if (pmic_->TryGetPowerStatus(current_charging, current_discharging, external_power)) {
+            last_charging_       = current_charging;
+            last_discharging_    = current_discharging;
+            last_external_power_ = external_power;
+            UpdatePowerSaveEnabled(external_power, current_discharging);
         }
 
-        level = pmic_->GetBatteryLevel();
+        int current_level = last_battery_level_;
+        if (pmic_->TryGetBatteryLevel(current_level)) {
+            last_battery_level_ = current_level;
+        }
+
+        charging    = last_charging_;
+        discharging = last_discharging_;
+        level       = last_battery_level_;
         return true;
     }
 

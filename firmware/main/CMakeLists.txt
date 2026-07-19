@@ -14,6 +14,9 @@ file(GLOB_RECURSE STACK_CHAN_SOURCES
     "stackchan/*.c"
     "stackchan/*.cc"
     "stackchan/*.cpp"
+    "ai_gateway/*.c"
+    "ai_gateway/*.cc"
+    "ai_gateway/*.cpp"
 )
 set(STACK_CHAN_INCLUDE_DIRS 
     "."
@@ -297,6 +300,7 @@ idf_component_register(SRCS ${SOURCES}
                         esp_pm
                         esp_psram
                         esp_netif
+                        esp_http_client
                         esp_driver_gpio
                         esp_driver_uart
                         esp_driver_spi
@@ -327,6 +331,23 @@ target_compile_definitions(${COMPONENT_LIB}
                     PRIVATE BOARD_TYPE=\"${BOARD_TYPE}\" BOARD_NAME=\"${BOARD_NAME}\"
                     PRIVATE BUILTIN_TEXT_FONT=${BUILTIN_TEXT_FONT} BUILTIN_ICON_FONT=${BUILTIN_ICON_FONT}
                     )
+
+# Keep development-only gateway mock and OTA guard opt-in; release builds stay
+# identical to the official firmware unless this cache flag is explicitly set.
+option(DEVELOPMENT_BUILD "Enable Tachikoma development safeguards and mock" OFF)
+if(DEVELOPMENT_BUILD)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE DEVELOPMENT_BUILD)
+endif()
+
+# Optional development-only provisioning. Values are supplied to CMake from a
+# local environment and are never committed to the repository.
+set(TACHIKOMA_GATEWAY_URL "" CACHE STRING "Development Gateway URL")
+set(TACHIKOMA_DEVICE_TOKEN "" CACHE STRING "Development Gateway device token")
+if(DEVELOPMENT_BUILD AND TACHIKOMA_GATEWAY_URL AND TACHIKOMA_DEVICE_TOKEN)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        TACHIKOMA_GATEWAY_URL="${TACHIKOMA_GATEWAY_URL}"
+        TACHIKOMA_DEVICE_TOKEN="${TACHIKOMA_DEVICE_TOKEN}")
+endif()
 
 # Add generation rules
 add_custom_command(

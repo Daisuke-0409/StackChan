@@ -1,8 +1,21 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..3b6f07e 100644
+index d69d43d..48d8cc3 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -610,33 +610,36 @@ void Application::InitializeProtocol() {
+@@ -435,6 +435,12 @@ void Application::CheckNewVersion() {
+         if (ota_->HasNewVersion()) {
++#ifdef DEVELOPMENT_BUILD
++            // Development builds must not overwrite locally flashed firmware while features are being tested.
++            // Keep this single policy gate so a private OTA backend can replace the official updater later.
++            ESP_LOGW(TAG, "DEVELOPMENT_BUILD: skipping official firmware OTA");
++#else
+             if (UpgradeFirmware(ota_->GetFirmwareUrl(), ota_->GetFirmwareVersion())) {
+                 return; // This line will never be reached after reboot
+             }
++#endif
+             // If upgrade failed, continue to normal operation
+         }
+@@ -610,33 +616,36 @@ void Application::InitializeProtocol() {
  }
  
  void Application::ShowActivationCode(const std::string& code, const std::string& message) {

@@ -17,6 +17,9 @@
 #include <mutex>
 #include <assets.h>
 #include <settings.h>
+#include <hal/hal.h>
+#include <stackchan/stackchan.h>
+#include <stackchan/motion/tachikoma_motion.h>
 
 static const char* _tag = "HAL_BRIDGE";
 
@@ -97,6 +100,18 @@ void disply_lvgl_unlock()
 {
     auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
     display->LvglUnlock();
+}
+
+void update_tachikoma_motion()
+{
+    auto& controller = stackchan::tachikoma_motion::GetMotionController();
+    const auto frame = controller.Update(GetHAL().millis());
+
+    auto& stackchan = GetStackChan();
+    stackchan::tachikoma_motion::GetServoMotion().Apply(frame, stackchan.motion());
+
+    auto display = static_cast<DISPLAY_TYPE*>(Board::GetInstance().GetDisplay());
+    display->ApplyTachikomaMotionFrame(frame);
 }
 
 /* -------------------------------------------------------------------------- */

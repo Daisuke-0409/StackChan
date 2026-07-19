@@ -9,6 +9,7 @@
 #include <esp_lcd_panel_ops.h>
 #include <esp_timer.h>
 #include <memory>
+#include <stackchan/motion/tachikoma_motion.h>
 
 class StackChanAvatarDisplay : public LvglDisplay {
 private:
@@ -25,7 +26,14 @@ private:
     esp_timer_handle_t preview_timer_                = nullptr;
     std::unique_ptr<LvglImage> preview_image_cached_ = nullptr;
 
+    lv_image_dsc_t idle_image_dsc_                  = {};
+    lv_obj_t* idle_image_                            = nullptr;
+    lv_obj_t* idle_label_                            = nullptr;
+    uint32_t last_tachikoma_display_sequence_ = 0;
+    bool is_standby_                         = false;
+
     void CreateIdleMotionModifier();
+    void SetIdleOverlayVisible(bool visible);
 
 protected:
     virtual bool Lock(int timeout_ms = 0) override;
@@ -52,4 +60,5 @@ public:
     void LvglLock();
     void LvglUnlock();
     lv_disp_t* GetLvglDisplay();
+    void ApplyTachikomaMotionFrame(const stackchan::tachikoma_motion::MotionFrame& frame);
 };

@@ -15,6 +15,8 @@
 #include <lvgl.h>
 #include <lvgl_theme.h>
 #include <stackchan/stackchan.h>
+#include <stackchan/state/tachikoma_state_manager.h>
+#include <assets/assets.h>
 #include <assets/lang_config.h>
 #include <hal/hal.h>
 
@@ -207,6 +209,14 @@ StackChanAvatarDisplay::~StackChanAvatarDisplay()
         lv_obj_del(preview_image_);
     }
 
+    if (idle_label_ != nullptr) {
+        lv_obj_del(idle_label_);
+    }
+
+    if (idle_image_ != nullptr) {
+        lv_obj_del(idle_image_);
+    }
+
     auto& stackchan = GetStackChan();
     if (stackchan.hasAvatar()) {
         stackchan.resetAvatar();
@@ -272,6 +282,31 @@ void StackChanAvatarDisplay::SetupUI()
     stackchan.addModifier(std::make_unique<HeadPetModifier>());
     stackchan.addModifier(std::make_unique<ImuEventModifier>());
 
+    idle_image_dsc_ = assets::get_image("tachikoma_idle.png");
+    if (idle_image_dsc_.data != nullptr && idle_image_dsc_.data_size > 0) {
+        idle_image_ = lv_image_create(lv_screen_active());
+        lv_image_set_src(idle_image_, &idle_image_dsc_);
+        // Keep the original 320x240 source, but clip its empty black margins so transforms redraw fewer pixels.
+        lv_obj_set_size(idle_image_, 290, 190);
+        lv_image_set_inner_align(idle_image_, LV_IMAGE_ALIGN_CENTER);
+        lv_obj_align(idle_image_, LV_ALIGN_CENTER, 0, 0);
+        lv_image_set_pivot(idle_image_, 145, 95);
+        lv_image_set_antialias(idle_image_, false);
+        lv_obj_remove_flag(idle_image_, LV_OBJ_FLAG_CLICKABLE);
+
+        idle_label_ = lv_label_create(lv_screen_active());
+        lv_label_set_text(idle_label_, "待機中…");
+        lv_obj_set_style_text_font(idle_label_, &BUILTIN_TEXT_FONT, 0);
+        lv_obj_set_style_text_color(idle_label_, lv_color_hex(0x00E5FF), 0);
+        lv_obj_align(idle_label_, LV_ALIGN_BOTTOM_MID, 0, -8);
+        lv_obj_remove_flag(idle_label_, LV_OBJ_FLAG_CLICKABLE);
+
+        // Wait for the official STANDBY status before showing and animating the idle overlay.
+        SetIdleOverlayVisible(false);
+    } else {
+        ESP_LOGE(TAG, "Failed to load tachikoma_idle.png; keeping the default avatar visible");
+    }
+
     preview_image_ = lv_image_create(lv_screen_active());
     lv_obj_set_size(preview_image_, 320, 240);
     lv_obj_align(preview_image_, LV_ALIGN_CENTER, 0, 0);
@@ -318,6 +353,37 @@ void StackChanAvatarDisplay::CreateIdleMotionModifier()
     }
 }
 
+void StackChanAvatarDisplay::ApplyTachikomaMotionFrame(const stackchan::tachikoma_motion::MotionFrame& frame)
+{
+    if (idle_image_ == nullptr || frame.display_sequence == last_tachikoma_display_sequence_) {
+        return;
+    }
+
+    if (!frame.active || frame.motion == stackchan::tachikoma_motion::MotionType::None) {
+        lv_obj_align(idle_image_, LV_ALIGN_CENTER, 0, 0);
+        lv_image_set_rotation(idle_image_, 0);
+    } else {
+        lv_obj_align(idle_image_, LV_ALIGN_CENTER, frame.display_x, frame.display_y);
+        lv_image_set_rotation(idle_image_, frame.display_rotation_tenths);
+    }
+    last_tachikoma_display_sequence_ = frame.display_sequence;
+}
+
+void StackChanAvatarDisplay::SetIdleOverlayVisible(bool visible)
+{
+    if (idle_image_ == nullptr || idle_label_ == nullptr) {
+        return;
+    }
+
+    if (visible) {
+        lv_obj_remove_flag(idle_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_remove_flag(idle_label_, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_add_flag(idle_image_, LV_OBJ_FLAG_HIDDEN);
+        lv_obj_add_flag(idle_label_, LV_OBJ_FLAG_HIDDEN);
+    }
+}
+
 void StackChanAvatarDisplay::SetEmotion(const char* emotion)
 {
     auto& stackchan = GetStackChan();
@@ -331,7 +397,6 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
     // ESP_LOGE(TAG, "SetEmotion: %s", emotion);
 
     auto& avatar = stackchan.avatar();
-
     // Map emotion string to stackchan::Emotion
     if (strcmp(emotion, "neutral") == 0) {
         avatar.setEmotion(Emotion::Neutral);
@@ -356,13 +421,16 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
         if (idle_motion_modifier_id_ >= 0) {
             stackchan.removeModifier(idle_motion_modifier_id_);
             idle_motion_modifier_id_ = -1;
+        }
+        if (idle_expression_modifier_id_ >= 0) {
             stackchan.removeModifier(idle_expression_modifier_id_);
             idle_expression_modifier_id_ = -1;
         }
 
-        // Return to default pose
-        auto& motion = GetStackChan().motion();
-        motion.pitchServo().moveWithSpeed(0, 80);
+        // StateManager owns the transition and lets the existing MotionManager
+        // return the head to its safe center pose.
+        stackchan::tachikoma_state::GetTachikomaStateManager().Notify(
+            stackchan::tachikoma_state::TachikomaEvent::SleepRequested);
 
     } else if (strcmp(emotion, "doubtful") == 0) {
         avatar.setEmotion(Emotion::Doubt);
@@ -370,6 +438,17 @@ void StackChanAvatarDisplay::SetEmotion(const char* emotion)
         ESP_LOGW(TAG, "Unknown emotion: %s, using NEUTRAL", emotion);
         avatar.setEmotion(Emotion::Neutral);
     }
+
+    if (strcmp(emotion, "happy") == 0 || strcmp(emotion, "laughing") == 0) {
+        stackchan::tachikoma_state::GetTachikomaStateManager().PlayReaction(
+            stackchan::tachikoma_state::TachikomaReaction::Happy);
+    } else if (strcmp(emotion, "doubtful") == 0) {
+        stackchan::tachikoma_state::GetTachikomaStateManager().PlayReaction(
+            stackchan::tachikoma_state::TachikomaReaction::Confused);
+    }
+
+    // STANDBY is authoritative for the idle overlay and its motion.
+    SetIdleOverlayVisible(is_standby_);
 
     // Resync blink modifier base eye weights
     auto blink_modifier = static_cast<BlinkModifier*>(stackchan.getModifier(blink_modifier_id_));
@@ -488,12 +567,11 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
     }
 
     auto& avatar = stackchan.avatar();
-    auto& motion = stackchan.motion();
-
     DisplayLockGuard lock(this);
 
-    bool is_idle      = false;
-    bool is_listening = false;
+    is_standby_ = strcmp(status, Lang::Strings::STANDBY) == 0;
+
+    bool is_idle = false;
 
     if (strcmp(status, Lang::Strings::LISTENING) == 0) {
         if (speaking_modifier_id_ >= 0) {
@@ -535,10 +613,8 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
     if (is_idle) {
         // Start idle motion
         ESP_LOGW(TAG, "Start idle motion");
-        if (idle_motion_modifier_id_ < 0) {
-            if (idle_motion_level_ > 0) {
-                CreateIdleMotionModifier();
-            }
+        // The shared Tachikoma controller owns idle head motion; keep the official expression modifier only.
+        if (idle_expression_modifier_id_ < 0) {
             idle_expression_modifier_id_ = stackchan.addModifier(std::make_unique<IdleExpressionModifier>());
         }
 
@@ -549,6 +625,8 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
         if (idle_motion_modifier_id_ >= 0) {
             stackchan.removeModifier(idle_motion_modifier_id_);
             idle_motion_modifier_id_ = -1;
+        }
+        if (idle_expression_modifier_id_ >= 0) {
             stackchan.removeModifier(idle_expression_modifier_id_);
             idle_expression_modifier_id_ = -1;
         }
@@ -565,6 +643,21 @@ void StackChanAvatarDisplay::SetStatus(const char* status)
     // Clear sleep state
     if (is_sleeping_) {
         avatar.setSpeech("");
+    }
+
+    SetIdleOverlayVisible(is_standby_);
+
+    // UI status changes are the existing application boundary. Convert them
+    // to queued state events; StateManager then selects MotionManager output.
+    auto& state_manager = stackchan::tachikoma_state::GetTachikomaStateManager();
+    if (strcmp(status, Lang::Strings::STANDBY) == 0) {
+        state_manager.Notify(stackchan::tachikoma_state::TachikomaEvent::InitializationComplete);
+        state_manager.Notify(stackchan::tachikoma_state::TachikomaEvent::SpeechFinished);
+    } else if (strcmp(status, Lang::Strings::LISTENING) == 0) {
+        state_manager.Notify(stackchan::tachikoma_state::TachikomaEvent::UserSpeechStarted);
+    } else if (strcmp(status, Lang::Strings::SPEAKING) == 0) {
+        state_manager.Notify(stackchan::tachikoma_state::TachikomaEvent::AiResponseReady);
+        state_manager.Notify(stackchan::tachikoma_state::TachikomaEvent::SpeechStarted);
     }
 }
 

@@ -50,6 +50,7 @@ void xiaozhi_board_init();
 void start_xiaozhi_app();
 bool is_xiaozhi_ready();
 bool is_xiaozhi_idle();
+void update_tachikoma_motion();
 XiaozhiConfig_t get_xiaozhi_config();
 void set_xiaozhi_config(const XiaozhiConfig_t& config);
 
