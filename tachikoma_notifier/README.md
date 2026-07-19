@@ -284,6 +284,15 @@ step does not send anything to Claude Code and does not apply any approval
 decision — recognized text only reaches a log line, and, separately, the
 strictly-gated path in Step 2.8.
 
+**On the cloud-STT choice:** this was a deliberate, informed choice by the
+user, made with an understanding of the tradeoff against an offline/local
+model. As of Step 2.7, no real microphone input and no real recorded voice
+is ever sent anywhere — only a dry run against recorded/mock audio. When
+Phase 5 wires an actual microphone into StackChan, that microphone may pick
+up voice from an in-progress customer interaction, not just approval
+confirmations, so the choice of cloud STT must be revisited at that point,
+not carried forward automatically.
+
 ## Step 2.8: strictly-gated voice `approve_once`
 
 `voice_approval_gate.py` adds `VoiceApprovalGate.try_approve()`, which
