@@ -7,9 +7,16 @@
 #include <memory>
 #include <mooncake_log.h>
 #include <nvs_flash.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+#include <stackchan/state/tachikoma_state_manager.h>
+#include <ai_gateway/ai_gateway_client.h>
 
 static std::unique_ptr<Hal> _hal_instance;
 static const std::string_view _tag = "HAL";
+static bool _stackchan_update_task_started = false;
+
+static void _stackchan_update_task(void* param);
 
 Hal& GetHAL()
 {
@@ -40,13 +47,42 @@ void Hal::init()
     imu_init();
     servo_init();
     lvgl_init();
+    // StateManager lifecycle is owned by HAL. AI.AGENT only sends runtime events.
+    auto& state_manager = stackchan::tachikoma_state::GetTachikomaStateManager();
+    state_manager.Initialize(millis());
+    state_manager.Notify(stackchan::tachikoma_state::TachikomaEvent::InitializationComplete);
+    {
+        // Process the HAL-owned initialization event before AI.AGENT is started.
+        LvglLockGuard lock;
+        state_manager.Update(millis());
+    }
+
+    // Reuse the existing lightweight update task for state, display, and servo updates.
+    // It is started here so StateManager is not gated by AI.AGENT startup.
+    if (!_stackchan_update_task_started) {
+        const auto result = xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
+        if (result == pdPASS) {
+            _stackchan_update_task_started = true;
+        } else {
+            mclog::tagError(_tag, "failed to start StackChan update task");
+        }
+    }
+
+#if defined(DEVELOPMENT_BUILD)
+    // Optional local build-time provisioning writes credentials to NVS once.
+#if defined(TACHIKOMA_GATEWAY_URL) && defined(TACHIKOMA_DEVICE_TOKEN)
+    stackchan::ai_gateway::GetAiGatewayClient().ConfigureGateway(TACHIKOMA_GATEWAY_URL,
+                                                                  TACHIKOMA_DEVICE_TOKEN);
+#endif
+    // Development-only offline request proves the AI path without requiring
+    // credentials or a network. Production builds never start this mock.
+    stackchan::ai_gateway::GetAiGatewayClient().StartDevelopmentMock();
+#endif
 }
 
 /* -------------------------------------------------------------------------- */
 /*                                   System                                   */
 /* -------------------------------------------------------------------------- */
-#include <freertos/FreeRTOS.h>
-#include <freertos/task.h>
 #include <system_info.h>
 #include <esp_ota_ops.h>
 #include <esp_system.h>
@@ -145,6 +181,7 @@ void Hal::xiaozhi_board_init()
 static void _stackchan_update_task(void* param)
 {
     bool is_setup_done = false;
+    auto& state_manager = stackchan::tachikoma_state::GetTachikomaStateManager();
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -157,6 +194,10 @@ static void _stackchan_update_task(void* param)
             vTaskDelay(pdMS_TO_TICKS(100));
         }
 
+        const auto now = GetHAL().millis();
+        state_manager.Update(now);
+        stackchan::ai_gateway::GetAiGatewayClient().Update(now);
+        hal_bridge::update_tachikoma_motion();
         GetStackChan().update();
 
         if (!hal_bridge::is_xiaozhi_ready()) {
@@ -195,9 +236,6 @@ void Hal::startXiaozhi()
         }
         hal_bridge::app_play_sound(OGG_NEW_NOTIFICATION);
     });
-
-    // Start stackchan update task
-    xTaskCreatePinnedToCore(_stackchan_update_task, "stackchan", 4096, NULL, 3, NULL, 1);
 
     hal_bridge::start_xiaozhi_app();
 }
