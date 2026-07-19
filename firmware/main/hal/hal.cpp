@@ -11,6 +11,7 @@
 #include <freertos/task.h>
 #include <stackchan/state/tachikoma_state_manager.h>
 #include <ai_gateway/ai_gateway_client.h>
+#include <ai_gateway/speech_announcer.h>
 
 static std::unique_ptr<Hal> _hal_instance;
 static const std::string_view _tag = "HAL";
@@ -197,6 +198,7 @@ static void _stackchan_update_task(void* param)
         const auto now = GetHAL().millis();
         state_manager.Update(now);
         stackchan::ai_gateway::GetAiGatewayClient().Update(now);
+        stackchan::ai_gateway::GetSpeechAnnouncer().Update(now);
         hal_bridge::update_tachikoma_motion();
         GetStackChan().update();
 
