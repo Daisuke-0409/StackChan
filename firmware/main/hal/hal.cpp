@@ -75,6 +75,12 @@ void Hal::init()
     stackchan::ai_gateway::GetAiGatewayClient().ConfigureGateway(TACHIKOMA_GATEWAY_URL,
                                                                   TACHIKOMA_DEVICE_TOKEN);
 #endif
+#if defined(TACHIKOMA_SPEAK_QUEUE_URL) && defined(TACHIKOMA_DEVICE_TOKEN)
+    // Shares TACHIKOMA_DEVICE_TOKEN with the gateway above: the Tachikoma
+    // Gateway server checks every endpoint against one DEVICE_TOKEN env var.
+    stackchan::ai_gateway::GetSpeechAnnouncer().ConfigureSpeechQueue(TACHIKOMA_SPEAK_QUEUE_URL,
+                                                                      TACHIKOMA_DEVICE_TOKEN);
+#endif
     // Development-only offline request proves the AI path without requiring
     // credentials or a network. Production builds never start this mock.
     stackchan::ai_gateway::GetAiGatewayClient().StartDevelopmentMock();

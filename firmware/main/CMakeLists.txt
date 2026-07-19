@@ -349,6 +349,21 @@ if(DEVELOPMENT_BUILD AND TACHIKOMA_GATEWAY_URL AND TACHIKOMA_DEVICE_TOKEN)
         TACHIKOMA_DEVICE_TOKEN="${TACHIKOMA_DEVICE_TOKEN}")
 endif()
 
+# Optional development-only provisioning for the speech-announcement queue.
+# Shares TACHIKOMA_DEVICE_TOKEN with the gateway above: the Tachikoma Gateway
+# server checks all endpoints (/v1/chat, /v1/speak, /v1/speak_queue) against
+# a single DEVICE_TOKEN env var, so a separate token would simply fail auth.
+set(TACHIKOMA_SPEAK_QUEUE_URL "" CACHE STRING "Development speech queue URL")
+if(DEVELOPMENT_BUILD AND TACHIKOMA_SPEAK_QUEUE_URL AND TACHIKOMA_DEVICE_TOKEN)
+    # Redefines TACHIKOMA_DEVICE_TOKEN too: the block above only defines it
+    # when TACHIKOMA_GATEWAY_URL is also set, but this block must not depend
+    # on that -- someone may configure the speech queue without the chat
+    # gateway. Identical duplicate -D flags are harmless if both fire.
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        TACHIKOMA_SPEAK_QUEUE_URL="${TACHIKOMA_SPEAK_QUEUE_URL}"
+        TACHIKOMA_DEVICE_TOKEN="${TACHIKOMA_DEVICE_TOKEN}")
+endif()
+
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
