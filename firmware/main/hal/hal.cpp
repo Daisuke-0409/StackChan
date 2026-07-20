@@ -12,8 +12,10 @@
 #include <stackchan/state/tachikoma_state_manager.h>
 #include <ai_gateway/ai_gateway_client.h>
 #include <ai_gateway/speech_announcer.h>
+#include <stackchan/voice_input/voice_input_controller.h>
 #if defined(DEVELOPMENT_BUILD)
 #include <ai_gateway/speech_announcer_self_test.h>
+#include <stackchan/voice_input/voice_input_controller_self_test.h>
 #endif
 
 static std::unique_ptr<Hal> _hal_instance;
@@ -84,6 +86,12 @@ void Hal::init()
     stackchan::ai_gateway::GetSpeechAnnouncer().ConfigureSpeechQueue(TACHIKOMA_SPEAK_QUEUE_URL,
                                                                       TACHIKOMA_DEVICE_TOKEN);
 #endif
+#if defined(TACHIKOMA_TRANSCRIBE_QUEUE_URL) && defined(TACHIKOMA_DEVICE_TOKEN)
+    // Shares TACHIKOMA_DEVICE_TOKEN with the gateway above: the Tachikoma
+    // Gateway server checks every endpoint against one DEVICE_TOKEN env var.
+    stackchan::voice_input::GetVoiceInputController().ConfigureTranscribeQueue(TACHIKOMA_TRANSCRIBE_QUEUE_URL,
+                                                                                TACHIKOMA_DEVICE_TOKEN);
+#endif
     // Development-only offline request proves the AI path without requiring
     // credentials or a network. Production builds never start this mock.
     stackchan::ai_gateway::GetAiGatewayClient().StartDevelopmentMock();
@@ -92,6 +100,12 @@ void Hal::init()
     if (!speech_announcer_self_test_ran) {
         speech_announcer_self_test_ran = true;
         stackchan::ai_gateway::RunSpeechAnnouncerSelfTest();
+    }
+
+    static bool voice_input_self_test_ran = false;
+    if (!voice_input_self_test_ran) {
+        voice_input_self_test_ran = true;
+        stackchan::voice_input::RunVoiceInputControllerSelfTest();
     }
 #endif
 }
@@ -214,6 +228,7 @@ static void _stackchan_update_task(void* param)
         state_manager.Update(now);
         stackchan::ai_gateway::GetAiGatewayClient().Update(now);
         stackchan::ai_gateway::GetSpeechAnnouncer().Update(now);
+        stackchan::voice_input::GetVoiceInputController().Update(now);
         hal_bridge::update_tachikoma_motion();
         GetStackChan().update();
 

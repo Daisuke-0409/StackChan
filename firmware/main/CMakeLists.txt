@@ -364,6 +364,16 @@ if(DEVELOPMENT_BUILD AND TACHIKOMA_SPEAK_QUEUE_URL AND TACHIKOMA_DEVICE_TOKEN)
         TACHIKOMA_DEVICE_TOKEN="${TACHIKOMA_DEVICE_TOKEN}")
 endif()
 
+# Optional development-only provisioning for the push-to-talk transcribe
+# queue (Phase 5 Step 5/6). Shares TACHIKOMA_DEVICE_TOKEN for the same reason
+# as the speech queue above.
+set(TACHIKOMA_TRANSCRIBE_QUEUE_URL "" CACHE STRING "Development transcribe queue URL")
+if(DEVELOPMENT_BUILD AND TACHIKOMA_TRANSCRIBE_QUEUE_URL AND TACHIKOMA_DEVICE_TOKEN)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        TACHIKOMA_TRANSCRIBE_QUEUE_URL="${TACHIKOMA_TRANSCRIBE_QUEUE_URL}"
+        TACHIKOMA_DEVICE_TOKEN="${TACHIKOMA_DEVICE_TOKEN}")
+endif()
+
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}
