@@ -71,6 +71,19 @@ size_t ClampToRemainingCapacity(size_t current_size, size_t incoming, size_t cap
     return std::min(incoming, capacity - current_size);
 }
 
+TriggerAction MapHeadTouchGesture(HeadPetGesture gesture)
+{
+    switch (gesture) {
+        case HeadPetGesture::Press: return TriggerAction::Press;
+        case HeadPetGesture::Release: return TriggerAction::Release;
+        case HeadPetGesture::None:
+        case HeadPetGesture::SwipeForward:
+        case HeadPetGesture::SwipeBackward:
+            return TriggerAction::None;
+    }
+    return TriggerAction::None;
+}
+
 VoiceInputController& GetVoiceInputController()
 {
     static VoiceInputController controller;
@@ -132,6 +145,26 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
 void VoiceInputController::OnButtonReleased(uint32_t now)
 {
     StopRecordingAndUpload(now);
+}
+
+void VoiceInputController::ConnectHeadTouchTrigger()
+{
+    if (head_touch_connected_) {
+        return;
+    }
+    head_touch_connected_ = true;
+    head_touch_connection_ = GetHAL().onHeadPetGesture.connect([this](HeadPetGesture gesture) {
+        switch (MapHeadTouchGesture(gesture)) {
+            case TriggerAction::Press:
+                OnButtonPressed(GetHAL().millis());
+                break;
+            case TriggerAction::Release:
+                OnButtonReleased(GetHAL().millis());
+                break;
+            case TriggerAction::None:
+                break;
+        }
+    });
 }
 
 void VoiceInputController::Update(uint32_t now)

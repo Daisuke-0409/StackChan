@@ -55,6 +55,27 @@ bool RunVoiceInputControllerSelfTest()
     passed &= Expect(VoiceInputErrorCode::RecordingTooShort != VoiceInputErrorCode::NetworkUnavailable,
                      "RecordingTooShort distinct from NetworkUnavailable");
 
+    // A chatter-scale press (well under the debounce threshold used by
+    // StopRecordingAndUpload) must still be rejected -- this is the same
+    // kMinRecordingMs guard exercised above, reused as-is for the head-touch
+    // trigger rather than adding a second threshold.
+    passed &= Expect(!MeetsMinimumDuration(50, 300), "50ms chatter-scale press rejected by the debounce guard");
+
+    // MapHeadTouchGesture: Phase 5 Step 6 head-touch trigger. Only Press and
+    // Release may ever start/stop a recording; Swipe/None must map to no
+    // action so this can never fire on the gesture HeadPetModifier already
+    // owns (SwipeForward/SwipeBackward).
+    passed &= Expect(MapHeadTouchGesture(HeadPetGesture::Press) == TriggerAction::Press,
+                     "Press maps to the Press trigger action");
+    passed &= Expect(MapHeadTouchGesture(HeadPetGesture::Release) == TriggerAction::Release,
+                     "Release maps to the Release trigger action");
+    passed &= Expect(MapHeadTouchGesture(HeadPetGesture::SwipeForward) == TriggerAction::None,
+                     "SwipeForward (HeadPetModifier's gesture) maps to no action");
+    passed &= Expect(MapHeadTouchGesture(HeadPetGesture::SwipeBackward) == TriggerAction::None,
+                     "SwipeBackward (HeadPetModifier's gesture) maps to no action");
+    passed &= Expect(MapHeadTouchGesture(HeadPetGesture::None) == TriggerAction::None,
+                     "None maps to no action");
+
     ESP_LOGI(kTag, "Self-test %s", passed ? "PASS" : "FAIL");
     return passed;
 }

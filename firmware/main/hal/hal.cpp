@@ -48,6 +48,9 @@ void Hal::init()
     xiaozhi_board_init();
     xiaozhi_mcp_init();
     head_touch_init();
+    // Push-to-talk trigger: Si12T head Press/Release starts/stops recording.
+    // Not DEVELOPMENT_BUILD-gated -- this is the real production trigger.
+    stackchan::voice_input::GetVoiceInputController().ConnectHeadTouchTrigger();
     io_expander_init();
     rtc_init();
     imu_init();

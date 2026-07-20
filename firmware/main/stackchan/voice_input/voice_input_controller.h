@@ -29,6 +29,8 @@
 #include <string>
 #include <vector>
 
+#include <hal/hal.h>
+
 #include "voice_input_types.h"
 
 namespace stackchan::voice_input {
@@ -39,6 +41,16 @@ bool HasExceededMaxDuration(uint32_t now, uint32_t started_ms, uint32_t max_dura
 bool MeetsMinimumDuration(uint32_t duration_ms, uint32_t min_duration_ms);
 size_t ClampToRemainingCapacity(size_t current_size, size_t incoming, size_t capacity);
 
+// Phase 5 Step 6 physical trigger: the Si12T head-touch sensor already
+// detects Press/Release (see hal_head_touch.cpp) and delivers them via
+// Hal::onHeadPetGesture, whose only other subscriber (HeadPetModifier)
+// reacts to SwipeForward/SwipeBackward/Release, not Press. Mapping only
+// Press/Release to a trigger action, and nothing else, is what guarantees
+// this can never fire on a swipe -- kept as a pure function so that
+// guarantee is unit-testable without touching the real Signal/HAL.
+enum class TriggerAction { None, Press, Release };
+TriggerAction MapHeadTouchGesture(HeadPetGesture gesture);
+
 class VoiceInputController {
 public:
     // Stores endpoint/token in a dedicated NVS namespace. Values are never logged.
@@ -48,6 +60,11 @@ public:
     // Call from the physical push-to-talk trigger (button/touch zone).
     void OnButtonPressed(uint32_t now);
     void OnButtonReleased(uint32_t now);
+
+    // Subscribes to the Si12T head-touch signal so a Press/Release on the
+    // robot's head starts/stops recording. Idempotent: calling more than
+    // once has no additional effect.
+    void ConnectHeadTouchTrigger();
 
     // Call every tick from the same loop that drives SpeechAnnouncer::Update().
     void Update(uint32_t now);
@@ -81,6 +98,11 @@ private:
     uint32_t recording_started_ms_ = 0;
     std::vector<int16_t> buffer_;
     VoiceInputErrorCode last_error_ = VoiceInputErrorCode::None;
+
+    // Set once from ConnectHeadTouchTrigger() at boot; never touched
+    // concurrently, so no mutex_ protection needed.
+    bool head_touch_connected_ = false;
+    size_t head_touch_connection_ = 0;
 };
 
 VoiceInputController& GetVoiceInputController();
