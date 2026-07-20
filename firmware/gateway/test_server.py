@@ -1,6 +1,17 @@
 import unittest
 
-from .server import MAX_INPUT_BYTES, MAX_SPEECH_AUDIO_BYTES, dequeue_speech, enqueue_speech, process_chat
+from .server import (
+    MAX_INPUT_BYTES,
+    MAX_SPEECH_AUDIO_BYTES,
+    MAX_SAMPLE_RATE,
+    MAX_TRANSCRIBE_AUDIO_BYTES,
+    MIN_SAMPLE_RATE,
+    _pcm_to_wav,
+    dequeue_speech,
+    enqueue_speech,
+    process_chat,
+    process_transcribe,
+)
 
 
 class GatewayTests(unittest.TestCase):
@@ -77,6 +88,78 @@ class SpeechQueueTests(unittest.TestCase):
     def test_accepts_audio_at_exact_size_limit(self):
         status, _ = enqueue_speech(self.device_id, b"\x00" * MAX_SPEECH_AUDIO_BYTES)
         self.assertEqual(status, 200)
+
+
+class TranscribeTests(unittest.TestCase):
+    def setUp(self):
+        self.env = {"STT_PROVIDER": "mock", "ALLOW_INSECURE_DEV": "1"}
+        self.audio = b"\x01\x00\x02\x00\x03\x00\x04\x00"
+
+    def test_mock_success(self):
+        status, body = process_transcribe(self.audio, {}, self.env, sample_rate=16000)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["text"])
+
+    def test_mock_returns_configured_text(self):
+        env = dict(self.env, MOCK_TRANSCRIPTION="タチコマ、聞こえてます")
+        status, body = process_transcribe(self.audio, {}, env, sample_rate=16000)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["text"], "タチコマ、聞こえてます")
+
+    def test_authentication_required(self):
+        status, body = process_transcribe(self.audio, {}, {"STT_PROVIDER": "mock"}, sample_rate=16000)
+        self.assertEqual(status, 401)
+        self.assertEqual(body["error"], "authentication_failed")
+
+    def test_rejects_empty_audio(self):
+        status, _ = process_transcribe(b"", {}, self.env, sample_rate=16000)
+        self.assertEqual(status, 400)
+
+    def test_rejects_odd_length_audio(self):
+        status, _ = process_transcribe(b"\x01\x00\x02", {}, self.env, sample_rate=16000)
+        self.assertEqual(status, 400)
+
+    def test_rejects_oversized_audio(self):
+        status, _ = process_transcribe(b"\x00" * (MAX_TRANSCRIBE_AUDIO_BYTES + 2), {}, self.env, sample_rate=16000)
+        self.assertEqual(status, 413)
+
+    def test_accepts_audio_at_exact_size_limit(self):
+        status, _ = process_transcribe(b"\x00" * MAX_TRANSCRIBE_AUDIO_BYTES, {}, self.env, sample_rate=16000)
+        self.assertEqual(status, 200)
+
+    def test_rejects_sample_rate_below_minimum(self):
+        status, _ = process_transcribe(self.audio, {}, self.env, sample_rate=MIN_SAMPLE_RATE - 1)
+        self.assertEqual(status, 400)
+
+    def test_rejects_sample_rate_above_maximum(self):
+        status, _ = process_transcribe(self.audio, {}, self.env, sample_rate=MAX_SAMPLE_RATE + 1)
+        self.assertEqual(status, 400)
+
+    def test_accepts_sample_rate_at_bounds(self):
+        self.assertEqual(process_transcribe(self.audio, {}, self.env, sample_rate=MIN_SAMPLE_RATE)[0], 200)
+        self.assertEqual(process_transcribe(self.audio, {}, self.env, sample_rate=MAX_SAMPLE_RATE)[0], 200)
+
+    def test_real_provider_without_credentials_is_server_error(self):
+        status, body = process_transcribe(self.audio, {}, {"STT_PROVIDER": "openai", "ALLOW_INSECURE_DEV": "1"},
+                                          sample_rate=16000)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "server_error")
+
+
+class WavHeaderTests(unittest.TestCase):
+    def test_wraps_pcm_with_valid_riff_wave_header(self):
+        pcm = b"\x01\x00\x02\x00\x03\x00\x04\x00"
+        wav = _pcm_to_wav(pcm, sample_rate=16000)
+        self.assertTrue(wav.startswith(b"RIFF"))
+        self.assertEqual(wav[8:12], b"WAVE")
+        self.assertEqual(wav[36:40], b"data")
+        self.assertEqual(wav[-len(pcm):], pcm)
+
+    def test_declared_data_size_matches_pcm_length(self):
+        pcm = b"\x00" * 100
+        wav = _pcm_to_wav(pcm, sample_rate=16000)
+        declared_size = int.from_bytes(wav[40:44], "little")
+        self.assertEqual(declared_size, len(pcm))
 
 
 if __name__ == "__main__":

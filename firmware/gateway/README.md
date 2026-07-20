@@ -29,3 +29,26 @@ idf.py -D DEVELOPMENT_BUILD=ON `
 
 The token is written to NVS on boot and is not printed in logs. Do not commit
 the command line or its values.
+
+## Push-to-talk transcription (`/v1/transcribe`)
+
+The device uploads one raw 16-bit PCM clip (recorded while a push-to-talk
+button was held; see `VoiceInputController` in the firmware) as the request
+body, with `X-Sample-Rate` set to the mic's actual sample rate. This
+endpoint owns the cloud STT provider credentials, exactly like `/v1/chat`
+owns the AI provider credentials -- the device never sees an STT API key.
+The default `mock` provider returns `MOCK_TRANSCRIPTION` (or a fixed
+Japanese phrase) without any network access, mirroring `AI_PROVIDER=mock`.
+
+For a real provider set `STT_PROVIDER=openai` (or any OpenAI-compatible
+`/v1/audio/transcriptions` endpoint), `STT_PROVIDER_URL`,
+`STT_PROVIDER_API_KEY`, and `STT_PROVIDER_MODEL`.
+
+The firmware stores its endpoint and device token in the NVS namespace
+`tachi_stt` (`url`, `device_token`), provisioned the same way:
+
+```powershell
+idf.py -D DEVELOPMENT_BUILD=ON `
+  -D TACHIKOMA_TRANSCRIBE_QUEUE_URL=https://gateway.example/v1/transcribe `
+  -D TACHIKOMA_DEVICE_TOKEN=<local-token> reconfigure
+```
