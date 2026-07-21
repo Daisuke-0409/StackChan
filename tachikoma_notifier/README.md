@@ -422,3 +422,49 @@ Steps 3–6 only generate and convert notifications. None of them touch
 `SimulatedPermissionRelay`, or any voice-approval logic, and none modify
 `notifier.py`, `routing.py`, `events.py`, `adapters/claude_code.py`, or
 `install_hooks.ps1`.
+
+## Step 7: Gemini + Voicebox conversational reply pipeline
+
+Three new, independent PC-side modules chain STT-recognized text into a
+spoken reply on the physical StackChan, reusing the existing
+`speak_queue`/`StackChanSpeechSink` delivery path already verified against
+real hardware — no device-side (NVS/flash) changes were needed or made.
+
+- `gemini_responder.py` — `GeminiResponder.generate_reply(user_text)` calls
+  the Gemini `generateContent` REST API (stdlib `urllib` only, matching
+  `cloud_transcriber.py`'s style) and returns a short Japanese reply.
+  Requires `TACHIKOMA_GEMINI_API_KEY`; model is `TACHIKOMA_GEMINI_MODEL`
+  (default `gemini-2.0-flash`, override if it's stale by the time you read
+  this). The key is sent only via the `x-goog-api-key` header, never in the
+  URL or body.
+- `voicebox_synth.py` — `VoiceboxSynthesizer.synthesize(text)` calls a
+  VOICEVOX-Engine-API-compatible Voicebox server (`POST /audio_query` then
+  `POST /synthesis`) and returns raw 16-bit mono PCM at the same sample
+  rate `windows_wave_synth.py` uses, raising the *same*
+  `SpeechSynthesisError` type on failure so it drops straight into
+  `StackChanSpeechSink`'s `synthesizer` parameter unchanged. Requires
+  `TACHIKOMA_VOICEBOX_BASE_URL` and `TACHIKOMA_VOICEBOX_SPEAKER_ID`;
+  `TACHIKOMA_VOICEBOX_API_KEY` is optional (omit for an unauthenticated
+  local engine).
+  **Unverified assumption** — no real Voicebox endpoint was reachable
+  while writing this; the two-step VOICEVOX-style contract above is a
+  best-guess based on the well-known open-source engine family, not
+  confirmed against the actual service. If the real API differs, only this
+  file should need to change.
+- `conversation_pipeline.py` — `ConversationReplyPipeline.handle_utterance(user_text)`
+  calls `GeminiResponder` then `sink.speak(reply.text)`; never raises
+  (reply-generation failures are logged safely and return `False` without
+  touching the sink). `build_voicebox_stackchan_sink()` returns the exact
+  `StackChanSpeechSink` class already proven end-to-end on real hardware,
+  with `VoiceboxSynthesizer.synthesize` injected as its `synthesizer`
+  instead of `windows_wave_synth.synthesize_wav_pcm` — endpoint/token/
+  device_id still resolve from the same `TACHIKOMA_STACKCHAN_*` env vars
+  `notifier.py` already uses, so nothing about the verified delivery path
+  changes.
+
+What this step deliberately does **not** do: it does not decide how
+recorded audio becomes STT text (that boundary stays at
+`cloud_transcriber.TranscriptionResult.text`, or any other `str`), it does
+not add a CLI entrypoint tying microphone capture to a reply, and it does
+not modify `stackchan_speech_sink.py`, `windows_wave_synth.py`, or
+`notifier.py`.
