@@ -1,5 +1,8 @@
 # Tachikoma 共通イベント通知基盤
 
+作業時の確認ポリシー（確認回数の上限、git push/実機flash/シークレット
+コミット前は必ず確認する例外）はリポジトリ直下の`CLAUDE.md`を参照。
+
 Step 1.5では、Claude Code固有のHook JSONを、将来のCodex・CI・StackChan
 などでも利用できる`TachikomaEvent`へ変換します。現在実装している入力は
 Claude Codeだけです。通知は片方向で、Permission relayや音声承認は行いません。
