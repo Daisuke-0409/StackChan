@@ -425,6 +425,11 @@ Steps 3–6 only generate and convert notifications. None of them touch
 
 ## Step 7: Gemini + Voicebox conversational reply pipeline
 
+**注意: このStepは土台の実装です。Voicebox REST APIの形（`/audio_query`→
+`/synthesis`の2段階）は実サーバーで未検証の推測であり、「動作確認済み」
+ではありません。** 実サービスへの接続確認が済むまではそのつもりで扱って
+ください（詳細は`voicebox_synth.py`の項を参照）。
+
 Three new, independent PC-side modules chain STT-recognized text into a
 spoken reply on the physical StackChan, reusing the existing
 `speak_queue`/`StackChanSpeechSink` delivery path already verified against
