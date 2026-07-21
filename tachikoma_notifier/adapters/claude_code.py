@@ -17,7 +17,6 @@ from tachikoma_notifier.events import (
 )
 
 MAX_SESSION_ID_LENGTH = 128
-ERROR_NOTIFICATION_TYPES = frozenset({"error", "error_notification", "notification_error"})
 
 
 def validate_hook_payload(payload: Mapping[str, Any]) -> Optional[str]:
@@ -67,22 +66,19 @@ class ClaudeCodeAdapter:
                     raw_event_name=raw_event_name,
                     metadata={"notification_type": "permission_prompt"},
                 )
-            if notification_type in ERROR_NOTIFICATION_TYPES:
-                return self._event(
-                    event_type=EventType.ERROR,
-                    severity=EventSeverity.ERROR,
-                    title="エラー",
-                    message="エラー",
-                    requires_action=False,
-                    session_id=session_id,
-                    raw_event_name=raw_event_name,
-                    metadata={"notification_type": notification_type},
-                )
+            # NOTE: 公式hooksにerror系notification_typeは存在しないため、エラー通知は将来別手段で検討
+            # Every other real notification_type (idle_prompt, auth_success,
+            # elicitation_dialog/complete/response, agent_needs_input,
+            # agent_completed) and any unrecognized value are intentionally
+            # ignored here -- fail-closed: never raises, simply no notification.
             return None
 
         if raw_event_name == "Stop":
-            # Keep the Step 1 behavior: active background work is not completion.
-            if payload.get("background_tasks") or payload.get("session_crons"):
+            # agent_id/agent_type are only present when this Stop belongs to
+            # a subagent, not the main session (see Claude Code hooks docs).
+            # Ignore those so a subagent finishing mid-task doesn't read as
+            # the overall task being complete.
+            if payload.get("agent_id") or payload.get("agent_type"):
                 return None
             return self._event(
                 event_type=EventType.TASK_COMPLETED,

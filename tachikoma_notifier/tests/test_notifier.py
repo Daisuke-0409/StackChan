@@ -58,9 +58,12 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(event.event.event_type, EventType.TASK_COMPLETED)
         self.assertFalse(event.event.requires_action)
 
-    def test_background_stop_is_not_completion(self):
+    def test_subagent_stop_is_not_completion(self):
+        # agent_id/agent_type mark this as a subagent's Stop, not the main
+        # session's -- see ClaudeCodeAdapter's dedicated tests for full
+        # coverage of this behavior.
         self.assertIsNone(self.service.handle({
-            "hook_event_name": "Stop", "session_id": "s1", "background_tasks": [{"id": "t"}]
+            "hook_event_name": "Stop", "session_id": "s1", "agent_id": "reviewer"
         }, now=10))
 
     def test_post_tool_use_failure_to_tool_failed(self):
