@@ -16,6 +16,14 @@
  * AudioService's idle power-management timer -- output stays on once
  * enabled rather than being power-cycled down. That's fine for short,
  * infrequent announcements; revisit for long or continuous audio output.
+ *
+ * Because this writes to the same AudioCodec instance AudioService uses
+ * from its own task(s), EnableOutput()/OutputData() here are guarded by
+ * the shared lock in hal/audio_codec_guard.h. Without it, AudioService's
+ * power-management timer could call EnableOutput(false) (or otherwise
+ * touch codec state) while this multi-second blocking write was still in
+ * flight -- confirmed on real hardware as the cause of a crash/reboot when
+ * a pushed announcement played while xiaozhi's Application was active.
  */
 #pragma once
 

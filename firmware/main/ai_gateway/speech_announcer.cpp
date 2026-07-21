@@ -16,6 +16,7 @@
 #include <string_view>
 #include <vector>
 
+#include "hal/audio_codec_guard.h"
 #include "hal/hal.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
@@ -269,13 +270,20 @@ bool SpeechAnnouncer::FetchAndPlay(const SpeechQueueConfig& config, bool& had_au
     // Fine for short, infrequent announcements; revisit (e.g. route through
     // AudioService instead) if this is ever extended to long or continuous
     // audio output.
-    if (!codec->output_enabled()) {
-        codec->EnableOutput(true);
-    }
     auto& state = tachikoma_state::GetTachikomaStateManager();
     state.Notify(tachikoma_state::TachikomaEvent::SpeechStarted);
     mclog::tagInfo(kTag, "playing pushed announcement bytes={}", buffer.body.size());
-    codec->OutputData(pcm);
+    {
+        // Held across the whole EnableOutput()+OutputData() sequence, not
+        // just each call individually, so AudioService's idle
+        // power-management timer can never interrupt this blocking write
+        // partway through. See hal/audio_codec_guard.h.
+        std::lock_guard<std::mutex> audio_lock(stackchan::hal::GetAudioCodecMutex());
+        if (!codec->output_enabled()) {
+            codec->EnableOutput(true);
+        }
+        codec->OutputData(pcm);
+    }
     state.Notify(tachikoma_state::TachikomaEvent::SpeechFinished);
     had_audio = true;
     return true;

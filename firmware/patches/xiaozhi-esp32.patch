@@ -1,8 +1,20 @@
 diff --git a/main/application.cc b/main/application.cc
-index d69d43d..48d8cc3 100644
+index d69d43d..911b653 100644
 --- a/main/application.cc
 +++ b/main/application.cc
-@@ -435,6 +435,12 @@ void Application::CheckNewVersion() {
+@@ -9,6 +9,9 @@
+ #include "mcp_server.h"
+ #include "assets.h"
+ #include "settings.h"
++#if defined(DEVELOPMENT_BUILD)
++#include "ai_gateway/ai_gateway_client.h"
++#endif
+ 
+ #include <cstring>
+ #include <esp_log.h>
+@@ -433,9 +436,15 @@ void Application::CheckNewVersion() {
+         retry_delay = 10; // Reset retry delay
+ 
          if (ota_->HasNewVersion()) {
 +#ifdef DEVELOPMENT_BUILD
 +            // Development builds must not overwrite locally flashed firmware while features are being tested.
@@ -15,7 +27,20 @@ index d69d43d..48d8cc3 100644
 +#endif
              // If upgrade failed, continue to normal operation
          }
-@@ -610,33 +616,36 @@ void Application::InitializeProtocol() {
+ 
+@@ -551,6 +560,11 @@ void Application::InitializeProtocol() {
+             auto text = cJSON_GetObjectItem(root, "text");
+             if (cJSON_IsString(text)) {
+                 ESP_LOGI(TAG, ">> %s", text->valuestring);
++#if defined(DEVELOPMENT_BUILD)
++                // Reuse the existing recognized-text event as the development
++                // input path; the AI client owns state notifications and timing.
++                stackchan::ai_gateway::GetAiGatewayClient().SubmitText(text->valuestring);
++#endif
+                 Schedule([display, message = std::string(text->valuestring)]() {
+                     display->SetChatMessage("user", message.c_str());
+                 });
+@@ -610,33 +624,36 @@ void Application::InitializeProtocol() {
  }
  
  void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -79,6 +104,11 @@ index d69d43d..48d8cc3 100644
  }
  
  void Application::Alert(const char* status, const char* message, const char* emotion, const std::string_view& sound) {
+@@ -1116,4 +1133,3 @@ void Application::ResetProtocol() {
+         protocol_.reset();
+     });
+ }
+-
 diff --git a/main/assets.cc b/main/assets.cc
 index ad61944..6b84daf 100644
 --- a/main/assets.cc
@@ -258,6 +288,74 @@ index 3692e0c..7bfbc5c 100644
      
      // Strategy instance
      std::unique_ptr<AssetStrategy> strategy_;
+diff --git a/main/audio/audio_service.cc b/main/audio/audio_service.cc
+index 350ac58..9f7168a 100644
+--- a/main/audio/audio_service.cc
++++ b/main/audio/audio_service.cc
+@@ -2,6 +2,8 @@
+ #include <esp_log.h>
+ #include <cstring>
+ 
++#include "hal/audio_codec_guard.h"
++
+ #define RATE_CVT_CFG(_src_rate, _dest_rate, _channel)        \
+     (esp_ae_rate_cvt_cfg_t)                                  \
+     {                                                        \
+@@ -303,10 +305,20 @@ void AudioService::AudioOutputTask() {
+         if (!codec_->output_enabled()) {
+             esp_timer_stop(audio_power_timer_);
+             esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+-            codec_->EnableOutput(true);
+         }
+ 
+-        codec_->OutputData(task->pcm);
++        {
++            // Shared with SpeechAnnouncer and CheckAndUpdateAudioPowerState()
++            // -- see hal/audio_codec_guard.h. esp_timer_stop() above must
++            // stay outside this lock: it blocks until any in-flight power
++            // timer callback returns, and that callback takes this same
++            // lock.
++            std::lock_guard<std::mutex> audio_lock(stackchan::hal::GetAudioCodecMutex());
++            if (!codec_->output_enabled()) {
++                codec_->EnableOutput(true);
++            }
++            codec_->OutputData(task->pcm);
++        }
+ 
+         /* Update the last output time */
+         last_output_time_ = std::chrono::steady_clock::now();
+@@ -634,7 +646,12 @@ void AudioService::PlaySound(const std::string_view& ogg) {
+     if (!codec_->output_enabled()) {
+         esp_timer_stop(audio_power_timer_);
+         esp_timer_start_periodic(audio_power_timer_, AUDIO_POWER_CHECK_INTERVAL_MS * 1000);
+-        codec_->EnableOutput(true);
++        // See hal/audio_codec_guard.h -- esp_timer_stop() above must stay
++        // outside this lock.
++        std::lock_guard<std::mutex> audio_lock(stackchan::hal::GetAudioCodecMutex());
++        if (!codec_->output_enabled()) {
++            codec_->EnableOutput(true);
++        }
+     }
+ 
+     const auto* buf = reinterpret_cast<const uint8_t*>(ogg.data());
+@@ -689,7 +706,16 @@ void AudioService::CheckAndUpdateAudioPowerState() {
+     if (output_elapsed > AUDIO_POWER_TIMEOUT_MS && codec_->output_enabled()) {
+         // Keep TX clock when duplex RX is active; otherwise RX may stall on some boards.
+         if (!(codec_->duplex() && codec_->input_enabled())) {
+-            codec_->EnableOutput(false);
++            // Shared with SpeechAnnouncer and the playback loop -- see
++            // hal/audio_codec_guard.h. Blocks here until any in-progress
++            // output write finishes, instead of powering the codec down
++            // mid-write.
++            std::lock_guard<std::mutex> audio_lock(stackchan::hal::GetAudioCodecMutex());
++            // Re-check after acquiring the lock: output may have just been
++            // (re)enabled by whoever was using it.
++            if (codec_->output_enabled()) {
++                codec_->EnableOutput(false);
++            }
+         }
+     }
+     if (!codec_->input_enabled() && !codec_->output_enabled()) {
 diff --git a/main/boards/common/i2c_device.cc b/main/boards/common/i2c_device.cc
 index 835997d..ea50d51 100644
 --- a/main/boards/common/i2c_device.cc
