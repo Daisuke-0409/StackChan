@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Read",
+      "Grep",
+      "Glob",
+      "Edit",
+      "Write",
+      "Bash(git status)",
+      "Bash(git diff*)",
+      "Bash(git log*)",
+      "Bash(python -m pytest*)",
+      "Bash(python -m tachikoma_notifier*)",
+      "Bash(python -m firmware.gateway.server*)",
+      "Bash(cd*)"
+    ],
+    "deny": [
+      "Bash(git push*)",
+      "Bash(git add .)",
+      "Bash(git add -A)",
+      "Bash(rm -rf*)",
+      "Bash(idf.py flash*)",
+      "Bash(idf.py *flash*monitor*)",
+      "Bash(esptool.py*)"
+    ]
+  }
+}
