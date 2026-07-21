@@ -1,8 +1,10 @@
 import json
+import os
 import threading
 import unittest
 from datetime import datetime
 from http.server import ThreadingHTTPServer
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -16,8 +18,17 @@ from tachikoma_notifier.events import (
     make_event_id,
     utc_now_iso,
 )
-from tachikoma_notifier.notifier import EventNormalizer, NotifierHandler, NotifierService, SpeechSink
+from tachikoma_notifier.notifier import (
+    EventNormalizer,
+    LogSpeechSink,
+    NotifierHandler,
+    NotifierService,
+    SpeechSink,
+    WindowsSpeechSink,
+    _build_sink,
+)
 from tachikoma_notifier.routing import SpeechFormatter
+from tachikoma_notifier.stackchan_speech_sink import StackChanSpeechSink
 
 
 class CaptureSink(SpeechSink):
@@ -253,6 +264,47 @@ class _ServerContext:
     def __exit__(self, exc_type, exc, tb):
         self.server.shutdown()
         self.server.server_close()
+
+
+class BuildSinkTests(unittest.TestCase):
+    """_build_sink() chooses StackChanSpeechSink only when fully configured."""
+
+    _ENV_VARS = (
+        "TACHIKOMA_STACKCHAN_SPEAK_URL",
+        "TACHIKOMA_STACKCHAN_DEVICE_TOKEN",
+        "TACHIKOMA_STACKCHAN_DEVICE_ID",
+    )
+
+    def test_log_only_wins_regardless_of_env(self):
+        env = {name: "x" for name in self._ENV_VARS}
+        with patch.dict("os.environ", env, clear=False):
+            self.assertIsInstance(_build_sink(log_only=True), LogSpeechSink)
+
+    def test_no_stackchan_env_vars_falls_back_to_windows_sink(self):
+        with patch.dict("os.environ", {}, clear=False):
+            for name in self._ENV_VARS:
+                os.environ.pop(name, None)
+            self.assertIsInstance(_build_sink(log_only=False), WindowsSpeechSink)
+
+    def test_partial_stackchan_env_vars_fall_back_to_windows_sink(self):
+        with patch.dict("os.environ", {}, clear=False):
+            for name in self._ENV_VARS:
+                os.environ.pop(name, None)
+            os.environ["TACHIKOMA_STACKCHAN_SPEAK_URL"] = "https://gateway.example/v1/speak"
+            os.environ["TACHIKOMA_STACKCHAN_DEVICE_TOKEN"] = "token"
+            # TACHIKOMA_STACKCHAN_DEVICE_ID intentionally left unset.
+            self.assertIsInstance(_build_sink(log_only=False), WindowsSpeechSink)
+
+    def test_all_stackchan_env_vars_selects_stackchan_sink_with_windows_fallback(self):
+        env = {
+            "TACHIKOMA_STACKCHAN_SPEAK_URL": "https://gateway.example/v1/speak",
+            "TACHIKOMA_STACKCHAN_DEVICE_TOKEN": "token",
+            "TACHIKOMA_STACKCHAN_DEVICE_ID": "device-1",
+        }
+        with patch.dict("os.environ", env, clear=False):
+            sink = _build_sink(log_only=False)
+            self.assertIsInstance(sink, StackChanSpeechSink)
+            self.assertIsInstance(sink._fallback, WindowsSpeechSink)
 
 
 if __name__ == "__main__":

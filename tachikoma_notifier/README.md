@@ -96,14 +96,17 @@ SHA-256の`dedupe_key`を生成します。同じキーは5秒以内に1回だ�
 
 ## 出力先
 
-`SpeechSink`が出力境界です。現在は以下を維持しています。
+`SpeechSink`が出力境界です。`notifier.py`の`_build_sink()`が起動時に以下から選びます。
 
-- `WindowsSpeechSink`: Windows PowerShell/System.Speechによる日本語TTS
-- `LogSpeechSink`: TTS失敗時または`--log-only`のログフォールバック
+- `LogSpeechSink`: `--log-only`指定時、または実機TTS失敗時のログフォールバック
+- `StackChanSpeechSink`: `TACHIKOMA_STACKCHAN_SPEAK_URL` / `TACHIKOMA_STACKCHAN_DEVICE_TOKEN` /
+  `TACHIKOMA_STACKCHAN_DEVICE_ID`の3つが**すべて**環境変数に設定されている場合のみ選択され、
+  タチコマ実機のスピーカーへ出力します（Gatewayの`/v1/speak`経由）。失敗時は
+  `WindowsSpeechSink`へフォールバックします
+- `WindowsSpeechSink`: 上記3変数が未設定、または一部のみ設定の場合の既定値。
+  PC自身のWindows PowerShell/System.Speechによる日本語TTS
 
-将来StackChanへ出力する場合は、`StackChanSpeechSink`を追加し、
-`EventRouter`へ渡すだけで差し替えられます。イベント変換、認証、デデュープは
-変更しません。
+イベント変換、認証、デデュープは出力先の選択に関わらず変更しません。
 
 新しい入力元は`adapters/base.py`のAdapter契約に沿って、例えば
 `adapters/codex.py`を追加します。Adapterは共通`TachikomaEvent`を返し、

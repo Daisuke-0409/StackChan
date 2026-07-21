@@ -207,6 +207,26 @@ def run(host: str, port: int, service: NotifierService) -> None:
     server.serve_forever()
 
 
+_STACKCHAN_SINK_ENV_VARS = (
+    "TACHIKOMA_STACKCHAN_SPEAK_URL",
+    "TACHIKOMA_STACKCHAN_DEVICE_TOKEN",
+    "TACHIKOMA_STACKCHAN_DEVICE_ID",
+)
+
+
+def _build_sink(log_only: bool) -> SpeechSink:
+    if log_only:
+        return LogSpeechSink()
+    windows_sink = WindowsSpeechSink()
+    if not all(os.getenv(name) for name in _STACKCHAN_SINK_ENV_VARS):
+        return windows_sink
+    # Imported lazily: stackchan_speech_sink.py imports SpeechSink from this
+    # module, so a top-level import here would be circular.
+    from tachikoma_notifier.stackchan_speech_sink import StackChanSpeechSink
+
+    return StackChanSpeechSink(fallback=windows_sink)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Claude Code one-way Tachikoma notifier")
     parser.add_argument("--host", default=os.getenv("TACHIKOMA_NOTIFY_HOST", "127.0.0.1"))
@@ -214,7 +234,7 @@ def main() -> None:
     parser.add_argument("--log-only", action="store_true", help="print phrases instead of invoking Windows TTS")
     args = parser.parse_args()
     token = os.getenv("TACHIKOMA_NOTIFY_TOKEN", "")
-    sink: SpeechSink = LogSpeechSink() if args.log_only else WindowsSpeechSink()
+    sink = _build_sink(args.log_only)
     run(args.host, args.port, NotifierService(token, sink))
 
 
