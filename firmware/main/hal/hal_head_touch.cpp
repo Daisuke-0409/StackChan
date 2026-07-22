@@ -159,6 +159,10 @@ void Hal::head_touch_init()
     si12t_setup(si12t, SI12T_TYPE_LOW, SI12T_SENSITIVITY_LEVEL_3);
 
     // xTaskCreateWithCaps(_head_touch_update_task, "headtouch", 1024 * 6, si12t, 2, NULL, MALLOC_CAP_SPIRAM);
+    // Stack must be internal RAM: the gesture signal handlers run in this
+    // task and read NVS (VoiceInputController::LoadConfig), and any flash
+    // access asserts (esp_task_stack_is_sane_cache_disabled) when the
+    // caller's stack lives in PSRAM.
     xTaskCreatePinnedToCoreWithCaps(_head_touch_update_task, "headtouch", 1024 * 6, si12t, 2, NULL, 1,
-                                    MALLOC_CAP_SPIRAM);
+                                    MALLOC_CAP_INTERNAL);
 }
