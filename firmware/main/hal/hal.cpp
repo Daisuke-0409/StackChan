@@ -7,6 +7,7 @@
 #include <memory>
 #include <mooncake_log.h>
 #include <nvs_flash.h>
+#include <settings.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <stackchan/state/tachikoma_state_manager.h>
@@ -255,6 +256,18 @@ static void _stackchan_update_task(void* param)
 void Hal::startXiaozhi()
 {
     mclog::tagInfo(_tag, "start xiaozhi");
+
+#ifdef TACHIKOMA_DISABLE_XIAOZHI_CLOUD
+    // Factory NVS ships live xiaozhi-cloud credentials (MQTT broker login,
+    // WebSocket token). Cloud protocol init is compiled out, so nothing
+    // reads these anymore; erase them so third-party credentials don't
+    // linger on the device. Idempotent, and touches only these two
+    // namespaces -- wifi, servo calibration, and tachi_* are unaffected.
+    for (const char* ns : {"mqtt", "websocket"}) {
+        Settings settings(ns, true);
+        settings.EraseAll();
+    }
+#endif
 
     auto& motion = GetStackChan().motion();
     motion.setAutoAngleSyncEnabled(true);

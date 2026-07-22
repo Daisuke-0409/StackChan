@@ -339,6 +339,13 @@ if(DEVELOPMENT_BUILD)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE DEVELOPMENT_BUILD)
 endif()
 
+# Tachikoma replaces the AI backend entirely (own gateway/STT), so no build
+# of this fork may stream wake-word audio to the upstream xiaozhi cloud
+# (api.tenclass.net / mqtt.xiaozhi.me). Deliberately not an option(): opting
+# back in should require removing this line, not flipping a cache flag.
+# Guards ActivationTask() in the patched xiaozhi-esp32/main/application.cc.
+target_compile_definitions(${COMPONENT_LIB} PRIVATE TACHIKOMA_DISABLE_XIAOZHI_CLOUD)
+
 # Optional development-only provisioning. Values are supplied to CMake from a
 # local environment and are never committed to the repository.
 set(TACHIKOMA_GATEWAY_URL "" CACHE STRING "Development Gateway URL")
