@@ -8,12 +8,14 @@
 #include <cstring>
 #include <esp_http_client.h>
 #include <esp_crt_bundle.h>
+#include <esp_netif.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mooncake_log.h>
 #include <settings.h>
 #include <string_view>
 
+#include "ai_gateway/speech_announcer.h"
 #include "hal/hal.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
@@ -26,6 +28,11 @@ constexpr size_t kMaxResponseBytes = 4096;
 constexpr uint32_t kMockDelayMs = 1200;
 constexpr uint32_t kMinSpeechMs = 700;
 constexpr uint32_t kMaxSpeechMs = 12000;
+// The boot-time development probe (StartDevelopmentMock) races WiFi/LWIP
+// bring-up, so a worker may start before the tcpip thread exists; bound how
+// long it waits for the stack instead of failing that first request outright.
+constexpr uint32_t kNetworkReadyPollMs = 500;
+constexpr uint32_t kNetworkReadyTimeoutMs = 15000;
 constexpr char kSettingsNamespace[] = "tachi_gateway";  // NVS namespace <= 15 chars
 
 struct HttpBuffer {
@@ -61,6 +68,25 @@ const char* ErrorName(AiErrorCode error)
     case AiErrorCode::Internal: return "internal";
     default: return "none";
     }
+}
+
+// Blocks the worker task (never the caller) until the LWIP/netif stack
+// exists, polling because there is no event to subscribe to for "some netif
+// was created" that works for both WiFi bring-up paths (xiaozhi's and
+// StackChanWifiStation's). Readiness here means the tcpip thread exists,
+// not that an IP was acquired -- a connect attempt without an IP fails
+// cleanly through the normal retry path.
+bool WaitForNetworkStack()
+{
+    uint32_t waited_ms = 0;
+    while (!IsNetworkStackReady(esp_netif_get_nr_of_ifs())) {
+        if (waited_ms >= kNetworkReadyTimeoutMs) {
+            return false;
+        }
+        vTaskDelay(pdMS_TO_TICKS(kNetworkReadyPollMs));
+        waited_ms += kNetworkReadyPollMs;
+    }
+    return true;
 }
 }  // namespace
 
@@ -184,6 +210,13 @@ void AiGatewayClient::RunWorker(WorkerArgs* args)
         const auto config = LoadConfig();
         if (config.endpoint.empty()) {
             error = AiErrorCode::NotConfigured;
+        } else if (!WaitForNetworkStack()) {
+            // esp_http_client_perform() on an uninitialized LWIP stack
+            // hard-crashes (tcpip_send_msg_wait_sem asserts on the missing
+            // mbox) instead of returning an error, so the stack must exist
+            // before any HTTP attempt -- the same guard SpeechAnnouncer
+            // takes before touching esp_http_client.
+            error = AiErrorCode::WifiUnavailable;
         } else {
             const uint8_t attempts = static_cast<uint8_t>(config.retries + 1);
             for (uint8_t attempt = 0; attempt < attempts; ++attempt) {
