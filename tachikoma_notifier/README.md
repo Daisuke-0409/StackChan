@@ -425,10 +425,13 @@ Steps 3–6 only generate and convert notifications. None of them touch
 
 ## Step 7: Gemini + Voicebox conversational reply pipeline
 
-**注意: このStepは土台の実装です。Voicebox REST APIの形（`/audio_query`→
-`/synthesis`の2段階）は実サーバーで未検証の推測であり、「動作確認済み」
-ではありません。** 実サービスへの接続確認が済むまではそのつもりで扱って
-ください（詳細は`voicebox_synth.py`の項を参照）。
+**注意: Voicebox連携部分は依然「動作確認済み」ではありません。**
+リクエスト形式（`POST /generate`、`{text, profile_id, language, engine}`）
+はユーザー提供の実仕様に合わせて書き直し済みですが、`localhost:17493`が
+このマシンから未起動（`/docs`どころかポート自体に接続不可）だったため、
+**レスポンス形式（生成された音声の返し方）は実サーバーで検証できていません**。
+現状はWAVバイト列を直接返す想定で実装しています。サービス起動後、
+`/docs`で照合してください（詳細は`voicebox_synth.py`の項を参照）。
 
 Three new, independent PC-side modules chain STT-recognized text into a
 spoken reply on the physical StackChan, reusing the existing
@@ -437,25 +440,33 @@ real hardware — no device-side (NVS/flash) changes were needed or made.
 
 - `gemini_responder.py` — `GeminiResponder.generate_reply(user_text)` calls
   the Gemini `generateContent` REST API (stdlib `urllib` only, matching
-  `cloud_transcriber.py`'s style) and returns a short Japanese reply.
-  Requires `TACHIKOMA_GEMINI_API_KEY`; model is `TACHIKOMA_GEMINI_MODEL`
-  (default `gemini-2.0-flash`, override if it's stale by the time you read
-  this). The key is sent only via the `x-goog-api-key` header, never in the
-  URL or body.
-- `voicebox_synth.py` — `VoiceboxSynthesizer.synthesize(text)` calls a
-  VOICEVOX-Engine-API-compatible Voicebox server (`POST /audio_query` then
-  `POST /synthesis`) and returns raw 16-bit mono PCM at the same sample
-  rate `windows_wave_synth.py` uses, raising the *same*
-  `SpeechSynthesisError` type on failure so it drops straight into
-  `StackChanSpeechSink`'s `synthesizer` parameter unchanged. Requires
-  `TACHIKOMA_VOICEBOX_BASE_URL` and `TACHIKOMA_VOICEBOX_SPEAKER_ID`;
-  `TACHIKOMA_VOICEBOX_API_KEY` is optional (omit for an unauthenticated
-  local engine).
-  **Unverified assumption** — no real Voicebox endpoint was reachable
-  while writing this; the two-step VOICEVOX-style contract above is a
-  best-guess based on the well-known open-source engine family, not
-  confirmed against the actual service. If the real API differs, only this
-  file should need to change.
+  `cloud_transcriber.py`'s style) and returns a short Japanese reply, using
+  a system prompt that gives it the Tachikoma personality (childlike
+  curiosity + genuine intelligence, opinions that drift day to day, replies
+  capped at two sentences). Requires `TACHIKOMA_GEMINI_API_KEY`; model is
+  `TACHIKOMA_GEMINI_MODEL` (default `gemini-flash-latest` — `gemini-2.0-flash`,
+  this file's original default, returned a 404 "no longer available" when
+  verified live on 2026-07-23; `-latest` aliases track whatever Google
+  currently recommends instead of a version number that will age out).
+  The key is sent only via the `x-goog-api-key` header, never in the URL or
+  body. **Verified live on 2026-07-23** with a real API key: returned a
+  correctly-styled Japanese reply on the first call.
+- `voicebox_synth.py` — `VoiceboxSynthesizer.synthesize(text)` calls the
+  local Voicebox service's `POST {base_url}/generate` with
+  `{"text", "profile_id", "language", "engine"}` (single call, no separate
+  audio_query step) and returns raw 16-bit mono PCM at the same sample rate
+  `windows_wave_synth.py` uses, raising the *same* `SpeechSynthesisError`
+  type on failure so it drops straight into `StackChanSpeechSink`'s
+  `synthesizer` parameter unchanged. Requires `TACHIKOMA_VOICEBOX_BASE_URL`
+  and `TACHIKOMA_VOICEBOX_PROFILE_ID`; `TACHIKOMA_VOICEBOX_API_KEY` is
+  optional (omit for an unauthenticated local engine).
+  **Unverified assumption** — the *request* shape above was given directly
+  by the service's owner, but `localhost:17493` was unreachable (connection
+  refused) while writing this, so the *response* shape is still a guess:
+  this implementation assumes `/generate` returns the synthesized audio as
+  WAV bytes directly in the response body. If the real service returns
+  JSON (e.g. base64 audio, or a follow-up URL) instead, only this file's
+  `synthesize`/`_extract_pcm` need to change.
 - `conversation_pipeline.py` — `ConversationReplyPipeline.handle_utterance(user_text)`
   calls `GeminiResponder` then `sink.speak(reply.text)`; never raises
   (reply-generation failures are logged safely and return `False` without
