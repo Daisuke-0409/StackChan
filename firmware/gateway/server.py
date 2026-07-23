@@ -79,7 +79,7 @@ def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
 
 GEMINI_DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
 GEMINI_DEFAULT_TTS_MODEL = "gemini-2.5-flash-preview-tts"
-GEMINI_DEFAULT_TTS_VOICE = "Kore"
+GEMINI_DEFAULT_TTS_VOICE = "Zephyr"  # chosen by ear over Kore + 6 alternates against real Japanese text
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 GEMINI_SYSTEM_PROMPT = (
     "あなたは「タチコマ」という名前の小さなロボットです。"
