@@ -6,6 +6,7 @@ from .server import (
     MAX_SAMPLE_RATE,
     MAX_TRANSCRIBE_AUDIO_BYTES,
     MIN_SAMPLE_RATE,
+    _gemini_tts_pcm,
     _pcm_to_wav,
     dequeue_speech,
     enqueue_speech,
@@ -40,6 +41,43 @@ class GatewayTests(unittest.TestCase):
         missing = dict(self.payload)
         del missing["request_id"]
         self.assertEqual(process_chat(missing, {}, self.env)[0], 400)
+
+    def test_mock_provider_still_enqueues_the_confirmation_tone(self):
+        # Regression check: process_chat()'s TTS branch must not change
+        # behavior for non-gemini providers.
+        device_id = f"dev-mock-{id(self)}"
+        payload = dict(self.payload, device_id=device_id)
+        status, _ = process_chat(payload, {}, self.env)
+        self.assertEqual(status, 200)
+        audio = dequeue_speech(device_id)
+        self.assertIsNotNone(audio)
+        self.assertGreater(len(audio), 0)
+
+
+class GeminiProviderTests(unittest.TestCase):
+    """AI_PROVIDER=gemini: real Gemini chat + Gemini TTS, without breaking mock/openai-compatible."""
+
+    def setUp(self):
+        # A real (non-mock) provider always requires a configured
+        # DEVICE_TOKEN -- ALLOW_INSECURE_DEV only permits an insecure
+        # AI_PROVIDER_URL, it does not bypass device authentication.
+        self.env = {"AI_PROVIDER": "gemini", "ALLOW_INSECURE_DEV": "1", "DEVICE_TOKEN": "test-device-token"}
+        self.headers = {"Authorization": "Bearer test-device-token"}
+        self.payload = {"device_id": "dev-gemini", "session_id": "s1", "request_id": "r1", "text": "こんにちは"}
+
+    def test_without_api_key_is_server_error(self):
+        status, body = process_chat(self.payload, self.headers, self.env)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "server_error")
+
+    def test_without_api_key_does_not_enqueue_anything(self):
+        device_id = f"dev-gemini-noauth-{id(self)}"
+        payload = dict(self.payload, device_id=device_id)
+        process_chat(payload, self.headers, self.env)
+        self.assertIsNone(dequeue_speech(device_id))
+
+    def test_gemini_tts_pcm_without_api_key_returns_none(self):
+        self.assertIsNone(_gemini_tts_pcm("こんにちは", {}))
 
 
 class SpeechQueueTests(unittest.TestCase):

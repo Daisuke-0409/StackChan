@@ -19,6 +19,7 @@ owns the AI provider credentials -- the device never sees an STT API key.
 """
 from __future__ import annotations
 
+import base64
 import json
 import math
 import os
@@ -76,12 +77,112 @@ def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
     return supplied == f"Bearer {expected}"
 
 
+GEMINI_DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
+GEMINI_DEFAULT_TTS_MODEL = "gemini-2.5-flash-preview-tts"
+GEMINI_DEFAULT_TTS_VOICE = "Kore"
+GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+GEMINI_SYSTEM_PROMPT = (
+    "あなたは「タチコマ」という名前の小さなロボットです。"
+    "子どものような無邪気さと、高度な知性を併せ持っています。"
+    "命令をただ実行するだけの存在ではなく、日々の出来事や会話を通じて、"
+    "少しずつ自分なりの好みや考え方を育てていく存在として振る舞ってください。"
+    "毎日の出来事を素直に面白がってください。同じ質問にも、その日の気分や"
+    "積み重ねた経験に応じて、少しずつ違うニュアンスで答えて構いません。"
+    "受け答えは2文以内、親しみやすい口調で。"
+)
+# Bare short phrases can make Gemini TTS answer conversationally in text
+# instead of speaking the text -- reproduced and worked around the same way
+# in tachikoma_notifier/gemini_tts_synth.py.
+_GEMINI_TTS_READ_ALOUD_PREFIX = "次のテキストをそのまま読み上げてください: "
+
+
+def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    key = env.get("AI_PROVIDER_API_KEY", "")
+    if not key:
+        return _result(503, "server_error")
+    model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
+    url = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
+    request_body = json.dumps({
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+    }).encode("utf-8")
+    request = urllib.request.Request(url, data=request_body, method="POST", headers={
+        "Content-Type": "application/json", "x-goog-api-key": key,
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
+                                    context=ssl.create_default_context()) as response:
+            decoded = json.loads(response.read(MAX_OUTPUT_BYTES * 4 + 1).decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return _result(502, "authentication_failed")
+        if exc.code == 429:
+            return _result(503, "rate_limited")
+        return _result(502, "server_error")
+    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return _result(504, "timeout")
+
+    try:
+        answer = decoded["candidates"][0]["content"]["parts"][0]["text"]
+    except (KeyError, IndexError, TypeError):
+        return _result(502, "invalid_response")
+    if not isinstance(answer, str) or not answer.strip() or len(answer.encode("utf-8")) > MAX_OUTPUT_BYTES:
+        return _result(502, "invalid_response")
+    return 200, {"text": answer.strip(), "request_id": payload["request_id"],
+                 "session_id": payload["session_id"], "is_final": True}
+
+
+def _gemini_tts_pcm(text: str, env: dict[str, str]) -> Optional[bytes]:
+    """Synthesize text via Gemini native TTS; returns None (never raises) on any failure.
+
+    Mirrors tachikoma_notifier/gemini_tts_synth.py's verified request/response
+    shape: responseModalities=["AUDIO"], response audio is raw 16-bit PCM at
+    24000Hz (audio/L16;codec=pcm;rate=24000, base64-encoded) -- matching what
+    /v1/speak_queue serves (audio/L16;rate=24000;channels=1) exactly, so no
+    resampling is needed.
+    """
+    key = env.get("AI_PROVIDER_API_KEY", "")
+    if not key:
+        return None
+    model = env.get("GEMINI_TTS_MODEL", GEMINI_DEFAULT_TTS_MODEL)
+    voice = env.get("GEMINI_TTS_VOICE", GEMINI_DEFAULT_TTS_VOICE)
+    url = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
+    request_body = json.dumps({
+        "contents": [{"role": "user", "parts": [{"text": _GEMINI_TTS_READ_ALOUD_PREFIX + text}]}],
+        "generationConfig": {
+            "responseModalities": ["AUDIO"],
+            "speechConfig": {"voiceConfig": {"prebuiltVoiceConfig": {"voiceName": voice}}},
+        },
+    }).encode("utf-8")
+    request = urllib.request.Request(url, data=request_body, method="POST", headers={
+        "Content-Type": "application/json", "x-goog-api-key": key,
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
+                                    context=ssl.create_default_context()) as response:
+            decoded = json.loads(response.read(MAX_SPEECH_AUDIO_BYTES * 2).decode("utf-8"))
+        inline_data = decoded["candidates"][0]["content"]["parts"][0]["inlineData"]
+        mime_type = inline_data["mimeType"]
+        if "L16" not in mime_type or "rate=24000" not in mime_type:
+            return None
+        pcm = base64.b64decode(inline_data["data"], validate=True)
+        return pcm or None
+    except Exception:
+        # Never let a TTS failure break the chat response itself -- the
+        # caller falls back to the confirmation tone. Deliberately broad:
+        # network errors, malformed JSON, missing keys, and bad base64 are
+        # all equally "no audio this time", not a /v1/chat failure.
+        return None
+
+
 def _provider_response(text: str, payload: dict[str, Any], env: dict[str, str]) -> tuple[int, dict[str, Any]]:
     provider = env.get("AI_PROVIDER", "mock").lower()
     if provider == "mock":
         answer = env.get("MOCK_RESPONSE", "こんにちは。タチコマ接続テストは成功です。")
         return 200, {"text": answer[:MAX_OUTPUT_BYTES], "request_id": payload["request_id"],
                      "session_id": payload["session_id"], "is_final": True}
+    if provider == "gemini":
+        return _gemini_chat_response(text, payload, env)
 
     url = env.get("AI_PROVIDER_URL", "")
     key = env.get("AI_PROVIDER_API_KEY", "")
@@ -147,10 +248,16 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
         return _result(400, "invalid_input")
     status, body = _provider_response(text, payload, env)
     if status == 200:
-        # No TTS provider yet: enqueue a fixed tone instead of real speech,
-        # solely to verify the transcribe->chat->speak_queue path is wired
-        # end-to-end. Replace with synthesized speech once TTS lands.
-        enqueue_speech(payload["device_id"], _generate_beep_pcm())
+        pcm = None
+        if env.get("AI_PROVIDER", "mock").lower() == "gemini":
+            pcm = _gemini_tts_pcm(body["text"], env)
+        if pcm is None:
+            # No real TTS (non-Gemini provider, or Gemini TTS failed this
+            # time): enqueue a fixed tone instead, solely to verify the
+            # transcribe->chat->speak_queue path is wired end-to-end. A TTS
+            # failure never fails the /v1/chat response itself.
+            pcm = _generate_beep_pcm()
+        enqueue_speech(payload["device_id"], pcm)
     return status, body
 
 
