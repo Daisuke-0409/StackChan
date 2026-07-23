@@ -25,13 +25,15 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # NOTE: model name is env-overridable (TACHIKOMA_GEMINI_MODEL) precisely
 # because Gemini model names/availability change over time; treat this
 # default as a starting point to verify, not a fixed contract.
-# "gemini-2.0-flash" (this file's original default) returned 404 "no longer
-# available", and "gemini-2.5-flash" (tried next, per explicit instruction)
-# returned 404 "no longer available to new users" -- both against the same
-# real API key on 2026-07-23. "-latest" aliases are Google's own mechanism
-# for pointing at whatever's currently recommended, so they age better than
-# a pinned version number that can go stale the same way.
-DEFAULT_MODEL = "gemini-flash-latest"
+# "gemini-2.0-flash" (this file's original default) and "gemini-2.5-flash"
+# (tried next, per explicit instruction) both returned 404 against a real
+# API key on 2026-07-23 (deprecated / no longer available to new users,
+# respectively). "gemini-flash-latest" was verified working next, but per
+# explicit instruction this is now pinned to "gemini-3.5-flash-lite"
+# instead -- also verified working live on 2026-07-23. Unlike a "-latest"
+# alias, a pinned version can go dead the same way 2.0/2.5 did; re-verify
+# if this ever starts 404ing.
+DEFAULT_MODEL = "gemini-3.5-flash-lite"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 MAX_INPUT_CHARS = 4000
 DEFAULT_SYSTEM_PROMPT = (
