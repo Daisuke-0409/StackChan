@@ -476,7 +476,8 @@ real hardware — no device-side (NVS/flash) changes were needed or made.
 - `gemini_tts_synth.py` — `GeminiTtsSynthesizer.synthesize(text)` calls a
   Gemini native-TTS model (`generateContent` with
   `responseModalities: ["AUDIO"]`; default model
-  `gemini-2.5-flash-preview-tts`, default voice `Kore`). No local service
+  `gemini-2.5-flash-preview-tts`, default voice `Zephyr` — chosen by ear
+  after comparing 8 candidate voices against real Japanese text). No local service
   to run. Verified live: ~4s per call, ~91 audio + ~21 text tokens for a
   short two-sentence reply (see cost note below). A bare short phrase can
   make the model answer conversationally in text instead of speaking it —

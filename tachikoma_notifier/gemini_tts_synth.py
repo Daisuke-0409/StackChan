@@ -22,15 +22,10 @@ Verified live against a real API key on 2026-07-23:
     -- raw 16-bit PCM at exactly DEFAULT_SAMPLE_RATE, no WAV header and no
     resampling needed, just a straight base64 decode.
 
-Voice: no reliable way to judge "most natural-sounding for Japanese" by
-ear was available while writing this (Gemini's prebuilt voices are shared
-across ~24 languages, not language-specific, and no listening test was
-done here). Defaults to "Kore" (Google's docs describe it as "Firm") as a
-reasonable general-purpose choice, verified to actually work for Japanese
-text against this API key. Override with TACHIKOMA_GEMINI_TTS_VOICE.
-Other voice names verified to work against this key: Puck, Charon, Aoede,
-Leda, Zephyr, Fenrir, Orus (untested beyond a successful API call each --
-compare by ear to choose).
+Voice: samples of Kore plus 7 alternates (Puck, Charon, Aoede, Leda,
+Zephyr, Fenrir, Orus) were generated and compared by ear against real
+Japanese text; "Zephyr" was chosen as the default from that comparison.
+Override with TACHIKOMA_GEMINI_TTS_VOICE for a different character/style.
 
 The API key is read only from TACHIKOMA_GEMINI_API_KEY (shared with
 gemini_responder.py) and sent only as the `x-goog-api-key` header.
@@ -49,7 +44,7 @@ from tachikoma_notifier.windows_wave_synth import DEFAULT_SAMPLE_RATE, SpeechSyn
 
 DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 DEFAULT_MODEL = "gemini-2.5-flash-preview-tts"
-DEFAULT_VOICE_NAME = "Kore"
+DEFAULT_VOICE_NAME = "Zephyr"
 DEFAULT_TIMEOUT_SECONDS = 30.0
 _READ_ALOUD_PREFIX = "次のテキストをそのまま読み上げてください: "
 

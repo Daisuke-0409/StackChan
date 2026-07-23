@@ -177,7 +177,7 @@ class GeminiTtsSynthesizerTests(unittest.TestCase):
 
     def test_defaults(self):
         self.assertEqual(DEFAULT_MODEL, "gemini-2.5-flash-preview-tts")
-        self.assertEqual(DEFAULT_VOICE_NAME, "Kore")
+        self.assertEqual(DEFAULT_VOICE_NAME, "Zephyr")
 
 
 if __name__ == "__main__":
