@@ -266,6 +266,12 @@ void Hal::startXiaozhi()
     for (const char* ns : {"mqtt", "websocket"}) {
         Settings settings(ns, true);
         settings.EraseAll();
+        // Settings::EraseAll() (vendored settings.cc) never sets the
+        // dirty_ flag, so ~Settings() skips nvs_commit() and the erase is
+        // silently lost on close -- confirmed by re-reading NVS after a
+        // real erase, which came back byte-identical. Forcing one write
+        // marks the handle dirty so the destructor actually commits.
+        settings.SetBool("erased", true);
     }
 #endif
 
