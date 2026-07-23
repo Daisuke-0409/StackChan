@@ -1,8 +1,10 @@
+import os
 import unittest
 from unittest.mock import patch
 
 from tachikoma_notifier.conversation_pipeline import (
     ConversationReplyPipeline,
+    build_tts_stackchan_sink,
     build_voicebox_stackchan_sink,
 )
 from tachikoma_notifier.gemini_responder import GeminiReply, GeminiResponseError
@@ -100,6 +102,51 @@ class BuildVoiceboxStackchanSinkTests(unittest.TestCase):
         custom_fallback = FakeSink()
         with patch.dict("os.environ", self._ENV_VARS, clear=False):
             sink = build_voicebox_stackchan_sink(fallback=custom_fallback)
+        self.assertIs(sink._fallback, custom_fallback)
+
+
+class BuildTtsStackchanSinkTests(unittest.TestCase):
+    """build_tts_stackchan_sink() picks the synthesizer engine from TACHIKOMA_TTS_ENGINE."""
+
+    _STACKCHAN_ENV_VARS = {
+        "TACHIKOMA_STACKCHAN_SPEAK_URL": "https://gateway.local:8080/v1/speak",
+        "TACHIKOMA_STACKCHAN_DEVICE_TOKEN": "device-token",
+        "TACHIKOMA_STACKCHAN_DEVICE_ID": "AABBCCDDEEFF",
+    }
+    _VOICEBOX_ENV_VARS = {
+        "TACHIKOMA_VOICEBOX_BASE_URL": "http://localhost:17493",
+        "TACHIKOMA_VOICEBOX_PROFILE_ID": "1",
+    }
+
+    def test_defaults_to_voicevox_engine(self):
+        with patch.dict("os.environ", self._STACKCHAN_ENV_VARS, clear=False):
+            os.environ.pop("TACHIKOMA_TTS_ENGINE", None)
+            sink = build_tts_stackchan_sink()
+        self.assertIsInstance(sink, StackChanSpeechSink)
+
+    def test_explicit_voicevox_engine(self):
+        env = {**self._STACKCHAN_ENV_VARS, "TACHIKOMA_TTS_ENGINE": "voicevox"}
+        with patch.dict("os.environ", env, clear=False):
+            sink = build_tts_stackchan_sink()
+        self.assertIsInstance(sink, StackChanSpeechSink)
+
+    def test_voicebox_engine_selection(self):
+        env = {**self._STACKCHAN_ENV_VARS, **self._VOICEBOX_ENV_VARS, "TACHIKOMA_TTS_ENGINE": "voicebox"}
+        with patch.dict("os.environ", env, clear=False):
+            sink = build_tts_stackchan_sink()
+        self.assertIsInstance(sink, StackChanSpeechSink)
+
+    def test_unknown_engine_raises_value_error(self):
+        env = {**self._STACKCHAN_ENV_VARS, "TACHIKOMA_TTS_ENGINE": "nonexistent"}
+        with patch.dict("os.environ", env, clear=False):
+            with self.assertRaises(ValueError):
+                build_tts_stackchan_sink()
+
+    def test_explicit_fallback_is_used_instead_of_default(self):
+        custom_fallback = FakeSink()
+        with patch.dict("os.environ", self._STACKCHAN_ENV_VARS, clear=False):
+            os.environ.pop("TACHIKOMA_TTS_ENGINE", None)
+            sink = build_tts_stackchan_sink(fallback=custom_fallback)
         self.assertIs(sink._fallback, custom_fallback)
 
 
