@@ -82,8 +82,8 @@ class BuildVoiceboxStackchanSinkTests(unittest.TestCase):
         "TACHIKOMA_STACKCHAN_SPEAK_URL": "https://gateway.local:8080/v1/speak",
         "TACHIKOMA_STACKCHAN_DEVICE_TOKEN": "device-token",
         "TACHIKOMA_STACKCHAN_DEVICE_ID": "AABBCCDDEEFF",
-        "TACHIKOMA_VOICEBOX_BASE_URL": "http://localhost:50021",
-        "TACHIKOMA_VOICEBOX_SPEAKER_ID": "1",
+        "TACHIKOMA_VOICEBOX_BASE_URL": "http://localhost:17493",
+        "TACHIKOMA_VOICEBOX_PROFILE_ID": "1",
     }
 
     def test_returns_stackchan_speech_sink_wired_to_voicebox(self):

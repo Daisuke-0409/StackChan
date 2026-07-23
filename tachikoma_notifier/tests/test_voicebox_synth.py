@@ -34,137 +34,132 @@ def _make_wav_bytes(*, pcm: bytes = b"\x01\x00\x02\x00", channels: int = 1, samp
     return buffer.getvalue()
 
 
-def two_step_opener(*, audio_query_payload=None, wav_bytes=None, calls=None):
-    """Routes /audio_query -> JSON, /synthesis -> WAV, recording each request if calls is given."""
-    audio_query_payload = audio_query_payload if audio_query_payload is not None else {"speedScale": 1.0}
+def opener_returning(wav_bytes=None, *, calls=None):
     wav_bytes = wav_bytes if wav_bytes is not None else _make_wav_bytes()
 
     def opener(request, timeout_seconds):
         if calls is not None:
             calls.append(request)
-        if "/audio_query" in request.full_url:
-            return FakeResponse(json.dumps(audio_query_payload).encode("utf-8"))
-        if "/synthesis" in request.full_url:
-            return FakeResponse(wav_bytes)
-        raise AssertionError(f"unexpected URL: {request.full_url}")
+        return FakeResponse(wav_bytes)
+
+    return opener
+
+
+def opener_raising(exc: Exception):
+    def opener(request, timeout_seconds):
+        raise exc
 
     return opener
 
 
 class VoiceboxSynthesizerTests(unittest.TestCase):
-    def test_requires_base_url_and_speaker_id(self):
+    def test_requires_base_url_and_profile_id(self):
         with self.assertRaises(ValueError):
-            VoiceboxSynthesizer(base_url="", speaker_id="1")
+            VoiceboxSynthesizer(base_url="", profile_id="1")
         with self.assertRaises(ValueError):
-            VoiceboxSynthesizer(base_url="http://localhost:50021", speaker_id="")
+            VoiceboxSynthesizer(base_url="http://localhost:17493", profile_id="")
 
     def test_synthesize_returns_pcm_from_wav_response(self):
         pcm = b"\x01\x00\x02\x00\x03\x00"
         synth = VoiceboxSynthesizer(
-            base_url="http://localhost:50021",
-            speaker_id="1",
-            opener=two_step_opener(wav_bytes=_make_wav_bytes(pcm=pcm)),
+            base_url="http://localhost:17493",
+            profile_id="1",
+            opener=opener_returning(_make_wav_bytes(pcm=pcm)),
         )
         result = synth.synthesize("こんにちは")
         self.assertEqual(result, pcm)
 
-    def test_synthesize_calls_audio_query_then_synthesis_with_speaker(self):
+    def test_synthesize_posts_to_generate_with_expected_body(self):
         calls = []
         synth = VoiceboxSynthesizer(
-            base_url="http://localhost:50021", speaker_id="42", opener=two_step_opener(calls=calls)
+            base_url="http://localhost:17493", profile_id="42", opener=opener_returning(calls=calls)
         )
         synth.synthesize("こんにちは")
-        self.assertEqual(len(calls), 2)
-        self.assertIn("/audio_query", calls[0].full_url)
-        self.assertIn("speaker=42", calls[0].full_url)
-        self.assertIn("text=", calls[0].full_url)
-        self.assertIn("/synthesis", calls[1].full_url)
-        self.assertIn("speaker=42", calls[1].full_url)
+        self.assertEqual(len(calls), 1)
+        request = calls[0]
+        self.assertEqual(request.full_url, "http://localhost:17493/generate")
+        body = json.loads(request.data.decode("utf-8"))
+        self.assertEqual(
+            body,
+            {"text": "こんにちは", "profile_id": "42", "language": "ja", "engine": "qwen3-tts"},
+        )
 
-    def test_synthesize_sends_audio_query_result_as_synthesis_body(self):
+    def test_language_and_engine_are_configurable(self):
         calls = []
-        query_payload = {"speedScale": 1.0, "marker": "distinctive-value"}
         synth = VoiceboxSynthesizer(
-            base_url="http://localhost:50021",
-            speaker_id="1",
-            opener=two_step_opener(audio_query_payload=query_payload, calls=calls),
+            base_url="http://localhost:17493",
+            profile_id="1",
+            language="en",
+            engine="custom-engine",
+            opener=opener_returning(calls=calls),
         )
-        synth.synthesize("こんにちは")
-        sent_body = json.loads(calls[1].data.decode("utf-8"))
-        self.assertEqual(sent_body, query_payload)
+        synth.synthesize("hello")
+        body = json.loads(calls[0].data.decode("utf-8"))
+        self.assertEqual(body["language"], "en")
+        self.assertEqual(body["engine"], "custom-engine")
 
     def test_rejects_empty_text(self):
-        synth = VoiceboxSynthesizer(base_url="http://localhost:50021", speaker_id="1", opener=two_step_opener())
+        synth = VoiceboxSynthesizer(base_url="http://localhost:17493", profile_id="1", opener=opener_returning())
         with self.assertRaises(ValueError):
             synth.synthesize("")
 
-    def test_audio_query_network_failure_raises_speech_synthesis_error(self):
-        def opener(request, timeout_seconds):
-            raise URLError("boom")
-
-        synth = VoiceboxSynthesizer(base_url="http://localhost:50021", speaker_id="1", opener=opener)
-        with self.assertRaises(SpeechSynthesisError):
-            synth.synthesize("こんにちは")
-
-    def test_synthesis_network_failure_raises_speech_synthesis_error(self):
-        def opener(request, timeout_seconds):
-            if "/audio_query" in request.full_url:
-                return FakeResponse(json.dumps({}).encode("utf-8"))
-            raise URLError("boom")
-
-        synth = VoiceboxSynthesizer(base_url="http://localhost:50021", speaker_id="1", opener=opener)
+    def test_network_failure_raises_speech_synthesis_error(self):
+        synth = VoiceboxSynthesizer(
+            base_url="http://localhost:17493", profile_id="1", opener=opener_raising(URLError("boom"))
+        )
         with self.assertRaises(SpeechSynthesisError):
             synth.synthesize("こんにちは")
 
     def test_non_mono_wav_raises_speech_synthesis_error(self):
         synth = VoiceboxSynthesizer(
-            base_url="http://localhost:50021",
-            speaker_id="1",
-            opener=two_step_opener(wav_bytes=_make_wav_bytes(channels=2)),
+            base_url="http://localhost:17493",
+            profile_id="1",
+            opener=opener_returning(_make_wav_bytes(channels=2)),
         )
         with self.assertRaises(SpeechSynthesisError):
             synth.synthesize("こんにちは")
 
     def test_wrong_sample_rate_raises_speech_synthesis_error(self):
         synth = VoiceboxSynthesizer(
-            base_url="http://localhost:50021",
-            speaker_id="1",
-            opener=two_step_opener(wav_bytes=_make_wav_bytes(framerate=16000)),
+            base_url="http://localhost:17493",
+            profile_id="1",
+            opener=opener_returning(_make_wav_bytes(framerate=16000)),
         )
         with self.assertRaises(SpeechSynthesisError):
             synth.synthesize("こんにちは")
 
     def test_invalid_wav_bytes_raises_speech_synthesis_error(self):
         synth = VoiceboxSynthesizer(
-            base_url="http://localhost:50021", speaker_id="1", opener=two_step_opener(wav_bytes=b"not a wav")
+            base_url="http://localhost:17493", profile_id="1", opener=opener_returning(b"not a wav")
         )
         with self.assertRaises(SpeechSynthesisError):
             synth.synthesize("こんにちは")
 
-    def test_api_key_never_appears_in_body_when_set(self):
+    def test_api_key_sent_as_header_when_set(self):
         calls = []
         synth = VoiceboxSynthesizer(
-            base_url="http://localhost:50021",
-            speaker_id="1",
+            base_url="http://localhost:17493",
+            profile_id="1",
             api_key="super-secret-voicebox-key",
-            opener=two_step_opener(calls=calls),
+            opener=opener_returning(calls=calls),
         )
         synth.synthesize("こんにちは")
         self.assertEqual(calls[0].get_header("Authorization"), "Bearer super-secret-voicebox-key")
-        self.assertNotIn(b"super-secret-voicebox-key", calls[1].data or b"")
+        self.assertNotIn(b"super-secret-voicebox-key", calls[0].data)
 
     def test_env_vars_are_used_when_arguments_omitted(self):
         env_backup = {
             key: os.environ.get(key)
-            for key in ("TACHIKOMA_VOICEBOX_BASE_URL", "TACHIKOMA_VOICEBOX_SPEAKER_ID")
+            for key in ("TACHIKOMA_VOICEBOX_BASE_URL", "TACHIKOMA_VOICEBOX_PROFILE_ID")
         }
         try:
-            os.environ["TACHIKOMA_VOICEBOX_BASE_URL"] = "http://localhost:50021"
-            os.environ["TACHIKOMA_VOICEBOX_SPEAKER_ID"] = "7"
+            os.environ["TACHIKOMA_VOICEBOX_BASE_URL"] = "http://localhost:17493"
+            os.environ["TACHIKOMA_VOICEBOX_PROFILE_ID"] = "7"
             calls = []
-            synth = VoiceboxSynthesizer(opener=two_step_opener(calls=calls))
+            synth = VoiceboxSynthesizer(opener=opener_returning(calls=calls))
             synth.synthesize("こんにちは")
-            self.assertIn("speaker=7", calls[0].full_url)
+            body = json.loads(calls[0].data.decode("utf-8"))
+            self.assertEqual(body["profile_id"], "7")
         finally:
             for key, value in env_backup.items():
                 if value is None:
