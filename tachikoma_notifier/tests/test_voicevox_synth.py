@@ -51,11 +51,11 @@ def two_step_opener(*, audio_query_payload=None, wav_bytes=None, calls=None):
 
 
 class VoicevoxSynthesizerTests(unittest.TestCase):
-    def test_defaults_to_localhost_50021_and_zundamon_normal(self):
+    def test_defaults_to_localhost_50021_and_shikoku_metan_normal(self):
         synth = VoicevoxSynthesizer(opener=two_step_opener())
         self.assertEqual(synth._base_url, "http://localhost:50021")
         self.assertEqual(synth._speaker_id, DEFAULT_SPEAKER_ID)
-        self.assertEqual(DEFAULT_SPEAKER_ID, "3")
+        self.assertEqual(DEFAULT_SPEAKER_ID, "2")
 
     def test_synthesize_returns_pcm_from_wav_response(self):
         pcm = b"\x01\x00\x02\x00\x03\x00"
