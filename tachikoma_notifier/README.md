@@ -467,16 +467,40 @@ real hardware — no device-side (NVS/flash) changes were needed or made.
   local engine). Valid `engine` values are `qwen` (default),
   `qwen_custom_voice`, `luxtts`, `chatterbox`, `chatterbox_turbo`, `tada`,
   `kokoro` — not `qwen3-tts`, an earlier incorrect guess.
+- `voicevox_synth.py` — `VoicevoxSynthesizer.synthesize(text)` drives a
+  local VOICEVOX ENGINE instance (`localhost:50021` by default; the same
+  two-step `audio_query`/`synthesis` REST flow, verified live). Fast
+  (well under a second per call, CPU-only) and free. Default speaker is
+  Zundamon / Normal (style id `3`; override with
+  `TACHIKOMA_VOICEVOX_SPEAKER_ID`).
+- `gemini_tts_synth.py` — `GeminiTtsSynthesizer.synthesize(text)` calls a
+  Gemini native-TTS model (`generateContent` with
+  `responseModalities: ["AUDIO"]`; default model
+  `gemini-2.5-flash-preview-tts`, default voice `Kore`). No local service
+  to run. Verified live: ~4s per call, ~91 audio + ~21 text tokens for a
+  short two-sentence reply (see cost note below). A bare short phrase can
+  make the model answer conversationally in text instead of speaking it —
+  worked around by wrapping the input in an explicit "read this verbatim"
+  instruction before sending. Response audio is raw 16-bit PCM
+  (`audio/L16;codec=pcm;rate=24000`, base64-encoded) — no WAV header, so
+  no `wave` parsing needed, just a straight base64 decode.
+  **Cost estimate (unverified against Google's live pricing page — this
+  session had no way to check it, treat as a rough order of magnitude
+  only):** at roughly published Gemini 2.5 Flash Preview TTS rates, a
+  ~100-token reply costs a small fraction of a US cent (well under ¥1).
+  Confirm current pricing before relying on this for volume use.
 - `conversation_pipeline.py` — `ConversationReplyPipeline.handle_utterance(user_text)`
   calls `GeminiResponder` then `sink.speak(reply.text)`; never raises
   (reply-generation failures are logged safely and return `False` without
-  touching the sink). `build_voicebox_stackchan_sink()` returns the exact
+  touching the sink). `build_tts_stackchan_sink()` returns the same
   `StackChanSpeechSink` class already proven end-to-end on real hardware,
-  with `VoiceboxSynthesizer.synthesize` injected as its `synthesizer`
-  instead of `windows_wave_synth.synthesize_wav_pcm` — endpoint/token/
-  device_id still resolve from the same `TACHIKOMA_STACKCHAN_*` env vars
-  `notifier.py` already uses, so nothing about the verified delivery path
-  changes.
+  with the synthesizer picked by `TACHIKOMA_TTS_ENGINE`
+  (`gemini` default, `voicevox`, or `voicebox`) injected in place of
+  `windows_wave_synth.synthesize_wav_pcm` — endpoint/token/device_id still
+  resolve from the same `TACHIKOMA_STACKCHAN_*` env vars `notifier.py`
+  already uses, so nothing about the verified delivery path changes.
+  `build_voicebox_stackchan_sink()` (Voicebox-only, no engine switch) is
+  kept unchanged for anything still calling it directly.
 
 What this step deliberately does **not** do: it does not decide how
 recorded audio becomes STT text (that boundary stays at
