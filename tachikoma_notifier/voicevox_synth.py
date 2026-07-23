@@ -16,10 +16,10 @@ Both calls completed in well under a second (CPU-only, no GPU needed) --
 unlike voicebox_synth.py's Qwen3-TTS model, which took 35-130s per call on
 this machine's CPU.
 
-Default speaker is Shikoku Metan / Normal (VOICEVOX style id 2, confirmed
-via GET /speakers against this instance). Override with
-TACHIKOMA_VOICEVOX_SPEAKER_ID for a different character/style (e.g. "3"
-for Zundamon / Normal, this file's previous default).
+Default speaker is Zundamon / Normal (VOICEVOX style id 3, confirmed via
+GET /speakers against this instance). Override with
+TACHIKOMA_VOICEVOX_SPEAKER_ID for a different character/style (e.g. "2"
+for Shikoku Metan / Normal, tried briefly before reverting to this).
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from typing import Any, Callable, Optional
 from tachikoma_notifier.windows_wave_synth import DEFAULT_SAMPLE_RATE, SpeechSynthesisError
 
 DEFAULT_BASE_URL = "http://localhost:50021"
-DEFAULT_SPEAKER_ID = "2"  # Shikoku Metan / Normal
+DEFAULT_SPEAKER_ID = "3"  # Zundamon / Normal
 DEFAULT_TIMEOUT_SECONDS = 30.0
 
 Opener = Callable[[urllib.request.Request, float], Any]
