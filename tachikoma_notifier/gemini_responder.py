@@ -25,13 +25,21 @@ DEFAULT_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # NOTE: model name is env-overridable (TACHIKOMA_GEMINI_MODEL) precisely
 # because Gemini model names/availability change over time; treat this
 # default as a starting point to verify, not a fixed contract.
-DEFAULT_MODEL = "gemini-2.0-flash"
+# "gemini-2.0-flash" (this file's original default) returned 404 "no longer
+# available" against a real API key on 2026-07-23; "-latest" aliases are
+# Google's own mechanism for pointing at whatever's currently recommended,
+# so they age better than a pinned version number.
+DEFAULT_MODEL = "gemini-flash-latest"
 DEFAULT_TIMEOUT_SECONDS = 20.0
 MAX_INPUT_CHARS = 4000
 DEFAULT_SYSTEM_PROMPT = (
-    "あなたはタチコマという小型ロボットのAI人格です。"
-    "ユーザーの発話に対して、日本語で短く(2文以内)、"
-    "話し言葉で親しみやすく応答してください。"
+    "あなたは「タチコマ」という名前の小さなロボットです。"
+    "子どものような無邪気さと、高度な知性を併せ持っています。"
+    "命令をただ実行するだけの存在ではなく、日々の出来事や会話を通じて、"
+    "少しずつ自分なりの好みや考え方を育てていく存在として振る舞ってください。"
+    "毎日の出来事を素直に面白がってください。同じ質問にも、その日の気分や"
+    "積み重ねた経験に応じて、少しずつ違うニュアンスで答えて構いません。"
+    "受け答えは2文以内、親しみやすい口調で。"
 )
 
 Opener = Callable[[urllib.request.Request, float], Any]
