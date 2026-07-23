@@ -20,6 +20,7 @@ owns the AI provider credentials -- the device never sees an STT API key.
 from __future__ import annotations
 
 import json
+import math
 import os
 import ssl
 import struct
@@ -119,6 +120,20 @@ def _provider_response(text: str, payload: dict[str, Any], env: dict[str, str]) 
                  "session_id": payload["session_id"], "is_final": True}
 
 
+def _generate_beep_pcm(*, duration_s: float = 0.4, freq_hz: float = 880.0, sample_rate: int = 24000) -> bytes:
+    """A fixed confirmation tone -- NOT TTS. Proves the chat->speak_queue
+    wiring end-to-end without a text-to-speech provider (tracked separately
+    alongside the Gemini+VOICEVOX pipeline work). 16-bit mono PCM at
+    sample_rate, matching what SpeechAnnouncer expects from /v1/speak_queue.
+    """
+    n_samples = int(duration_s * sample_rate)
+    samples = bytearray()
+    for i in range(n_samples):
+        value = int(8000 * math.sin(2 * math.pi * freq_hz * i / sample_rate))
+        samples += struct.pack("<h", value)
+    return bytes(samples)
+
+
 def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
                  env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     headers = headers or {}
@@ -130,7 +145,13 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
     text = payload.get("text")
     if not isinstance(text, str) or not text or len(text.encode("utf-8")) > MAX_INPUT_BYTES:
         return _result(400, "invalid_input")
-    return _provider_response(text, payload, env)
+    status, body = _provider_response(text, payload, env)
+    if status == 200:
+        # No TTS provider yet: enqueue a fixed tone instead of real speech,
+        # solely to verify the transcribe->chat->speak_queue path is wired
+        # end-to-end. Replace with synthesized speech once TTS lands.
+        enqueue_speech(payload["device_id"], _generate_beep_pcm())
+    return status, body
 
 
 def _pcm_to_wav(pcm: bytes, sample_rate: int, *, channels: int = 1, bits_per_sample: int = 16) -> bytes:
