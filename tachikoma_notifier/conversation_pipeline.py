@@ -5,9 +5,10 @@ network calls of its own:
   1. gemini_responder.GeminiResponder  (STT text -> short reply text)
   2. A TTS synthesizer (reply text -> PCM), injected as a `synthesizer`
      into the *existing*, already-verified-on-real-hardware
-     StackChanSpeechSink -- see stackchan_speech_sink.py. Two engines are
-     available -- voicevox_synth.VoicevoxSynthesizer (fast, CPU-friendly,
-     used for everyday replies) and voicebox_synth.VoiceboxSynthesizer
+     StackChanSpeechSink -- see stackchan_speech_sink.py. Three engines
+     are available -- gemini_tts_synth.GeminiTtsSynthesizer (default: no
+     extra local service to run, ~4s/call measured), voicevox_synth.VoicevoxSynthesizer
+     (fast, CPU-friendly local engine), and voicebox_synth.VoiceboxSynthesizer
      (cloned voice, much slower on this machine's CPU -- see its own
      module docstring -- kept for uses where the clone voice matters more
      than latency).
@@ -30,7 +31,7 @@ from tachikoma_notifier.voicebox_synth import VoiceboxSynthesizer
 
 Logger = Callable[[str], None]
 
-DEFAULT_TTS_ENGINE = "voicevox"
+DEFAULT_TTS_ENGINE = "gemini"
 
 
 def build_voicebox_stackchan_sink(*, fallback: Optional[SpeechSink] = None) -> SpeechSink:
@@ -53,25 +54,31 @@ def build_voicebox_stackchan_sink(*, fallback: Optional[SpeechSink] = None) -> S
 def build_tts_stackchan_sink(*, fallback: Optional[SpeechSink] = None) -> SpeechSink:
     """StackChanSpeechSink wired to whichever TTS engine TACHIKOMA_TTS_ENGINE selects.
 
-    TACHIKOMA_TTS_ENGINE=voicevox (default) -> voicevox_synth.VoicevoxSynthesizer
+    TACHIKOMA_TTS_ENGINE=gemini   (default) -> gemini_tts_synth.GeminiTtsSynthesizer
+    TACHIKOMA_TTS_ENGINE=voicevox           -> voicevox_synth.VoicevoxSynthesizer
     TACHIKOMA_TTS_ENGINE=voicebox           -> voicebox_synth.VoiceboxSynthesizer
 
     Same StackChanSpeechSink class as build_voicebox_stackchan_sink; only
-    the synthesizer selection differs, so day-to-day replies can use the
-    fast VOICEVOX engine while the slower cloned-voice Voicebox engine
-    stays available by switching the one env var.
+    the synthesizer selection differs, so which engine speaks day-to-day
+    replies is a single env var away from changing.
     """
     from tachikoma_notifier.stackchan_speech_sink import StackChanSpeechSink
 
     engine = os.getenv("TACHIKOMA_TTS_ENGINE", DEFAULT_TTS_ENGINE).strip().lower()
-    if engine == "voicevox":
+    if engine == "gemini":
+        from tachikoma_notifier.gemini_tts_synth import GeminiTtsSynthesizer
+
+        synthesizer = GeminiTtsSynthesizer().synthesize
+    elif engine == "voicevox":
         from tachikoma_notifier.voicevox_synth import VoicevoxSynthesizer
 
         synthesizer = VoicevoxSynthesizer().synthesize
     elif engine == "voicebox":
         synthesizer = VoiceboxSynthesizer().synthesize
     else:
-        raise ValueError(f"unknown TACHIKOMA_TTS_ENGINE: {engine!r} (expected 'voicevox' or 'voicebox')")
+        raise ValueError(
+            f"unknown TACHIKOMA_TTS_ENGINE: {engine!r} (expected 'gemini', 'voicevox', or 'voicebox')"
+        )
 
     return StackChanSpeechSink(synthesizer=synthesizer, fallback=fallback or WindowsSpeechSink())
 
@@ -105,4 +112,4 @@ class ConversationReplyPipeline:
         return bool(self._sink.speak(reply.text))
 
 
-__all__ = ["ConversationReplyPipeline", "build_voicebox_stackchan_sink"]
+__all__ = ["ConversationReplyPipeline", "build_tts_stackchan_sink", "build_voicebox_stackchan_sink"]

@@ -113,14 +113,24 @@ class BuildTtsStackchanSinkTests(unittest.TestCase):
         "TACHIKOMA_STACKCHAN_DEVICE_TOKEN": "device-token",
         "TACHIKOMA_STACKCHAN_DEVICE_ID": "AABBCCDDEEFF",
     }
+    _GEMINI_ENV_VARS = {
+        "TACHIKOMA_GEMINI_API_KEY": "test-gemini-key",
+    }
     _VOICEBOX_ENV_VARS = {
         "TACHIKOMA_VOICEBOX_BASE_URL": "http://localhost:17493",
         "TACHIKOMA_VOICEBOX_PROFILE_ID": "1",
     }
 
-    def test_defaults_to_voicevox_engine(self):
-        with patch.dict("os.environ", self._STACKCHAN_ENV_VARS, clear=False):
+    def test_defaults_to_gemini_engine(self):
+        env = {**self._STACKCHAN_ENV_VARS, **self._GEMINI_ENV_VARS}
+        with patch.dict("os.environ", env, clear=False):
             os.environ.pop("TACHIKOMA_TTS_ENGINE", None)
+            sink = build_tts_stackchan_sink()
+        self.assertIsInstance(sink, StackChanSpeechSink)
+
+    def test_explicit_gemini_engine(self):
+        env = {**self._STACKCHAN_ENV_VARS, **self._GEMINI_ENV_VARS, "TACHIKOMA_TTS_ENGINE": "gemini"}
+        with patch.dict("os.environ", env, clear=False):
             sink = build_tts_stackchan_sink()
         self.assertIsInstance(sink, StackChanSpeechSink)
 
@@ -144,7 +154,8 @@ class BuildTtsStackchanSinkTests(unittest.TestCase):
 
     def test_explicit_fallback_is_used_instead_of_default(self):
         custom_fallback = FakeSink()
-        with patch.dict("os.environ", self._STACKCHAN_ENV_VARS, clear=False):
+        env = {**self._STACKCHAN_ENV_VARS, **self._GEMINI_ENV_VARS}
+        with patch.dict("os.environ", env, clear=False):
             os.environ.pop("TACHIKOMA_TTS_ENGINE", None)
             sink = build_tts_stackchan_sink(fallback=custom_fallback)
         self.assertIs(sink._fallback, custom_fallback)
