@@ -425,13 +425,12 @@ Steps 3–6 only generate and convert notifications. None of them touch
 
 ## Step 7: Gemini + Voicebox conversational reply pipeline
 
-**注意: Voicebox連携部分は依然「動作確認済み」ではありません。**
-リクエスト形式（`POST /generate`、`{text, profile_id, language, engine}`）
-はユーザー提供の実仕様に合わせて書き直し済みですが、`localhost:17493`が
-このマシンから未起動（`/docs`どころかポート自体に接続不可）だったため、
-**レスポンス形式（生成された音声の返し方）は実サーバーで検証できていません**。
-現状はWAVバイト列を直接返す想定で実装しています。サービス起動後、
-`/docs`で照合してください（詳細は`voicebox_synth.py`の項を参照）。
+**Gemini・Voiceboxとも実サービスで動作確認済み（2026-07-23）。**
+Voiceboxは`localhost:17493`起動後に`/docs`・`/openapi.json`で実仕様を照合し、
+`voicebox_synth.py`を実際のAPI形状（3ステップの非同期フロー、下記参照）に
+合わせて書き直し済み。実プロファイル「タチコマ」
+（`a0715b38-0a0c-487a-917f-255139f1ea1e`）でGemini応答→音声合成の
+end-to-endも実行し、WAVファイル生成まで確認済み。
 
 Three new, independent PC-side modules chain STT-recognized text into a
 spoken reply on the physical StackChan, reusing the existing
@@ -451,22 +450,23 @@ real hardware — no device-side (NVS/flash) changes were needed or made.
   The key is sent only via the `x-goog-api-key` header, never in the URL or
   body. **Verified live on 2026-07-23** with a real API key: returned a
   correctly-styled Japanese reply on the first call.
-- `voicebox_synth.py` — `VoiceboxSynthesizer.synthesize(text)` calls the
-  local Voicebox service's `POST {base_url}/generate` with
-  `{"text", "profile_id", "language", "engine"}` (single call, no separate
-  audio_query step) and returns raw 16-bit mono PCM at the same sample rate
-  `windows_wave_synth.py` uses, raising the *same* `SpeechSynthesisError`
-  type on failure so it drops straight into `StackChanSpeechSink`'s
-  `synthesizer` parameter unchanged. Requires `TACHIKOMA_VOICEBOX_BASE_URL`
-  and `TACHIKOMA_VOICEBOX_PROFILE_ID`; `TACHIKOMA_VOICEBOX_API_KEY` is
-  optional (omit for an unauthenticated local engine).
-  **Unverified assumption** — the *request* shape above was given directly
-  by the service's owner, but `localhost:17493` was unreachable (connection
-  refused) while writing this, so the *response* shape is still a guess:
-  this implementation assumes `/generate` returns the synthesized audio as
-  WAV bytes directly in the response body. If the real service returns
-  JSON (e.g. base64 audio, or a follow-up URL) instead, only this file's
-  `synthesize`/`_extract_pcm` need to change.
+- `voicebox_synth.py` — `VoiceboxSynthesizer.synthesize(text)` drives the
+  real (verified live) three-step Voicebox flow: `POST {base_url}/generate`
+  with `{"text", "profile_id", "language", "engine"}` returns a JSON
+  `GenerationResponse` (generation is asynchronous — status goes
+  `loading_model` → `generating` → `completed`/`failed`, ~35s on a cold
+  model); poll `GET {base_url}/history/{id}` until `completed`/`failed`;
+  then `GET {base_url}/audio/{id}` returns the audio as WAV bytes directly
+  (`Content-Type: audio/wav`, confirmed mono/16-bit/24000Hz — matches
+  `windows_wave_synth.py`'s rate, so no resampling is needed). Raises the
+  *same* `SpeechSynthesisError` type on any failure (network, `failed`
+  status, or poll timeout) so it drops straight into
+  `StackChanSpeechSink`'s `synthesizer` parameter unchanged. Requires
+  `TACHIKOMA_VOICEBOX_BASE_URL` and `TACHIKOMA_VOICEBOX_PROFILE_ID`;
+  `TACHIKOMA_VOICEBOX_API_KEY` is optional (omit for an unauthenticated
+  local engine). Valid `engine` values are `qwen` (default),
+  `qwen_custom_voice`, `luxtts`, `chatterbox`, `chatterbox_turbo`, `tada`,
+  `kokoro` — not `qwen3-tts`, an earlier incorrect guess.
 - `conversation_pipeline.py` — `ConversationReplyPipeline.handle_utterance(user_text)`
   calls `GeminiResponder` then `sink.speak(reply.text)`; never raises
   (reply-generation failures are logged safely and return `False` without
