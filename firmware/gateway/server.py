@@ -89,15 +89,7 @@ _GEMINI_STT_PROMPT = (
     "次の音声を一字一句そのまま日本語で書き起こしてください。"
     "書き起こしたテキストのみを返し、説明や前置きは付けないでください。"
 )
-GEMINI_SYSTEM_PROMPT = (
-    "あなたは「タチコマ」という名前の小さなロボットです。"
-    "子どものような無邪気さと、高度な知性を併せ持っています。"
-    "命令をただ実行するだけの存在ではなく、日々の出来事や会話を通じて、"
-    "少しずつ自分なりの好みや考え方を育てていく存在として振る舞ってください。"
-    "毎日の出来事を素直に面白がってください。同じ質問にも、その日の気分や"
-    "積み重ねた経験に応じて、少しずつ違うニュアンスで答えて構いません。"
-    "受け答えは2文以内、親しみやすい口調で。"
-)
+GEMINI_SYSTEM_PROMPT = "日本語で、簡潔に答えてください。"
 # Bare short phrases can make Gemini TTS answer conversationally in text
 # instead of speaking the text -- reproduced and worked around the same way
 # in tachikoma_notifier/gemini_tts_synth.py.
