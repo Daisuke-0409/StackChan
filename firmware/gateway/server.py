@@ -35,7 +35,8 @@ from typing import Any, Optional
 
 MAX_INPUT_BYTES = 512
 MAX_OUTPUT_BYTES = 4096
-MAX_SPEECH_AUDIO_BYTES = 256 * 1024  # ~5.5s at 24kHz/16-bit/mono; matches the device-side cap
+MAX_SPEECH_AUDIO_BYTES = 720_000  # ~15s at 24kHz/16-bit/mono; sized for a real Gemini TTS reply,
+                                   # not just the old fixed confirmation tone
 MAX_TRANSCRIBE_AUDIO_BYTES = 256 * 1024  # matches VoiceInputController's kMaxRecordingSamples cap
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
@@ -257,7 +258,16 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
             # transcribe->chat->speak_queue path is wired end-to-end. A TTS
             # failure never fails the /v1/chat response itself.
             pcm = _generate_beep_pcm()
-        enqueue_speech(payload["device_id"], pcm)
+        enqueue_status, enqueue_body = enqueue_speech(payload["device_id"], pcm)
+        if enqueue_status != 200:
+            # Previously silent: enqueue_speech()'s return value was
+            # discarded here, so a rejection (e.g. 413 for audio over
+            # MAX_SPEECH_AUDIO_BYTES) left /v1/chat looking like a full
+            # success -- text delivered, but the device would never hear
+            # anything, with no log line anywhere explaining why.
+            print(f"gateway enqueue_speech failed status={enqueue_status} "
+                  f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)} "
+                  f"device_id={payload['device_id']}")
     return status, body
 
 
