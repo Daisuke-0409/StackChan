@@ -30,6 +30,14 @@ constexpr std::string_view kTag = "VoiceInput";
 constexpr char kSettingsNamespace[] = "tachi_stt";  // NVS namespace <= 15 chars
 constexpr uint32_t kMaxRecordingMs = 8000;
 constexpr uint32_t kMinRecordingMs = 300;
+// How long after playback ends (Speaking -> Idle) to ignore a new Press.
+// Confirmed on real hardware: the speaker's own vibration during Zephyr
+// TTS playback reached the Si12T head-touch sensor and was misread as a
+// physical touch, immediately re-triggering push-to-talk and producing an
+// unbounded reply loop with no user involvement. Tune here if false
+// triggers still slip through (louder replies vibrate longer) or if this
+// proves longer than necessary once retested.
+constexpr uint32_t kPostSpeechCooldownMs = 1500;
 constexpr size_t kFrameSamples = 320;  // ~20ms at 16kHz mono, matched to the stackchan update tick
 constexpr size_t kMaxRecordingSamples = 128 * 1024;  // 256 KiB of int16 PCM; mirrors SpeechAnnouncer's kMaxAudioBytes
 constexpr int kFallbackSampleRate = 16000;
@@ -118,9 +126,18 @@ bool VoiceInputController::ConfigureTranscribeQueue(const std::string& endpoint,
 void VoiceInputController::OnButtonPressed(uint32_t now)
 {
     const auto state = tachikoma_state::GetTachikomaStateManager().GetCurrentState();
-    if (state != tachikoma_state::TachikomaState::Idle && state != tachikoma_state::TachikomaState::Speaking) {
+    if (state != tachikoma_state::TachikomaState::Idle) {
+        // Speaking is deliberately excluded (was previously allowed, to let
+        // a user barge in on a reply): combined with the speaker-vibration
+        // false-trigger above, allowing a Press while still Speaking meant
+        // the tail end of the false trigger itself could restart the loop.
         std::lock_guard<std::mutex> lock(mutex_);
         last_error_ = VoiceInputErrorCode::Busy;
+        return;
+    }
+    if (static_cast<int32_t>(now - cooldown_until_ms_) < 0) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_error_ = VoiceInputErrorCode::Cooldown;
         return;
     }
 
@@ -169,6 +186,13 @@ void VoiceInputController::ConnectHeadTouchTrigger()
 
 void VoiceInputController::Update(uint32_t now)
 {
+    const auto current_state = tachikoma_state::GetTachikomaStateManager().GetCurrentState();
+    if (last_observed_state_ == tachikoma_state::TachikomaState::Speaking &&
+        current_state == tachikoma_state::TachikomaState::Idle) {
+        cooldown_until_ms_ = now + kPostSpeechCooldownMs;
+    }
+    last_observed_state_ = current_state;
+
     bool is_recording;
     uint32_t started_ms;
     {

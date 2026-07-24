@@ -31,6 +31,7 @@
 
 #include <hal/hal.h>
 
+#include "stackchan/state/tachikoma_state_types.h"
 #include "voice_input_types.h"
 
 namespace stackchan::voice_input {
@@ -98,6 +99,15 @@ private:
     uint32_t recording_started_ms_ = 0;
     std::vector<int16_t> buffer_;
     VoiceInputErrorCode last_error_ = VoiceInputErrorCode::None;
+
+    // Post-speech cooldown (see kPostSpeechCooldownMs in the .cpp): a
+    // Speaking -> Idle edge, detected in Update(), arms cooldown_until_ms_
+    // so a Press within the window right after playback ends is ignored.
+    // Guards against the speaker's own vibration reaching the head-touch
+    // sensor and being misread as a real Press. last_observed_state_ is
+    // Update()'s only concern -- OnButtonPressed() doesn't touch it.
+    tachikoma_state::TachikomaState last_observed_state_ = tachikoma_state::TachikomaState::Booting;
+    uint32_t cooldown_until_ms_ = 0;
 
     // Set once from ConnectHeadTouchTrigger() at boot; never touched
     // concurrently, so no mutex_ protection needed.

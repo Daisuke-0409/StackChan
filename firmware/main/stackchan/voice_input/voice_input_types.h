@@ -14,6 +14,7 @@ enum class VoiceInputErrorCode : uint8_t {
     None,
     NotConfigured,
     Busy,
+    Cooldown,
     RecordingTooShort,
     NetworkUnavailable,
     ConnectionFailed,
