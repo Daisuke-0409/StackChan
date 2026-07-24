@@ -1,11 +1,16 @@
 import unittest
+from unittest import mock
 
+from . import server
 from .server import (
     MAX_INPUT_BYTES,
     MAX_SPEECH_AUDIO_BYTES,
     MAX_SAMPLE_RATE,
     MAX_TRANSCRIBE_AUDIO_BYTES,
     MIN_SAMPLE_RATE,
+    _extract_ready_sentences,
+    _gemini_stream_chat_and_speak,
+    _gemini_streaming_enabled,
     _gemini_tts_pcm,
     _pcm_to_wav,
     dequeue_speech,
@@ -127,6 +132,28 @@ class SpeechQueueTests(unittest.TestCase):
         status, _ = enqueue_speech(self.device_id, b"\x00" * MAX_SPEECH_AUDIO_BYTES)
         self.assertEqual(status, 200)
 
+    def test_append_true_queues_in_order_instead_of_replacing(self):
+        enqueue_speech(self.device_id, b"\x01\x00", append=True)
+        enqueue_speech(self.device_id, b"\x02\x00", append=True)
+        enqueue_speech(self.device_id, b"\x03\x00", append=True)
+        self.assertEqual(dequeue_speech(self.device_id), b"\x01\x00")
+        self.assertEqual(dequeue_speech(self.device_id), b"\x02\x00")
+        self.assertEqual(dequeue_speech(self.device_id), b"\x03\x00")
+        self.assertIsNone(dequeue_speech(self.device_id))
+
+    def test_append_true_on_empty_queue_behaves_like_first_item(self):
+        # append=True with nothing queued yet still has to seed the list.
+        status, _ = enqueue_speech(self.device_id, b"\x01\x00", append=True)
+        self.assertEqual(status, 200)
+        self.assertEqual(dequeue_speech(self.device_id), b"\x01\x00")
+
+    def test_append_false_after_append_true_still_replaces(self):
+        enqueue_speech(self.device_id, b"\x01\x00", append=True)
+        enqueue_speech(self.device_id, b"\x02\x00", append=True)
+        enqueue_speech(self.device_id, b"\x03\x00")  # default append=False
+        self.assertEqual(dequeue_speech(self.device_id), b"\x03\x00")
+        self.assertIsNone(dequeue_speech(self.device_id))
+
 
 class TranscribeTests(unittest.TestCase):
     def setUp(self):
@@ -182,6 +209,190 @@ class TranscribeTests(unittest.TestCase):
                                           sample_rate=16000)
         self.assertEqual(status, 503)
         self.assertEqual(body["error"], "server_error")
+
+
+class SentenceSplittingTests(unittest.TestCase):
+    """_extract_ready_sentences is pure/network-free, so exercise it directly."""
+
+    def test_splits_on_each_delimiter(self):
+        sentences, remainder = _extract_ready_sentences("こんにちは、元気ですか？今日は晴れです。")
+        self.assertEqual(sentences, ["こんにちは、元気ですか？", "今日は晴れです。"])
+        self.assertEqual(remainder, "")
+
+    def test_no_delimiter_yields_only_remainder(self):
+        sentences, remainder = _extract_ready_sentences("まだ話している途中です")
+        self.assertEqual(sentences, [])
+        self.assertEqual(remainder, "まだ話している途中です")
+
+    def test_short_fragment_merges_into_next_sentence(self):
+        # "はい。" alone is 3 characters (at the GEMINI_MIN_SENTENCE_CHARS
+        # boundary) and must not become its own sentence.
+        sentences, remainder = _extract_ready_sentences("はい。それでは始めましょう。")
+        self.assertEqual(sentences, ["はい。それでは始めましょう。"])
+        self.assertEqual(remainder, "")
+
+    def test_short_fragments_merge_one_step_at_a_time(self):
+        # "え。" (2 chars) is too short alone, so it merges with the next
+        # delimiter-terminated span ("え。あ。", 4 chars) and flushes there
+        # -- merging is step-by-step against the growing candidate, not an
+        # unbounded chain across every subsequent short fragment.
+        sentences, remainder = _extract_ready_sentences("え。あ。うーん、そうですね。")
+        self.assertEqual(sentences, ["え。あ。", "うーん、そうですね。"])
+        self.assertEqual(remainder, "")
+
+    def test_incremental_calls_accumulate_correctly(self):
+        # Mirrors how the streaming loop actually calls this: once per
+        # arriving delta, carrying the remainder forward each time.
+        pending = ""
+        all_sentences = []
+        for delta in ["こんにち", "は。元気で", "すか？", "はい、", "元気です。"]:
+            pending += delta
+            ready, pending = _extract_ready_sentences(pending)
+            all_sentences.extend(ready)
+        if pending.strip():
+            all_sentences.append(pending)
+        self.assertEqual(all_sentences, ["こんにちは。", "元気ですか？", "はい、元気です。"])
+
+
+class _FakeSseResponse:
+    """Minimal stand-in for the context-manager/iterable urllib returns,
+    carrying pre-built SSE `data: {...}` lines as bytes."""
+
+    def __init__(self, events: list[dict]):
+        self._lines = []
+        for event in events:
+            self._lines.append(("data: " + __import__("json").dumps(event)).encode("utf-8"))
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        return False
+
+    def __iter__(self):
+        return iter(self._lines)
+
+
+def _sse_text_event(delta: str) -> dict:
+    return {"candidates": [{"content": {"parts": [{"text": delta}]}}]}
+
+
+class GeminiStreamingTests(unittest.TestCase):
+    def setUp(self):
+        self.env = {"AI_PROVIDER": "gemini", "AI_PROVIDER_API_KEY": "fake-key",
+                    "ALLOW_INSECURE_DEV": "1", "DEVICE_TOKEN": "test-device-token"}
+        self.headers = {"Authorization": "Bearer test-device-token"}
+        self.device_id = f"dev-stream-{id(self)}"
+        self.payload = {"device_id": self.device_id, "session_id": "s1", "request_id": "r1",
+                        "text": "こんにちは"}
+
+    def test_streaming_enabled_by_default(self):
+        self.assertTrue(_gemini_streaming_enabled({}))
+        self.assertTrue(_gemini_streaming_enabled({"GEMINI_STREAMING": "1"}))
+
+    def test_streaming_disabled_via_env(self):
+        self.assertFalse(_gemini_streaming_enabled({"GEMINI_STREAMING": "0"}))
+
+    def test_process_chat_routes_to_streaming_by_default(self):
+        with mock.patch.object(server, "_gemini_stream_chat_and_speak",
+                               return_value=(200, {"text": "ok", "request_id": "r1",
+                                                   "session_id": "s1", "is_final": True})) as streamed:
+            process_chat(self.payload, self.headers, self.env)
+        streamed.assert_called_once()
+
+    def test_process_chat_skips_streaming_when_disabled(self):
+        env = dict(self.env, GEMINI_STREAMING="0")
+        with mock.patch.object(server, "_gemini_stream_chat_and_speak") as streamed:
+            with mock.patch.object(server, "_gemini_chat_response",
+                                   return_value=(200, {"text": "ok", "request_id": "r1",
+                                                       "session_id": "s1", "is_final": True})) as non_streamed:
+                process_chat(self.payload, self.headers, env)
+        streamed.assert_not_called()
+        non_streamed.assert_called_once()
+
+    def test_without_api_key_is_server_error_and_enqueues_nothing(self):
+        env = dict(self.env)
+        del env["AI_PROVIDER_API_KEY"]
+        status, body = _gemini_stream_chat_and_speak("こんにちは", self.payload, env)
+        self.assertEqual(status, 503)
+        self.assertEqual(body["error"], "server_error")
+        self.assertIsNone(dequeue_speech(self.device_id))
+
+    def test_multiple_sentences_enqueue_in_order(self):
+        events = [_sse_text_event(d) for d in ["こんにちは。", "元気です", "か？"]]
+        fake_pcm_calls = []
+
+        def fake_tts(text, env):
+            fake_pcm_calls.append(text)
+            return (b"\x01\x00" * 10) if text == "こんにちは。" else (b"\x02\x00" * 10)
+
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=_FakeSseResponse(events)):
+            with mock.patch.object(server, "_gemini_tts_pcm", side_effect=fake_tts):
+                status, body = _gemini_stream_chat_and_speak("こんにちは", self.payload, self.env)
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body["text"], "こんにちは。元気ですか？")
+        self.assertEqual(fake_pcm_calls, ["こんにちは。", "元気ですか？"])
+        # FIFO order: first sentence's audio must come out of the queue first.
+        first = dequeue_speech(self.device_id)
+        second = dequeue_speech(self.device_id)
+        self.assertEqual(first, b"\x01\x00" * 10)
+        self.assertEqual(second, b"\x02\x00" * 10)
+        self.assertIsNone(dequeue_speech(self.device_id))
+
+    def test_short_fragments_reduce_tts_call_count(self):
+        events = [_sse_text_event(d) for d in ["え。", "あ。", "うーん、そうですね。"]]
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=_FakeSseResponse(events)):
+            with mock.patch.object(server, "_gemini_tts_pcm", return_value=b"\x01\x00" * 10) as fake_tts:
+                status, _ = _gemini_stream_chat_and_speak("何か言って", self.payload, self.env)
+        self.assertEqual(status, 200)
+        # "え。" alone (2 chars) merges forward into "え。あ。" (4 chars,
+        # over threshold) instead of getting its own TTS call -- 2 calls
+        # total, not 3 (one per raw delimiter).
+        self.assertEqual(fake_tts.call_args_list,
+                         [mock.call("え。あ。", self.env), mock.call("うーん、そうですね。", self.env)])
+
+    def test_trailing_fragment_without_delimiter_is_flushed_at_stream_end(self):
+        events = [_sse_text_event(d) for d in ["最後の一言です"]]  # no trailing delimiter
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=_FakeSseResponse(events)):
+            with mock.patch.object(server, "_gemini_tts_pcm", return_value=b"\x01\x00" * 10) as fake_tts:
+                status, body = _gemini_stream_chat_and_speak("何か言って", self.payload, self.env)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["text"], "最後の一言です")
+        fake_tts.assert_called_once_with("最後の一言です", self.env)
+
+    def test_sentence_tts_failure_is_skipped_not_fatal(self):
+        events = [_sse_text_event(d) for d in ["だめな文です。", "これは話せます。"]]
+
+        def fake_tts(text, env):
+            return None if text == "だめな文です。" else b"\x02\x00" * 10
+
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=_FakeSseResponse(events)):
+            with mock.patch.object(server, "_gemini_tts_pcm", side_effect=fake_tts):
+                status, body = _gemini_stream_chat_and_speak("何か言って", self.payload, self.env)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["text"], "だめな文です。これは話せます。")
+        # Only the successful sentence's audio made it to the queue.
+        self.assertEqual(dequeue_speech(self.device_id), b"\x02\x00" * 10)
+        self.assertIsNone(dequeue_speech(self.device_id))
+
+    def test_all_sentences_failing_falls_back_to_confirmation_tone(self):
+        events = [_sse_text_event(d) for d in ["だめな文です。"]]
+        with mock.patch.object(server.urllib.request, "urlopen", return_value=_FakeSseResponse(events)):
+            with mock.patch.object(server, "_gemini_tts_pcm", return_value=None):
+                status, _ = _gemini_stream_chat_and_speak("何か言って", self.payload, self.env)
+        self.assertEqual(status, 200)
+        audio = dequeue_speech(self.device_id)
+        self.assertIsNotNone(audio)
+        self.assertGreater(len(audio), 0)
+
+    def test_http_error_401_maps_to_authentication_failed(self):
+        import urllib.error
+        with mock.patch.object(server.urllib.request, "urlopen",
+                               side_effect=urllib.error.HTTPError("url", 401, "unauthorized", {}, None)):
+            status, body = _gemini_stream_chat_and_speak("何か言って", self.payload, self.env)
+        self.assertEqual(status, 502)
+        self.assertEqual(body["error"], "authentication_failed")
 
 
 class WavHeaderTests(unittest.TestCase):

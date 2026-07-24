@@ -26,6 +26,7 @@ import os
 import ssl
 import struct
 import threading
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -41,12 +42,26 @@ MAX_TRANSCRIBE_AUDIO_BYTES = 256 * 1024  # matches VoiceInputController's kMaxRe
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
 
-_speech_queue: dict[str, bytes] = {}
+# Each device_id maps to an ordered list, drained front-first by
+# dequeue_speech(). enqueue_speech() defaults to *replacing* that list with
+# a single new item -- the original Phase 5 contract POST /v1/speak and its
+# callers (StackChanSpeechSink) still rely on ("only the latest pending
+# announcement is kept"), verified against real hardware and covered by
+# test_second_enqueue_replaces_first_pending_one. append=True is additive
+# only, used by the streaming chat->TTS path (see
+# _gemini_stream_chat_and_speak) to queue several sentences in speaking
+# order without one clobbering the last.
+_speech_queue: dict[str, list[bytes]] = {}
 _speech_queue_lock = threading.Lock()
 
 
-def enqueue_speech(device_id: str, audio: bytes) -> tuple[int, dict[str, Any]]:
-    """Store one pending announcement for device_id, replacing any prior one."""
+def enqueue_speech(device_id: str, audio: bytes, *, append: bool = False) -> tuple[int, dict[str, Any]]:
+    """Store a pending announcement for device_id.
+
+    append=False (default): replaces any existing queue for this device
+    with just this one item -- the original single-slot behavior.
+    append=True: adds to the end of the existing queue instead.
+    """
     if not isinstance(device_id, str) or not device_id:
         return _result(400, "invalid_input")
     if not isinstance(audio, (bytes, bytearray)) or not audio or len(audio) % 2 != 0:
@@ -54,14 +69,24 @@ def enqueue_speech(device_id: str, audio: bytes) -> tuple[int, dict[str, Any]]:
     if len(audio) > MAX_SPEECH_AUDIO_BYTES:
         return _result(413, "invalid_input")
     with _speech_queue_lock:
-        _speech_queue[device_id] = bytes(audio)
+        if append and device_id in _speech_queue:
+            _speech_queue[device_id].append(bytes(audio))
+        else:
+            _speech_queue[device_id] = [bytes(audio)]
     return 200, {"ok": True}
 
 
 def dequeue_speech(device_id: str) -> Optional[bytes]:
-    """Pop and return the pending announcement for device_id, if any."""
+    """Pop and return the oldest pending announcement for device_id, if any."""
     with _speech_queue_lock:
-        return _speech_queue.pop(device_id, None)
+        pending = _speech_queue.get(device_id)
+        if not pending:
+            _speech_queue.pop(device_id, None)
+            return None
+        audio = pending.pop(0)
+        if not pending:
+            del _speech_queue[device_id]
+        return audio
 
 
 def _result(status: int, code: str, **extra: Any) -> tuple[int, dict[str, Any]]:
@@ -175,6 +200,164 @@ def _gemini_tts_pcm(text: str, env: dict[str, str]) -> Optional[bytes]:
         return None
 
 
+GEMINI_SENTENCE_DELIMITERS = "。！？!?"
+GEMINI_MIN_SENTENCE_CHARS = 3
+
+
+def _gemini_streaming_enabled(env: dict[str, str]) -> bool:
+    return env.get("GEMINI_STREAMING", "1") != "0"
+
+
+def _extract_ready_sentences(pending: str) -> tuple[list[str], str]:
+    """Splits pending into zero or more sentences ready to speak, plus the
+    remaining unflushed tail (kept for the next call, or for a final
+    end-of-stream flush by the caller).
+
+    A candidate ending at a delimiter is held back -- merged into whatever
+    follows -- while it is at most GEMINI_MIN_SENTENCE_CHARS characters
+    (stripped), so a fragment like "はい。" gets combined with the next
+    sentence instead of triggering its own (wasted) TTS call. Pure and
+    network-free so the splitting logic is unit-testable on its own.
+    """
+    sentences: list[str] = []
+    start = 0
+    for i, ch in enumerate(pending):
+        if ch not in GEMINI_SENTENCE_DELIMITERS:
+            continue
+        candidate = pending[start:i + 1]
+        if len(candidate.strip()) > GEMINI_MIN_SENTENCE_CHARS:
+            sentences.append(candidate)
+            start = i + 1
+        # else: too short on its own -- left in place so it merges into
+        # whatever candidate is found at the next delimiter.
+    return sentences, pending[start:]
+
+
+def _iter_gemini_sse_text_deltas(response: Any):
+    """Yields each incremental text delta from a streamGenerateContent SSE
+    response, in arrival order. Lines that aren't a well-formed `data: {...}`
+    event, or don't carry a text part (e.g. a bare finishReason chunk), are
+    silently skipped -- a stream is expected to contain a mix of these.
+    """
+    for raw_line in response:
+        line = raw_line.decode("utf-8", errors="replace").strip()
+        if not line.startswith("data:"):
+            continue
+        chunk_str = line[len("data:"):].strip()
+        if not chunk_str or chunk_str == "[DONE]":
+            continue
+        try:
+            chunk = json.loads(chunk_str)
+            delta = chunk["candidates"][0]["content"]["parts"][0]["text"]
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError):
+            continue
+        if isinstance(delta, str) and delta:
+            yield delta
+
+
+def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
+                                  env: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    """Streaming counterpart to _gemini_chat_response() + the TTS/enqueue
+    block in process_chat(): as Gemini's reply streams in, each completed
+    sentence is synthesized and enqueued immediately (in speaking order,
+    via enqueue_speech(..., append=True)) instead of waiting for the full
+    reply before any audio exists at all. Returns the same (status, body)
+    shape as the non-streaming path, so process_chat() doesn't need to know
+    which one ran.
+
+    A sentence's TTS failure is logged and skipped, not fatal -- later
+    sentences still get their turn. Only a total failure (no sentence ever
+    enqueued) falls back to the fixed confirmation tone, matching the
+    non-streaming path's existing behavior.
+    """
+    key = env.get("AI_PROVIDER_API_KEY", "")
+    if not key:
+        return _result(503, "server_error")
+    device_id = payload["device_id"]
+    model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
+    url = f"{GEMINI_API_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
+    request_body = json.dumps({
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+    }).encode("utf-8")
+    request = urllib.request.Request(url, data=request_body, method="POST", headers={
+        "Content-Type": "application/json", "x-goog-api-key": key,
+    })
+
+    t_start = time.monotonic()
+    full_text_parts: list[str] = []
+    enqueued_count = 0
+    sentence_index = 0
+
+    def flush_sentence(sentence: str) -> None:
+        nonlocal enqueued_count, sentence_index
+        sentence = sentence.strip()
+        if not sentence:
+            return
+        sentence_index += 1
+        idx = sentence_index
+        t_ready = time.monotonic()
+        pcm = _gemini_tts_pcm(sentence, env)
+        t_tts = time.monotonic()
+        if pcm is None:
+            print(f"gateway streaming sentence={idx} tts_failed text_len={len(sentence)} "
+                  f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
+                  f"tts_ms={(t_tts - t_ready) * 1000:.0f}")
+            return
+        enqueue_status, enqueue_body = enqueue_speech(device_id, pcm, append=enqueued_count > 0)
+        t_enqueue = time.monotonic()
+        if enqueue_status != 200:
+            print(f"gateway streaming sentence={idx} enqueue_failed status={enqueue_status} "
+                  f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)}")
+            return
+        enqueued_count += 1
+        print(f"gateway streaming sentence={idx} text_len={len(sentence)} pcm_bytes={len(pcm)} "
+              f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
+              f"tts_ms={(t_tts - t_ready) * 1000:.0f} "
+              f"enqueue_ms={(t_enqueue - t_tts) * 1000:.0f} "
+              f"total_ms={(t_enqueue - t_start) * 1000:.0f}")
+
+    pending = ""
+    first_chunk_logged = False
+    try:
+        with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
+                                    context=ssl.create_default_context()) as response:
+            for delta in _iter_gemini_sse_text_deltas(response):
+                if not first_chunk_logged:
+                    first_chunk_logged = True
+                    print(f"gateway streaming first_chunk_ms={(time.monotonic() - t_start) * 1000:.0f}")
+                full_text_parts.append(delta)
+                pending += delta
+                ready, pending = _extract_ready_sentences(pending)
+                for sentence in ready:
+                    flush_sentence(sentence)
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return _result(502, "authentication_failed")
+        if exc.code == 429:
+            return _result(503, "rate_limited")
+        return _result(502, "server_error")
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        return _result(504, "timeout")
+
+    if pending.strip():
+        flush_sentence(pending)
+
+    full_text = "".join(full_text_parts).strip()
+    if not full_text:
+        return _result(502, "invalid_response")
+    full_text = full_text[:MAX_OUTPUT_BYTES]
+
+    if enqueued_count == 0:
+        # Every sentence's TTS (or the stream itself) failed -- same
+        # fallback the non-streaming path uses so /v1/chat still produces
+        # *something* audible rather than silence with no explanation.
+        enqueue_speech(device_id, _generate_beep_pcm())
+
+    return 200, {"text": full_text, "request_id": payload["request_id"],
+                 "session_id": payload["session_id"], "is_final": True}
+
+
 def _provider_response(text: str, payload: dict[str, Any], env: dict[str, str]) -> tuple[int, dict[str, Any]]:
     provider = env.get("AI_PROVIDER", "mock").lower()
     if provider == "mock":
@@ -246,10 +429,18 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
     text = payload.get("text")
     if not isinstance(text, str) or not text or len(text.encode("utf-8")) > MAX_INPUT_BYTES:
         return _result(400, "invalid_input")
+
+    provider = env.get("AI_PROVIDER", "mock").lower()
+    if provider == "gemini" and _gemini_streaming_enabled(env):
+        # Owns TTS/enqueue itself (per completed sentence, as they arrive)
+        # instead of the single after-the-fact block below -- see
+        # _gemini_stream_chat_and_speak's docstring.
+        return _gemini_stream_chat_and_speak(text, payload, env)
+
     status, body = _provider_response(text, payload, env)
     if status == 200:
         pcm = None
-        if env.get("AI_PROVIDER", "mock").lower() == "gemini":
+        if provider == "gemini":
             pcm = _gemini_tts_pcm(body["text"], env)
         if pcm is None:
             # No real TTS (non-Gemini provider, or Gemini TTS failed this
