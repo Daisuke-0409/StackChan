@@ -42,6 +42,19 @@ bool HasExceededMaxDuration(uint32_t now, uint32_t started_ms, uint32_t max_dura
 bool MeetsMinimumDuration(uint32_t duration_ms, uint32_t min_duration_ms);
 size_t ClampToRemainingCapacity(size_t current_size, size_t incoming, size_t capacity);
 
+// This board's mic is configured with AUDIO_INPUT_REFERENCE=true (see
+// hal/board/config.h), which makes AudioCodec::input_channels() 2: channel
+// 0 is the real microphone, channel 1 an echo-cancellation reference feed
+// -- AudioCodec::InputData() returns them raw-interleaved, undocumented at
+// the call site. Uploading that as declared-mono (the Content-Type this
+// class sends has always said "channels=1") spliced a much quieter,
+// unrelated signal into every other sample -- confirmed on real hardware
+// via a saved WAV: channel-0 samples ran ~13x the RMS of channel-1's.
+// Extracting channel 0 here keeps the rest of this file's mono assumption
+// (buffer_, kMaxRecordingSamples, the "channels=1" upload header) actually
+// true instead of just declared. channels<=1 returns the input unchanged.
+std::vector<int16_t> DownmixToChannel0(const std::vector<int16_t>& interleaved, int channels);
+
 // Phase 5 Step 6 physical trigger: the Si12T head-touch sensor already
 // detects Press/Release (see hal_head_touch.cpp) and delivers them via
 // Hal::onHeadPetGesture, whose only other subscriber (HeadPetModifier)

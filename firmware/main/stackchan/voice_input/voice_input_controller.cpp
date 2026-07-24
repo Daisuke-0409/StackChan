@@ -79,6 +79,19 @@ size_t ClampToRemainingCapacity(size_t current_size, size_t incoming, size_t cap
     return std::min(incoming, capacity - current_size);
 }
 
+std::vector<int16_t> DownmixToChannel0(const std::vector<int16_t>& interleaved, int channels)
+{
+    if (channels <= 1) {
+        return interleaved;
+    }
+    std::vector<int16_t> mono;
+    mono.reserve(interleaved.size() / static_cast<size_t>(channels));
+    for (size_t i = 0; i < interleaved.size(); i += static_cast<size_t>(channels)) {
+        mono.push_back(interleaved[i]);
+    }
+    return mono;
+}
+
 TriggerAction MapHeadTouchGesture(HeadPetGesture gesture)
 {
     switch (gesture) {
@@ -217,6 +230,11 @@ void VoiceInputController::Update(uint32_t now)
     if (!codec->InputData(frame)) {
         return;  // no new samples available this tick
     }
+    // See DownmixToChannel0's declaration: this board's mic is 2-channel
+    // (real mic + AEC reference) at the I2S level, but every consumer past
+    // this point -- buffer_, the upload's declared "channels=1" -- assumes
+    // mono. No-ops when input_channels() is 1.
+    frame = DownmixToChannel0(frame, codec->input_channels());
 
     bool cap_reached = false;
     {

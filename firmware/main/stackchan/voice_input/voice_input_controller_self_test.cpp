@@ -50,6 +50,21 @@ bool RunVoiceInputControllerSelfTest()
     passed &= Expect(ClampToRemainingCapacity(1200, 320, 1000) == 0, "past capacity -> nothing taken");
     passed &= Expect(ClampToRemainingCapacity(0, 0, 1000) == 0, "empty frame -> nothing taken");
 
+    // DownmixToChannel0: this board's mic is 2-channel (real mic + AEC
+    // reference, see AUDIO_INPUT_REFERENCE in hal/board/config.h) -- must
+    // extract channel 0 only, and must not touch already-mono input.
+    {
+        const std::vector<int16_t> stereo = {10, -1, 20, -2, 30, -3};
+        const auto mono = DownmixToChannel0(stereo, 2);
+        passed &= Expect(mono.size() == 3, "2ch downmix halves the sample count");
+        passed &= Expect(mono[0] == 10 && mono[1] == 20 && mono[2] == 30,
+                         "2ch downmix keeps only channel 0's samples, in order");
+
+        const std::vector<int16_t> mono_input = {5, 6, 7};
+        passed &= Expect(DownmixToChannel0(mono_input, 1) == mono_input,
+                         "channels<=1 returns the input unchanged");
+    }
+
     passed &= Expect(VoiceInputErrorCode::NetworkUnavailable != VoiceInputErrorCode::None,
                      "NetworkUnavailable distinct from None");
     passed &= Expect(VoiceInputErrorCode::RecordingTooShort != VoiceInputErrorCode::NetworkUnavailable,
