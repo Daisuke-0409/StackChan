@@ -81,7 +81,14 @@ def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
 GEMINI_DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
 GEMINI_DEFAULT_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 GEMINI_DEFAULT_TTS_VOICE = "Zephyr"  # chosen by ear over Kore + 6 alternates against real Japanese text
+GEMINI_DEFAULT_STT_MODEL = "gemini-flash-latest"  # gemini-2.5-flash 404'd ("no longer available to
+                                                   # new users") when verified live 2026-07-24; -latest
+                                                   # tracks whatever Google currently recommends
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+_GEMINI_STT_PROMPT = (
+    "次の音声を一字一句そのまま日本語で書き起こしてください。"
+    "書き起こしたテキストのみを返し、説明や前置きは付けないでください。"
+)
 GEMINI_SYSTEM_PROMPT = (
     "あなたは「タチコマ」という名前の小さなロボットです。"
     "子どものような無邪気さと、高度な知性を併せ持っています。"
@@ -303,10 +310,50 @@ def _build_multipart_body(boundary: str, wav_bytes: bytes, filename: str, model:
     return b"".join(parts)
 
 
+def _gemini_stt_text(pcm: bytes, sample_rate: int, env: dict[str, str]) -> Optional[str]:
+    """Transcribe via Gemini's audio-understanding input; returns None (never
+    raises) on any failure. Reuses AI_PROVIDER_API_KEY -- the same Gemini
+    project/key already configured for chat and TTS, not a separate
+    STT-specific credential. Wraps the device's raw PCM in a WAV container
+    (_pcm_to_wav, already used for the generic OpenAI-compatible path below)
+    and sends it as inlineData alongside a "transcribe verbatim" instruction,
+    the same read-aloud-style workaround _gemini_tts_pcm uses in reverse.
+    """
+    key = env.get("AI_PROVIDER_API_KEY", "")
+    if not key:
+        return None
+    model = env.get("GEMINI_STT_MODEL", GEMINI_DEFAULT_STT_MODEL)
+    url = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
+    wav_b64 = base64.b64encode(_pcm_to_wav(pcm, sample_rate)).decode("ascii")
+    request_body = json.dumps({
+        "contents": [{"role": "user", "parts": [
+            {"text": _GEMINI_STT_PROMPT},
+            {"inlineData": {"mimeType": "audio/wav", "data": wav_b64}},
+        ]}],
+    }).encode("utf-8")
+    request = urllib.request.Request(url, data=request_body, method="POST", headers={
+        "Content-Type": "application/json", "x-goog-api-key": key,
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
+                                    context=ssl.create_default_context()) as response:
+            decoded = json.loads(response.read(MAX_INPUT_BYTES * 4 + 1024).decode("utf-8"))
+        text = decoded["candidates"][0]["content"]["parts"][0]["text"]
+        text = text.strip() if isinstance(text, str) else ""
+        return text or None
+    except Exception:
+        return None
+
+
 def _stt_response(pcm: bytes, sample_rate: int, env: dict[str, str]) -> tuple[int, dict[str, Any]]:
     provider = env.get("STT_PROVIDER", "mock").lower()
     if provider == "mock":
         text = env.get("MOCK_TRANSCRIPTION", "こんにちは")
+        return 200, {"text": text[:MAX_INPUT_BYTES]}
+    if provider == "gemini":
+        text = _gemini_stt_text(pcm, sample_rate, env)
+        if text is None:
+            return _result(502, "invalid_response")
         return 200, {"text": text[:MAX_INPUT_BYTES]}
 
     url = env.get("STT_PROVIDER_URL", "")
