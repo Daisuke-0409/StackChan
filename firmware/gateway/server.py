@@ -20,11 +20,13 @@ owns the AI provider credentials -- the device never sees an STT API key.
 from __future__ import annotations
 
 import base64
+import datetime
 import json
 import math
 import os
 import ssl
 import struct
+import tempfile
 import threading
 import time
 import urllib.error
@@ -41,6 +43,30 @@ MAX_SPEECH_AUDIO_BYTES = 720_000  # ~15s at 24kHz/16-bit/mono; sized for a real 
 MAX_TRANSCRIBE_AUDIO_BYTES = 256 * 1024  # matches VoiceInputController's kMaxRecordingSamples cap
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
+
+# --- TEMPORARY debug instrumentation (2026-07-24, "STT sounds wrong" /
+# latency investigation) ---------------------------------------------------
+# Off by default: recognized speech content and raw mic audio are personal
+# conversation data, so this must never log or save anything unless a human
+# explicitly opts in for one debugging session. Remove this block (and its
+# call sites in process_transcribe/_log) once the investigation is done.
+def _debug_logging_enabled(env: dict[str, str]) -> bool:
+    return env.get("TACHIKOMA_DEBUG_LOGGING") == "1"
+
+
+DEBUG_AUDIO_DIR = os.environ.get(
+    "TACHIKOMA_DEBUG_AUDIO_DIR", os.path.join(tempfile.gettempdir(), "tachikoma_debug_audio")
+)
+# --- end temporary debug instrumentation block (see other markers below) --
+
+
+def _log(message: str) -> None:
+    """Prints one gateway log line with a wall-clock timestamp, so it can be
+    correlated against the device's own epoch-ms log timestamps. Replaces
+    bare print() for all gateway logging (access log, streaming/enqueue
+    diagnostics); never includes conversation content by default.
+    """
+    print(f"[{datetime.datetime.now().isoformat(timespec='milliseconds')}] {message}")
 
 # Each device_id maps to an ordered list, drained front-first by
 # dequeue_speech(). enqueue_speech() defaults to *replacing* that list with
@@ -300,22 +326,22 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
         pcm = _gemini_tts_pcm(sentence, env)
         t_tts = time.monotonic()
         if pcm is None:
-            print(f"gateway streaming sentence={idx} tts_failed text_len={len(sentence)} "
-                  f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
-                  f"tts_ms={(t_tts - t_ready) * 1000:.0f}")
+            _log(f"gateway streaming sentence={idx} tts_failed text_len={len(sentence)} "
+                 f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
+                 f"tts_ms={(t_tts - t_ready) * 1000:.0f}")
             return
         enqueue_status, enqueue_body = enqueue_speech(device_id, pcm, append=enqueued_count > 0)
         t_enqueue = time.monotonic()
         if enqueue_status != 200:
-            print(f"gateway streaming sentence={idx} enqueue_failed status={enqueue_status} "
-                  f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)}")
+            _log(f"gateway streaming sentence={idx} enqueue_failed status={enqueue_status} "
+                 f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)}")
             return
         enqueued_count += 1
-        print(f"gateway streaming sentence={idx} text_len={len(sentence)} pcm_bytes={len(pcm)} "
-              f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
-              f"tts_ms={(t_tts - t_ready) * 1000:.0f} "
-              f"enqueue_ms={(t_enqueue - t_tts) * 1000:.0f} "
-              f"total_ms={(t_enqueue - t_start) * 1000:.0f}")
+        _log(f"gateway streaming sentence={idx} text_len={len(sentence)} pcm_bytes={len(pcm)} "
+             f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
+             f"tts_ms={(t_tts - t_ready) * 1000:.0f} "
+             f"enqueue_ms={(t_enqueue - t_tts) * 1000:.0f} "
+             f"total_ms={(t_enqueue - t_start) * 1000:.0f}")
 
     pending = ""
     first_chunk_logged = False
@@ -325,7 +351,7 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
             for delta in _iter_gemini_sse_text_deltas(response):
                 if not first_chunk_logged:
                     first_chunk_logged = True
-                    print(f"gateway streaming first_chunk_ms={(time.monotonic() - t_start) * 1000:.0f}")
+                    _log(f"gateway streaming first_chunk_ms={(time.monotonic() - t_start) * 1000:.0f}")
                 full_text_parts.append(delta)
                 pending += delta
                 ready, pending = _extract_ready_sentences(pending)
@@ -455,9 +481,9 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
             # MAX_SPEECH_AUDIO_BYTES) left /v1/chat looking like a full
             # success -- text delivered, but the device would never hear
             # anything, with no log line anywhere explaining why.
-            print(f"gateway enqueue_speech failed status={enqueue_status} "
-                  f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)} "
-                  f"device_id={payload['device_id']}")
+            _log(f"gateway enqueue_speech failed status={enqueue_status} "
+                 f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)} "
+                 f"device_id={payload['device_id']}")
     return status, body
 
 
@@ -584,7 +610,27 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
         return _result(413, "invalid_input")
     if not isinstance(sample_rate, int) or not (MIN_SAMPLE_RATE <= sample_rate <= MAX_SAMPLE_RATE):
         return _result(400, "invalid_input")
-    return _stt_response(bytes(audio), sample_rate, env)
+
+    debug = _debug_logging_enabled(env)  # TEMPORARY, see DEBUG_AUDIO_DIR block near the top of this file
+    if debug:
+        try:
+            os.makedirs(DEBUG_AUDIO_DIR, exist_ok=True)
+            filename = f"transcribe_{datetime.datetime.now().strftime('%Y%m%dT%H%M%S%f')}.wav"
+            path = os.path.join(DEBUG_AUDIO_DIR, filename)
+            with open(path, "wb") as f:
+                f.write(_pcm_to_wav(bytes(audio), sample_rate))
+            _log(f"gateway debug saved uploaded audio to {path} (sample_rate={sample_rate} "
+                 f"bytes={len(audio)} duration_s={len(audio) / 2 / sample_rate:.2f})")
+        except OSError as exc:
+            _log(f"gateway debug failed to save uploaded audio: {type(exc).__name__}")
+
+    t_stt_start = time.monotonic()
+    status, body = _stt_response(bytes(audio), sample_rate, env)
+    if debug:
+        stt_ms = (time.monotonic() - t_stt_start) * 1000
+        detail = repr(body.get("text")) if status == 200 else body.get("error")
+        _log(f"gateway debug transcribe status={status} stt_ms={stt_ms:.0f} text={detail}")
+    return status, body
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
@@ -654,6 +700,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             status, body = enqueue_speech(device_id, audio)
             self._send(status, body)
         elif self.path == "/v1/transcribe":
+            debug = _debug_logging_enabled(os.environ)  # TEMPORARY, see DEBUG_AUDIO_DIR block
+            t_upload_start = time.monotonic() if debug else None
             try:
                 length = min(int(self.headers.get("Content-Length", "0")), MAX_TRANSCRIBE_AUDIO_BYTES + 1024)
                 if length <= 0:
@@ -663,6 +711,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             except ValueError:
                 self._send(400, {"error": "invalid_input"})
                 return
+            if debug:
+                _log(f"gateway debug upload_ms={(time.monotonic() - t_upload_start) * 1000:.0f} "
+                     f"bytes={len(audio)} sample_rate={sample_rate}")
             status, body = process_transcribe(audio, dict(self.headers), os.environ, sample_rate=sample_rate)
             self._send(status, body)
         else:
@@ -670,13 +721,16 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Never print Authorization headers, provider keys, or full prompts.
-        print("gateway", self.command, self.path, args[1] if len(args) > 1 else "")
+        _log(f"gateway {self.command} {self.path} {args[1] if len(args) > 1 else ''}")
 
 
 def main() -> None:
     host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
     port = int(os.environ.get("GATEWAY_PORT", "8080"))
-    print(f"Tachikoma Gateway listening on {host}:{port} (provider={os.environ.get('AI_PROVIDER', 'mock')})")
+    _log(f"Tachikoma Gateway listening on {host}:{port} (provider={os.environ.get('AI_PROVIDER', 'mock')})")
+    if _debug_logging_enabled(os.environ):
+        _log(f"TACHIKOMA_DEBUG_LOGGING=1: recognized speech text will be logged and uploaded audio "
+             f"saved to {DEBUG_AUDIO_DIR} -- investigation-only, disable when done")
     ThreadingHTTPServer((host, port), GatewayHandler).serve_forever()
 
 
