@@ -24,10 +24,13 @@
 namespace stackchan::ai_gateway {
 namespace {
 constexpr std::string_view kTag = "SpeechAnnouncer";
-// 256 KiB is generous headroom for a spoken phrase at 24kHz/16-bit/mono
-// (roughly 5.5s); this bounds ESP32 heap usage for a single fetch, not a
-// tuned production limit.
-constexpr size_t kMaxAudioBytes = 256 * 1024;
+// Sized with headroom over the gateway's own MAX_SPEECH_AUDIO_BYTES
+// (720000 bytes, ~15s at 24kHz/16-bit/mono): a real Gemini TTS reply
+// routinely runs 300-450 KB, and the old 256 KiB here silently truncated
+// the HTTP transfer (esp_http_client_perform -> ESP_ERR_NO_MEM) well under
+// what the gateway would even agree to serve. 768 KiB bounds ESP32 heap
+// usage for a single fetch, not a tuned production limit.
+constexpr size_t kMaxAudioBytes = 768 * 1024;
 constexpr uint32_t kPollIntervalMs = 2000;
 constexpr char kSettingsNamespace[] = "tachi_speak";  // NVS namespace <= 15 chars
 
