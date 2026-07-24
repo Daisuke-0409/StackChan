@@ -54,26 +54,49 @@ on every other device still running an older build of this same code
 without it, a fresh Windows clone silently builds unpatched vendor sources
 (the audio_codec_guard fix from `1178b6a` never lands).
 
-### Known issue (unresolved, 2026-07-23): no voice from the device with AI_PROVIDER=gemini
+### Resolved, 2026-07-24: "no voice from the device with AI_PROVIDER=gemini"
 
-Gateway started with `AI_PROVIDER=gemini` and `GEMINI_TTS_VOICE=Zephyr`
-(see `37efaba`, `592d4b0`); held the device's head to trigger push-to-talk
-and spoke to it -- no voice came out of the device.
+The 2026-07-23 issue below was tracked down to two stacked causes and
+fixed: the gateway's `MAX_SPEECH_AUDIO_BYTES` cap (256 KiB) silently
+rejected real Gemini TTS output (300-450 KB) with no log line explaining
+why (`98d0dec`), and the device's own `SpeechAnnouncer::kMaxAudioBytes`
+had the same 256 KiB ceiling on the receiving end (`7cea0b3`). Chat replies
+reach the speaker now.
 
-**Not yet checked**: which of the four stages the request actually reaches
-before failing -- transcribe (`/v1/transcribe`), chat
-(`process_chat()`/`_gemini_chat_response()`), TTS
-(`_gemini_tts_pcm()`), or delivery (`enqueue_speech()` /
-`/v1/speak_queue` poll). `process_chat()` and `_gemini_tts_pcm()` were
-each verified working in isolation via direct Python calls earlier the
-same day (see `37efaba`'s commit message), so the bug is likely either in
-the transcribe step, in how the device's push-to-talk flow calls
-`/v1/chat`, or in the speak_queue poll/playback path -- but this is a
-guess, not a finding.
+### Known issue (unresolved, 2026-07-24): recognized/spoken audio is garbled and fast
 
-**First thing to do next session**: start the gateway the same way
-(`AI_PROVIDER=gemini`, `GEMINI_TTS_VOICE=Zephyr` -- see the startup
-command in today's chat log or reconstruct from `server.py`'s env vars),
-keep its stdout visible, hold the device's head and speak, and read the
-gateway log line by line to find exactly which of the four stages above
-the request reaches (or fails at) before investigating further.
+While investigating the above, push-to-talk audio sent to STT was found to
+be garbled -- and speech played back through the (now-working) audio path
+sounds fast/garbled too.
+
+**What was found and fixed today**: `TACHIKOMA_DEBUG_LOGGING=1` (`78b4557`)
+saved an uploaded recording as WAV; analyzing it showed even-indexed
+samples at ~13x the RMS of odd-indexed samples -- two different signals
+interleaved, not one noisy mono channel. Traced to
+`AUDIO_INPUT_REFERENCE=true` (`hal/board/config.h`), which makes
+`AudioCodec::input_channels()` 2 (real mic + AEC reference), while
+`VoiceInputController` has declared `channels=1` and never checked
+`input_channels()` since the original Phase 5 implementation (`b76f04a`,
+2026-07-20). `DownmixToChannel0()` (`0f35305`) now extracts channel 0
+before the recording buffer is built.
+
+**Not resolved**: after flashing the downmix fix, speech is still
+fast/garbled. This is not yet understood -- possibilities, none confirmed:
+
+- The downmix picked the wrong channel (channel 0 assumed to be the real
+  mic; if the hardware/driver actually interleaves reference-first, this
+  needs to extract index 1, not index 0, from each channel-pair).
+- A separate, still-unidentified sample-rate or frame-size handling bug
+  independent of the channel count (e.g. `kFrameSamples` / recording
+  buffer arithmetic assuming a rate or frame layout that doesn't match
+  `AUDIO_INPUT_SAMPLE_RATE=24000` in practice).
+
+**First thing to do next session**: re-analyze the WAV files already saved
+in `TACHIKOMA_DEBUG_AUDIO_DIR` (default
+`%TEMP%\tachikoma_debug_audio`) -- both the pre-downmix ones from today
+and, ideally, a fresh one recorded after the downmix fix -- to reconfirm
+which of the interleaved channels (even-indexed vs. odd-indexed samples)
+is actually the coherent speech signal, not just assume channel 0. Re-check
+the sample-rate and frame-size handling in `voice_input_controller.cpp`
+against the codec's actual behavior at the same time, in case the channel
+mixup was only ever part of the problem.
