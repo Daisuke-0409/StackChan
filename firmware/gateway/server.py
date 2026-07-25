@@ -43,6 +43,12 @@ MAX_SPEECH_AUDIO_BYTES = 720_000  # ~15s at 24kHz/16-bit/mono; sized for a real 
 MAX_TRANSCRIBE_AUDIO_BYTES = 256 * 1024  # matches VoiceInputController's kMaxRecordingSamples cap
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
+MIN_TRANSCRIBE_AUDIO_SECONDS = 0.5  # below this, skip STT entirely and treat as "didn't hear
+                                    # anything" -- confirmed live: Gemini's STT confidently
+                                    # hallucinates a fluent, plausible-sounding but entirely
+                                    # fabricated sentence for near-empty audio instead of
+                                    # admitting it heard nothing, so a low-confidence real
+                                    # result isn't the failure mode being guarded against here
 
 # --- TEMPORARY debug instrumentation (2026-07-24, "STT sounds wrong" /
 # latency investigation) ---------------------------------------------------
@@ -623,6 +629,19 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
                  f"bytes={len(audio)} duration_s={len(audio) / 2 / sample_rate:.2f})")
         except OSError as exc:
             _log(f"gateway debug failed to save uploaded audio: {type(exc).__name__}")
+
+    duration_s = len(audio) / 2 / sample_rate
+    if duration_s < MIN_TRANSCRIBE_AUDIO_SECONDS:
+        # Too little audio to plausibly contain speech: skip the STT call
+        # entirely rather than risk a confidently-fabricated transcription.
+        # {"text": ""} is not a special case for the device -- it already
+        # rejects an empty "text" field as InvalidResponse
+        # (VoiceInputController::UploadAndTranscribe), the same failure path
+        # a real STT error takes, so no firmware change is needed for this.
+        if debug:
+            _log(f"gateway debug transcribe skipped: duration_s={duration_s:.2f} "
+                 f"< {MIN_TRANSCRIBE_AUDIO_SECONDS}s minimum")
+        return 200, {"text": ""}
 
     t_stt_start = time.monotonic()
     status, body = _stt_response(bytes(audio), sample_rate, env)

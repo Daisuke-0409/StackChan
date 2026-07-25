@@ -8,6 +8,7 @@ from .server import (
     MAX_SAMPLE_RATE,
     MAX_TRANSCRIBE_AUDIO_BYTES,
     MIN_SAMPLE_RATE,
+    MIN_TRANSCRIBE_AUDIO_SECONDS,
     _extract_ready_sentences,
     _gemini_stream_chat_and_speak,
     _gemini_streaming_enabled,
@@ -158,7 +159,10 @@ class SpeechQueueTests(unittest.TestCase):
 class TranscribeTests(unittest.TestCase):
     def setUp(self):
         self.env = {"STT_PROVIDER": "mock", "ALLOW_INSECURE_DEV": "1"}
-        self.audio = b"\x01\x00\x02\x00\x03\x00\x04\x00"
+        # 1 second of dummy audio at 16000Hz (16-bit mono), well above
+        # MIN_TRANSCRIBE_AUDIO_SECONDS so these tests exercise the mock/provider
+        # path rather than the too-short-audio short-circuit.
+        self.audio = b"\x01\x00\x02\x00\x03\x00\x04\x00" * 4000
 
     def test_mock_success(self):
         status, body = process_transcribe(self.audio, {}, self.env, sample_rate=16000)
@@ -195,6 +199,23 @@ class TranscribeTests(unittest.TestCase):
     def test_rejects_sample_rate_below_minimum(self):
         status, _ = process_transcribe(self.audio, {}, self.env, sample_rate=MIN_SAMPLE_RATE - 1)
         self.assertEqual(status, 400)
+
+    def test_short_audio_skips_stt_and_returns_empty_text(self):
+        # Below MIN_TRANSCRIBE_AUDIO_SECONDS: too little audio to plausibly
+        # contain speech, so STT must not be called (Gemini hallucinates a
+        # fabricated sentence rather than admitting it heard nothing).
+        short_audio = b"\x01\x00\x02\x00\x03\x00\x04\x00"  # 4 samples @16kHz = 0.00025s
+        env = dict(self.env, MOCK_TRANSCRIPTION="タチコマ、聞こえてます")
+        status, body = process_transcribe(short_audio, {}, env, sample_rate=16000)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["text"], "")
+
+    def test_audio_at_exact_minimum_duration_is_transcribed(self):
+        min_bytes = int(MIN_TRANSCRIBE_AUDIO_SECONDS * 16000) * 2
+        audio = b"\x00\x00" * (min_bytes // 2)
+        status, body = process_transcribe(audio, {}, self.env, sample_rate=16000)
+        self.assertEqual(status, 200)
+        self.assertTrue(body["text"])
 
     def test_rejects_sample_rate_above_maximum(self):
         status, _ = process_transcribe(self.audio, {}, self.env, sample_rate=MAX_SAMPLE_RATE + 1)
