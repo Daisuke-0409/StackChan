@@ -266,11 +266,15 @@ void VoiceInputController::RecordingTask()
         }
 #endif
         CaptureTick(now);
-        // ~4x tighter than the shared task's 20ms nominal (and well under
-        // what it actually measured, 30-85ms) so a slow iteration here still
-        // leaves headroom before a whole 20ms frame is missed. InputData()
-        // itself measured 22-64us, so polling this often costs nothing.
-        vTaskDelay(pdMS_TO_TICKS(5));
+        // 1 tick, not a smaller pdMS_TO_TICKS(N): CONFIG_FREERTOS_HZ=100 (10ms
+        // tick) makes pdMS_TO_TICKS(5) truncate to 0 via integer division,
+        // which turned this into vTaskDelay(0) -- a same-priority-only yield,
+        // not a real block. At priority 8 that starved core 0's idle task
+        // and tripped the 10s task watchdog on real hardware. 1 tick (10ms)
+        // is still 2x tighter than the shared task's 20ms nominal (and well
+        // under what it actually measured, 30-85ms), and InputData() itself
+        // measured only 22-64us, so polling this often costs nothing.
+        vTaskDelay(1);
     }
 }
 
