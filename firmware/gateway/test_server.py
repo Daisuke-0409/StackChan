@@ -1,3 +1,4 @@
+import tempfile
 import unittest
 from unittest import mock
 
@@ -19,6 +20,27 @@ from .server import (
     process_chat,
     process_transcribe,
 )
+
+
+_memory_tmp = None
+
+
+def setUpModule():
+    """Keep conversation memory out of the real store.
+
+    process_chat() persists turns and profile facts per device_id, so without
+    this a test run drops files like dev-mock-1877600144784.json into
+    gateway/memory/ alongside real devices' memories -- which happened, and is
+    exactly the directory that holds personal data.
+    """
+    global _memory_tmp
+    _memory_tmp = tempfile.TemporaryDirectory()
+    server.MEMORY_DIR = _memory_tmp.name
+
+
+def tearDownModule():
+    if _memory_tmp is not None:
+        _memory_tmp.cleanup()
 
 
 class GatewayTests(unittest.TestCase):
