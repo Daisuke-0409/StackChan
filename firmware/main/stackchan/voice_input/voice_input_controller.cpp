@@ -6,6 +6,7 @@
 #include "voice_input_controller.h"
 
 #include <algorithm>
+#include <application.h>
 #include <audio_codec.h>
 #include <board.h>
 #include <cJSON.h>
@@ -165,6 +166,12 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
         last_error_ = VoiceInputErrorCode::None;
     }
 
+    // Stop xiaozhi's own wake-word/processor task from also reading the
+    // mic for the duration of this recording -- see
+    // AudioService::SetAudioInputPaused()'s declaration for why both
+    // reading at once corrupts the recording instead of erroring cleanly.
+    Application::GetInstance().GetAudioService().SetAudioInputPaused(true);
+
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
         codec->EnableInput(true);
@@ -270,6 +277,13 @@ void VoiceInputController::StopRecordingAndUpload(uint32_t now)
     if (codec != nullptr) {
         codec->EnableInput(false);
     }
+    // Unconditional and unpaired with the pause call in OnButtonPressed()
+    // on purpose: this is the one function every recording_=true..false
+    // transition passes through (Update()'s two StopRecordingAndUpload()
+    // call sites included), so resuming here -- rather than matching each
+    // call to a corresponding pause -- can't leave AudioService paused
+    // after some early-return path forgets to undo it.
+    Application::GetInstance().GetAudioService().SetAudioInputPaused(false);
     tachikoma_state::GetTachikomaStateManager().Notify(tachikoma_state::TachikomaEvent::UserSpeechEnded);
 
     if (!MeetsMinimumDuration(duration_ms, kMinRecordingMs) || pcm.empty()) {
