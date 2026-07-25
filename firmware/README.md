@@ -33,6 +33,66 @@ ctest --test-dir build-host-tests --output-on-failure
 idf.py flash
 ```
 
+### Recording length
+
+Push-to-talk records up to **30s** (`kMaxRecordingMs`), capped by
+`kMaxRecordingSamples` at 30s of 24kHz mono = 1.44 MB. That buffer lives in
+PSRAM (`CONFIG_SPIRAM_USE_MALLOC=y`, `ALWAYSINTERNAL=512`) and is reserved in
+full at record start so a 1.4 MB vector never doubles mid-capture; the upload
+hands `esp_http_client` a pointer to it rather than copying.
+
+Both limits used to be much lower for reasons that no longer applied: the
+sample cap was 256 KiB "mirroring SpeechAnnouncer's kMaxAudioBytes" -- a
+playback limit unrelated to how long someone may speak -- which cut
+recordings off at 5.5s once capture ran at the correct rate.
+
+The gateway's `MAX_TRANSCRIBE_AUDIO_BYTES` must stay >= this in bytes, and
+`VoiceInputConfig::response_timeout_ms` (45s) has to cover uploading the
+largest clip plus the STT call on it.
+
+### The device is silent / "no reply" -- check the gateway first
+
+The device has no AI of its own: every reply comes from the Tachikoma
+Gateway on the PC. If that process is not running, the device is working
+perfectly and still says nothing. Symptoms in the device log, all of which
+mean "the PC is not listening", not "the firmware is broken":
+
+```
+E (nnnnn) esp-tls: [sock=NN] delayed connect error: Connection reset by peer
+E (nnnnn) HTTP_CLIENT: Connection failed, sock < 0
+[SpeechAnnouncer] speech queue poll failed
+TachikomaState: Thinking -> Error by AiRequestFailed
+```
+
+Start it with the launcher, which reads `gateway/.env` (gitignored):
+
+```powershell
+powershell -File gateway\run_gateway.ps1
+```
+
+Three things silently break this if set up by hand instead:
+
+- `GATEWAY_HOST` must be `0.0.0.0`. server.py's default is `127.0.0.1`,
+  which accepts only PC-local connections -- the device then gets exactly
+  the "Connection reset by peer" above. `run_gateway.ps1` forces it.
+- `DEVICE_TOKEN` must equal the firmware's provisioned
+  `TACHIKOMA_DEVICE_TOKEN`, or every request is 401. The launcher falls
+  back to reading it out of `build/CMakeCache.txt`.
+- The provisioned URL is a fixed LAN IP (`build/CMakeCache.txt`,
+  `TACHIKOMA_GATEWAY_URL`). If the PC's address changes, the device keeps
+  dialing the old one; the launcher prints the current LAN addresses so
+  this is visible at startup.
+
+`AI_PROVIDER=gemini` needs `AI_PROVIDER_API_KEY` in `.env` -- chat, TTS and
+STT all reuse that one key. The launcher refuses to start without it rather
+than letting every request fail at runtime.
+
+Verified working end to end 2026-07-25 with `gemini-3.5-flash-lite` (chat),
+`gemini-2.5-flash-preview-tts` (TTS) and `gemini-flash-latest` (STT).
+Note `gemini-2.5-flash` now 404s with "no longer available to new users" --
+the defaults in server.py already avoid it, but a hand-set
+`AI_PROVIDER_MODEL` can walk back into it.
+
 ### Before flashing any other device running this firmware
 
 2026-07-22 found four bugs on the office device that almost certainly exist

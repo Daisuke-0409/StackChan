@@ -29,7 +29,10 @@ struct VoiceInputConfig {
     std::string endpoint;  // full URL to POST recorded PCM to, e.g. "https://host:port/v1/transcribe"
     std::string device_token;
     std::string device_id;
-    uint32_t response_timeout_ms = 15000;
+    // Covers the worst case this endpoint now has to carry: uploading a
+    // 30s recording (1.44 MB) and waiting out the STT call on it. 15s was
+    // sized for 5.5s clips and would time out on a long question.
+    uint32_t response_timeout_ms = 45000;
 };
 
 }  // namespace stackchan::voice_input

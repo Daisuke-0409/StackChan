@@ -115,7 +115,9 @@ private:
     void RunWorker(WorkerArgs* args);
     static void RecordingTaskEntry(void* arg);
     void RecordingTask();
-    void CaptureTick(uint32_t now);
+    // Returns true when it performed a blocking codec read, i.e. when the
+    // call itself already paced the caller and no extra delay is wanted.
+    bool CaptureTick(uint32_t now);
     bool UploadAndTranscribe(const VoiceInputConfig& config, const std::vector<int16_t>& pcm, uint32_t sample_rate,
                              std::string& text, VoiceInputErrorCode& error);
     void StopRecordingAndUpload(uint32_t now);
@@ -128,6 +130,10 @@ private:
     uint32_t generation_ = 0;
     uint32_t recording_started_ms_ = 0;
     std::vector<int16_t> buffer_;
+    // What buffer_ was actually able to reserve for the recording in flight,
+    // which may be below kMaxRecordingSamples if PSRAM was short at the time.
+    // Capture is clamped to this, not to the constant.
+    size_t recording_capacity_samples_ = 0;
     VoiceInputErrorCode last_error_ = VoiceInputErrorCode::None;
 
     // Post-speech cooldown (see kPostSpeechCooldownMs in the .cpp): a

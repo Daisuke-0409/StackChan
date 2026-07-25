@@ -11,8 +11,10 @@
 #include <board.h>
 #include <cJSON.h>
 #include <esp_crt_bundle.h>
+#include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_netif.h>
+#include <new>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <mooncake_log.h>
@@ -28,6 +30,7 @@
 
 #include "ai_gateway/ai_gateway_client.h"
 #include "ai_gateway/speech_announcer.h"
+#include "hal/audio_codec_guard.h"
 #include "hal/hal.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
@@ -36,7 +39,12 @@ namespace stackchan::voice_input {
 namespace {
 constexpr std::string_view kTag = "VoiceInput";
 constexpr char kSettingsNamespace[] = "tachi_stt";  // NVS namespace <= 15 chars
-constexpr uint32_t kMaxRecordingMs = 8000;
+// 30s, not the previous 8s: asking the device to look something up takes
+// noticeably longer to say than a one-line question, and being cut off
+// mid-sentence is worse than a slightly longer wait. Only the ceiling moves
+// -- an ordinary short utterance still ends the moment the button is
+// released, so this costs nothing in the common case.
+constexpr uint32_t kMaxRecordingMs = 30000;
 constexpr uint32_t kMinRecordingMs = 300;
 // How long after playback ends (Speaking -> Idle) to ignore a new Press.
 // Confirmed on real hardware: the speaker's own vibration during Zephyr
@@ -46,8 +54,33 @@ constexpr uint32_t kMinRecordingMs = 300;
 // triggers still slip through (louder replies vibrate longer) or if this
 // proves longer than necessary once retested.
 constexpr uint32_t kPostSpeechCooldownMs = 1500;
-constexpr size_t kFrameSamples = 320;  // ~20ms at 16kHz mono
-constexpr size_t kMaxRecordingSamples = 128 * 1024;  // 256 KiB of int16 PCM; mirrors SpeechAnnouncer's kMaxAudioBytes
+// How much audio to ask the codec for per read. This must be derived from the
+// mic's real rate and channel count, never assumed: a fixed 320 int16 was the
+// bug that made every recording unintelligible. The mic produces
+// rate * channels int16 per second (24000 * 2 = 48000 here), while a
+// 320-sample read on a 10ms-nominal (18.4ms measured) loop drained only
+// ~17,400 -- about 36% of it. The rest overran the 1,440-frame DMA ring
+// (6 * AUDIO_CODEC_DMA_FRAME_NUM, ~60ms at 24kHz), so the recording became
+// disjoint 320-sample fragments spliced together: roughly 2.8x too fast, with
+// the gaps destroying exactly the formant and pitch continuity speech
+// recognition depends on. Confirmed by measured_rate=8313..8542 against a
+// declared 24000.
+constexpr uint32_t kCaptureChunkMs = 20;
+constexpr size_t kFallbackFrameSamples = 960;  // 20ms at 24kHz, 2 channels
+constexpr size_t kMaxFrameSamples = 4096;
+// 30s of 24kHz mono int16 = 1.44 MB. That is far too large for internal RAM
+// (~55 KB free), but CONFIG_SPIRAM_USE_MALLOC=y with
+// CONFIG_SPIRAM_MALLOC_ALWAYSINTERNAL=512 sends any allocation this size to
+// the 8 MB PSRAM, and the upload hands esp_http_client a pointer to this
+// buffer rather than copying it. The old 128*1024 was expressed as "256 KiB,
+// mirrors SpeechAnnouncer's kMaxAudioBytes" -- a playback-side limit that
+// never had anything to do with how long someone may speak. It capped
+// recordings at 5.5s once capture ran at the correct rate.
+// The gateway's MAX_TRANSCRIBE_AUDIO_BYTES must stay >= this in bytes.
+constexpr size_t kMaxRecordingSamples = 30 * 24000;  // 30s at 24kHz mono
+// Floor for the degraded case: 3s at 24kHz. Below this a recording is not
+// worth attempting, so ReserveRecordingBuffer() reports failure instead.
+constexpr size_t kMinRecordingCapacitySamples = 3 * 24000;
 constexpr int kFallbackSampleRate = 16000;
 constexpr size_t kMaxResponseBytes = 4096;
 
@@ -85,6 +118,37 @@ size_t ClampToRemainingCapacity(size_t current_size, size_t incoming, size_t cap
         return 0;
     }
     return std::min(incoming, capacity - current_size);
+}
+
+size_t ReserveRecordingBuffer(std::vector<int16_t>& buffer)
+{
+    // Reserve the ceiling up front rather than letting the vector grow into
+    // 1.44 MB: each doubling holds the old and new blocks at once, a >2 MB
+    // transient, during a real-time capture loop that cannot afford to stall.
+    //
+    // But do not assume the allocation succeeds. CONFIG_COMPILER_CXX_EXCEPTIONS
+    // is on, so a failed reserve() throws std::bad_alloc, and an uncaught
+    // throw here would abort the device on a button press. PSRAM is shared
+    // with LVGL and the camera (stackchan_camera.cc takes frame-sized blocks),
+    // so a fragmented heap is a realistic way to get there. Ask what is
+    // actually available, keep half of it free for everything else, and treat
+    // whatever we get as this recording's real capacity.
+    size_t wanted = kMaxRecordingSamples;
+    const size_t largest_block_samples = heap_caps_get_largest_free_block(MALLOC_CAP_SPIRAM) / sizeof(int16_t);
+    if (largest_block_samples < wanted * 2) {
+        wanted = std::min(wanted, largest_block_samples / 2);
+    }
+    wanted = std::max(wanted, kMinRecordingCapacitySamples);
+    while (wanted >= kMinRecordingCapacitySamples) {
+        try {
+            buffer.reserve(wanted);
+            return buffer.capacity();
+        } catch (const std::bad_alloc&) {
+            wanted /= 2;
+        }
+    }
+    mclog::tagWarn(kTag, "could not reserve a recording buffer; recording unavailable");
+    return 0;
 }
 
 std::vector<int16_t> DownmixToChannel0(const std::vector<int16_t>& interleaved, int channels)
@@ -170,6 +234,8 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
         recording_ = true;
         recording_started_ms_ = now;
         buffer_.clear();
+        buffer_.shrink_to_fit();  // release the previous recording's block first
+        recording_capacity_samples_ = ReserveRecordingBuffer(buffer_);
         last_error_ = VoiceInputErrorCode::None;
     }
 
@@ -181,6 +247,30 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
+        // The mic's sample rate does not take effect on its own. This board
+        // runs I2S in full duplex with TX as the clock master, and
+        // esp_codec_dev only propagates a newly opened RX rate to TX while
+        // the output is disabled -- see the "TX is master, set to RX not
+        // take effect need reconfig TX also" branch in set_fs()
+        // (managed_components/espressif__esp_codec_dev/platform/
+        // audio_codec_data_i2s.c). Opening the mic with the speaker still
+        // enabled silently leaves the capture running at whatever rate the
+        // last playback configured, while StopRecordingAndUpload() goes on
+        // declaring input_sample_rate() to the STT. That mismatch is what
+        // made recordings come back at wildly different speeds -- one clip
+        // slow and deep, the next sped up -- and left the audio garbled
+        // enough that Gemini returned confident hallucinations instead of a
+        // transcription.
+        //
+        // A plain EnableInput(true) is not enough to fix it either: it
+        // returns early when input is already enabled, skipping the
+        // esp_codec_dev_open() that would reconfigure anything at all. So
+        // drop output, force a close/open cycle, and only then record.
+        // The output mutex is required because EnableOutput() is shared
+        // with SpeechAnnouncer and AudioService -- see audio_codec_guard.h.
+        std::lock_guard<std::mutex> codec_lock(stackchan::hal::GetAudioCodecMutex());
+        codec->EnableOutput(false);
+        codec->EnableInput(false);
         codec->EnableInput(true);
     }
     tachikoma_state::GetTachikomaStateManager().Notify(tachikoma_state::TachikomaEvent::UserSpeechStarted);
@@ -265,20 +355,28 @@ void VoiceInputController::RecordingTask()
             debug_had_last_tick = false;
         }
 #endif
-        CaptureTick(now);
-        // 1 tick, not a smaller pdMS_TO_TICKS(N): CONFIG_FREERTOS_HZ=100 (10ms
-        // tick) makes pdMS_TO_TICKS(5) truncate to 0 via integer division,
-        // which turned this into vTaskDelay(0) -- a same-priority-only yield,
-        // not a real block. At priority 8 that starved core 0's idle task
-        // and tripped the 10s task watchdog on real hardware. 1 tick (10ms)
-        // is still 2x tighter than the shared task's 20ms nominal (and well
-        // under what it actually measured, 30-85ms), and InputData() itself
-        // measured only 22-64us, so polling this often costs nothing.
-        vTaskDelay(1);
+        const bool paced_by_codec = CaptureTick(now);
+        // Only delay when the codec read did not already block. While
+        // recording, esp_codec_dev_read() waits for a full chunk to arrive
+        // (i2s_channel_read with a 1s timeout), so it both paces this loop
+        // and sleeps the task -- adding a delay on top of that would put the
+        // loop's period above the time its own read covers, which is exactly
+        // how the previous version fell behind the mic and lost most of the
+        // audio. When nothing was read (not recording, or the read failed)
+        // there is no such pacing, so yield explicitly.
+        //
+        // 1 tick, not a smaller pdMS_TO_TICKS(N): CONFIG_FREERTOS_HZ=100
+        // (10ms tick) makes pdMS_TO_TICKS(5) truncate to 0 via integer
+        // division, which turned this into vTaskDelay(0) -- a
+        // same-priority-only yield, not a real block. At priority 8 that
+        // starved core 0's idle task and tripped the 10s task watchdog.
+        if (!paced_by_codec) {
+            vTaskDelay(1);
+        }
     }
 }
 
-void VoiceInputController::CaptureTick(uint32_t now)
+bool VoiceInputController::CaptureTick(uint32_t now)
 {
     bool is_recording;
     uint32_t started_ms;
@@ -288,19 +386,29 @@ void VoiceInputController::CaptureTick(uint32_t now)
         started_ms = recording_started_ms_;
     }
     if (!is_recording) {
-        return;
+        return false;
     }
 
     if (HasExceededMaxDuration(now, started_ms, kMaxRecordingMs)) {
         StopRecordingAndUpload(now);
-        return;
+        return false;
     }
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec == nullptr) {
-        return;
+        return false;
     }
-    std::vector<int16_t> frame(kFrameSamples);
+    // Sized from the mic's own rate and channel count so one read covers
+    // kCaptureChunkMs of real time -- see kCaptureChunkMs's declaration for
+    // what a fixed size cost us.
+    const int rate = codec->input_sample_rate();
+    const int channels = codec->input_channels();
+    size_t frame_samples = kFallbackFrameSamples;
+    if (rate > 0 && channels > 0) {
+        frame_samples = static_cast<size_t>(rate) * static_cast<size_t>(channels) * kCaptureChunkMs / 1000u;
+    }
+    frame_samples = std::clamp<size_t>(frame_samples, 160, kMaxFrameSamples);
+    std::vector<int16_t> frame(frame_samples);
 #ifdef TACHIKOMA_DEBUG_TIMING
     const int64_t debug_input_data_start_us = esp_timer_get_time();
 #endif
@@ -310,7 +418,7 @@ void VoiceInputController::CaptureTick(uint32_t now)
                     esp_timer_get_time() - debug_input_data_start_us, got_frame);
 #endif
     if (!got_frame) {
-        return;  // no new samples available this tick
+        return false;  // no new samples available this tick
     }
     // See DownmixToChannel0's declaration: this board's mic is 2-channel
     // (real mic + AEC reference) at the I2S level, but every consumer past
@@ -322,15 +430,19 @@ void VoiceInputController::CaptureTick(uint32_t now)
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!recording_) {
-            return;  // stopped while we were reading the frame
+            return true;  // stopped while we were reading the frame
         }
-        const size_t take = ClampToRemainingCapacity(buffer_.size(), frame.size(), kMaxRecordingSamples);
+        // recording_capacity_samples_, not kMaxRecordingSamples: growing past
+        // what was actually reserved is the reallocation this avoids.
+        const size_t capacity = recording_capacity_samples_;
+        const size_t take = ClampToRemainingCapacity(buffer_.size(), frame.size(), capacity);
         buffer_.insert(buffer_.end(), frame.begin(), frame.begin() + static_cast<long>(take));
-        cap_reached = buffer_.size() >= kMaxRecordingSamples;
+        cap_reached = buffer_.size() >= capacity;
     }
     if (cap_reached) {
         StopRecordingAndUpload(now);
     }
+    return true;
 }
 
 void VoiceInputController::StopRecordingAndUpload(uint32_t now)
@@ -396,6 +508,16 @@ void VoiceInputController::StopRecordingAndUpload(uint32_t now)
 
     const int raw_rate = (codec != nullptr) ? codec->input_sample_rate() : 0;
     const uint32_t sample_rate = raw_rate > 0 ? static_cast<uint32_t>(raw_rate) : static_cast<uint32_t>(kFallbackSampleRate);
+#ifdef TACHIKOMA_DEBUG_TIMING
+    // Samples actually captured divided by the real press-to-release time is
+    // the rate the hardware was truly running at. If it does not match the
+    // declared rate above, the clip reaches the STT at the wrong speed and
+    // no amount of prompt or model tuning will make it intelligible.
+    const uint32_t measured_rate =
+        duration_ms > 0 ? static_cast<uint32_t>((static_cast<uint64_t>(pcm.size()) * 1000u) / duration_ms) : 0u;
+    mclog::tagInfo(kTag, "debug_timing samples={} hold_ms={} declared_rate={} measured_rate={}",
+                   pcm.size(), duration_ms, sample_rate, measured_rate);
+#endif
 
     auto* args = new WorkerArgs{this, config, std::move(pcm), sample_rate, generation};
     const auto result = xTaskCreate(&VoiceInputController::WorkerTask, "voice_input", 8192, args, 2, nullptr);
