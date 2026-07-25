@@ -11,11 +11,37 @@
 namespace stackchan::tachikoma_motion {
 
 namespace {
-constexpr int kServoYawMinTenths   = -30;  // -3 degrees
-constexpr int kServoYawMaxTenths   = 30;   // +3 degrees
-constexpr int kServoPitchMinTenths = 30;   // Physical lower limit is +3 degrees
-constexpr int kServoPitchMaxTenths = 60;   // +6 degrees
-constexpr int kServoSpeed           = 140;
+// Tenths of a degree. These bound what any motion may ask of the servos --
+// they are a policy limit, well inside the hardware's own (hal_servo.cpp
+// configures yaw at +-1280 and pitch at 30..870, i.e. +-128 and 3..87
+// degrees).
+//
+// They used to be +-30 yaw and 30..60 pitch: a total of six degrees of head
+// turn and three of tilt. That is below the threshold of noticing, which is
+// why every gesture read as a twitch no matter how the motion data was
+// written. Widened to +-25 degrees of turn and 3..50 of tilt -- clearly
+// visible from across a room, still a fifth of the yaw the hardware would
+// allow, and unchanged in speed (kServoSpeed) so nothing moves more
+// abruptly than before, just further.
+constexpr int kServoYawMinTenths   = -250;  // -25 degrees
+constexpr int kServoYawMaxTenths   = 250;   // +25 degrees
+constexpr int kServoPitchMinTenths = 30;    // Physical lower limit is +3 degrees
+constexpr int kServoPitchMaxTenths = 500;   // +50 degrees
+// Servo::moveWithSpeed maps this to spring stiffness as
+// k = 10 + (speed/1000)^2 * 640, so it is not a velocity -- it is how hard
+// the servo pulls toward the target. At 140 the stiffness is only ~22, which
+// takes roughly a second to settle. The idle loop holds each step for
+// 550-1200ms so it arrives; an emotion step lasting 180-240ms does not get
+// anywhere near its target before the next command overwrites it. That, not
+// the angle limits, is why widening the range alone did not make the
+// gestures bigger.
+//
+// Two speeds, because the two families want opposite things. Loops stay soft
+// so resting motion still drifts rather than snaps. One-shot emotions use
+// 500 -- the same value Motion::lookAtNormalized already defaults to -- for
+// stiffness ~170, settling in about 0.3s, which fits inside their steps.
+constexpr int kServoSpeedAmbient  = 140;
+constexpr int kServoSpeedExpressive = 500;
 constexpr uint32_t kDisplayPeriodMs = 33;   // About 25-30 Hz on the existing 20 ms task.
 constexpr uint32_t kSwitchDurationMs = 350; // Smooth transition between motion types.
 
@@ -289,7 +315,8 @@ void ServoMotion::Apply(const MotionFrame& frame, stackchan::motion::Motion& mot
     // Servo::init() and auto torque release leave the servos unpowered while idle; re-enable them only for a
     // rate-limited motion command. The existing Servo update releases torque again after the move settles.
     motion.setTorqueEnabled(true);
-    motion.moveWithSpeed(yaw, pitch, kServoSpeed);
+    const bool expressive = frame.motion == MotionType::Happy || frame.motion == MotionType::Confused;
+    motion.moveWithSpeed(yaw, pitch, expressive ? kServoSpeedExpressive : kServoSpeedAmbient);
     last_command_sequence_ = frame.servo_command_sequence;
 }
 

@@ -65,32 +65,43 @@ constexpr MotionStep kThinkingSteps[] = {
 };
 
 // Happy is a short, energetic but safely clamped upward bounce, ending at center.
-// Deliberately much larger than the idle loop (yaw +-25 -> +-70, and four
-// swings instead of two): an emotion nobody notices is not an emotion. The
-// idle wobble reads as "alive", this has to read as "pleased" from across a
-// room. Durations are shortened alongside the amplitude so the movement is
-// bouncy rather than a slow sweep.
+// servo_yaw/servo_pitch are TENTHS of a degree, not degrees. The previous
+// values here (yaw 25, then 70) were written as if they were degrees, so
+// they asked for 2.5 and 7 degrees of head turn -- and even those were then
+// clamped to 3 by the old policy limit. Hence "the motion is too small" no
+// matter what was written.
+//
+// Now at real scale: the head swings a full +-25 degrees, four times, and
+// looks up 40 degrees while doing it. Steps are short so it bounces.
+// Steps are ~350ms, not the 180-240 tried before. A step has to outlast the
+// servo's settling time or the next command overwrites it mid-travel and the
+// head never reaches the angle being asked for -- which is what made this
+// look small even after the range was widened. At kServoSpeedExpressive the
+// spring settles in roughly 0.3s, so 350ms arrives with a little margin and
+// the swing still reads as bouncy.
 constexpr MotionStep kHappySteps[] = {
-    Step(0, -8, 0, 0, 70, 0, 0, 0, 0, 2, 200, 280, 40, 90),
-    Step(-6, -12, -40, 70, 78, 1, 0, 3, 6, 0, 180, 240, 40, 90),
-    Step(6, -12, 40, -70, 78, 1, 0, 3, 6, 0, 180, 240, 40, 90),
-    Step(-5, -10, -32, 55, 74, 1, 0, 3, 6, 0, 170, 230, 40, 80),
-    Step(5, -10, 32, -55, 74, 1, 0, 3, 6, 0, 170, 230, 40, 80),
-    Step(0, -9, 0, 0, 72, 0, 1, 2, 4, 2, 200, 300, 80, 160),
-    Step(0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 350, 500, 0, 0),
+    Step(0, -8, 0, 0, 340, 0, 0, 0, 0, 5, 300, 380, 40, 90),
+    Step(-6, -12, -40, -250, 400, 1, 0, 3, 20, 8, 340, 420, 50, 110),
+    Step(6, -12, 40, 250, 400, 1, 0, 3, 20, 8, 340, 420, 50, 110),
+    Step(-5, -10, -32, -210, 370, 1, 0, 3, 20, 8, 320, 400, 50, 100),
+    Step(5, -10, 32, 210, 370, 1, 0, 3, 20, 8, 320, 400, 50, 100),
+    Step(0, -9, 0, 0, 350, 0, 1, 2, 15, 8, 300, 380, 80, 160),
+    Step(0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 400, 550, 0, 0),
 };
 
 // Confused compares right, left, center and right once more, then safely returns to center.
-// Sad reads as a fall, not a wobble: the head lifts slightly, then pitch is
-// driven well below the idle centre (30 -> 5) and held there, hanging, before
-// creeping back. The slow durations are the point -- speeding this up would
-// make it look like a search rather than dejection.
+// Dejection has to be built as a fall *to* the floor, because the pitch
+// floor (30 tenths = 3 degrees) is also the rest pose -- the neck physically
+// cannot droop below where it already sits. So the head lifts well up first,
+// then sinks the whole way down and stays there, which reads as the head
+// dropping rather than as looking around. The slow steps are the point;
+// speeding this up turns a slump into a search.
 constexpr MotionStep kConfusedSteps[] = {
-    Step(0, -4, 0, 0, 46, 0, 1, 2, 2, 2, 350, 500, 150, 300),
-    Step(6, 4, 30, -34, 22, 0, 1, 3, 3, 3, 700, 950, 350, 600),
-    Step(-6, 6, -30, 34, 12, 0, 1, 3, 3, 3, 750, 1000, 350, 600),
-    Step(0, 10, 0, 0, 5, 0, 1, 2, 2, 1, 650, 900, 900, 1400),
-    Step(0, 6, 0, 0, 16, 0, 1, 2, 2, 2, 700, 950, 300, 500),
+    Step(0, -4, 0, 0, 300, 0, 1, 2, 10, 8, 350, 500, 150, 300),
+    Step(6, 4, 30, -170, 220, 0, 1, 3, 15, 8, 700, 950, 350, 600),
+    Step(-6, 6, -30, 170, 140, 0, 1, 3, 15, 8, 750, 1000, 350, 600),
+    Step(0, 10, 0, 0, 30, 0, 1, 2, 6, 0, 650, 900, 1100, 1600),
+    Step(0, 8, 0, 0, 45, 0, 1, 2, 6, 2, 700, 950, 400, 700),
     Step(0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 700, 950, 0, 0),
 };
 
