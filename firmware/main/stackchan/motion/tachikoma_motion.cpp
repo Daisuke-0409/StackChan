@@ -23,10 +23,14 @@ namespace {
 // visible from across a room, still a fifth of the yaw the hardware would
 // allow, and unchanged in speed (kServoSpeed) so nothing moves more
 // abruptly than before, just further.
-constexpr int kServoYawMinTenths   = -250;  // -25 degrees
-constexpr int kServoYawMaxTenths   = 250;   // +25 degrees
+constexpr int kServoYawMinTenths   = -750;  // -75 degrees
+constexpr int kServoYawMaxTenths   = 750;   // +75 degrees
 constexpr int kServoPitchMinTenths = 30;    // Physical lower limit is +3 degrees
-constexpr int kServoPitchMaxTenths = 500;   // +50 degrees
+// Not 3x like yaw: pitch only has 3..87 degrees to work with, and
+// ScsServo::handle_stall permanently narrows the runtime limit for the rest
+// of the session whenever it trips, so crowding the hardware end would cost
+// range rather than gain it. 70 keeps a margin below 87.
+constexpr int kServoPitchMaxTenths = 700;   // +70 degrees
 // Servo::moveWithSpeed maps this to spring stiffness as
 // k = 10 + (speed/1000)^2 * 640, so it is not a velocity -- it is how hard
 // the servo pulls toward the target. At 140 the stiffness is only ~22, which
