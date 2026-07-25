@@ -3,6 +3,8 @@
 #include <esp_log.h>
 #include <driver/i2c_master.h>
 #include <driver/i2s_tdm.h>
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
 
 #define TAG "CoreS3AudioCodec"
 
@@ -187,6 +189,29 @@ void CoreS3AudioCodec::SetOutputVolume(int volume) {
     AudioCodec::SetOutputVolume(volume);
 }
 
+// Opening the codec talks to the ES7210/AW88298 over I2C, and that read can
+// fail transiently -- the FT6336 touch controller on the same bus logs
+// ESP_ERR_TIMEOUT from time to time for the same reason. ESP_ERROR_CHECK
+// turns any such blip into abort() and a reboot, which is what was actually
+// happening mid-conversation: two crashes in one session, each immediately
+// preceded by exactly one "I2C_If: Fail to read from dev 6c". A dropped
+// reply is recoverable; a reboot is not, so retry once and then give up
+// without taking the device down. Leaving input_enabled_/output_enabled_
+// unchanged on failure means the next attempt retries cleanly.
+static bool TryOpenCodec(const char* what, esp_codec_dev_handle_t dev, esp_codec_dev_sample_info_t* fs) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const int err = esp_codec_dev_open(dev, fs);
+        if (err == ESP_CODEC_DEV_OK) {
+            return true;
+        }
+        ESP_LOGW(TAG, "esp_codec_dev_open(%s) failed: %d (attempt %d)", what, err, attempt + 1);
+        esp_codec_dev_close(dev);
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    ESP_LOGE(TAG, "esp_codec_dev_open(%s) gave up; leaving it disabled for now", what);
+    return false;
+}
+
 void CoreS3AudioCodec::EnableInput(bool enable) {
     if (enable == input_enabled_) {
         return;
@@ -202,10 +227,21 @@ void CoreS3AudioCodec::EnableInput(bool enable) {
         if (input_reference_) {
             fs.channel_mask |= ESP_CODEC_DEV_MAKE_CHANNEL_MASK(1);
         }
-        ESP_ERROR_CHECK(esp_codec_dev_open(input_dev_, &fs));
-        ESP_ERROR_CHECK(esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_));
+        if (!TryOpenCodec("input", input_dev_, &fs)) {
+            return;
+        }
+        const int gain_err =
+            esp_codec_dev_set_in_channel_gain(input_dev_, ESP_CODEC_DEV_MAKE_CHANNEL_MASK(0), input_gain_);
+        if (gain_err != ESP_CODEC_DEV_OK) {
+            // Worth recording, but not worth aborting: the mic still works
+            // at whatever gain it already had.
+            ESP_LOGW(TAG, "esp_codec_dev_set_in_channel_gain failed: %d", gain_err);
+        }
     } else {
-        ESP_ERROR_CHECK(esp_codec_dev_close(input_dev_));
+        const int err = esp_codec_dev_close(input_dev_);
+        if (err != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "esp_codec_dev_close(input) failed: %d", err);
+        }
     }
     AudioCodec::EnableInput(enable);
 }
@@ -223,10 +259,18 @@ void CoreS3AudioCodec::EnableOutput(bool enable) {
             .sample_rate = (uint32_t)output_sample_rate_,
             .mclk_multiple = 0,
         };
-        ESP_ERROR_CHECK(esp_codec_dev_open(output_dev_, &fs));
-        ESP_ERROR_CHECK(esp_codec_dev_set_out_vol(output_dev_, output_volume_));
+        if (!TryOpenCodec("output", output_dev_, &fs)) {
+            return;
+        }
+        const int vol_err = esp_codec_dev_set_out_vol(output_dev_, output_volume_);
+        if (vol_err != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "esp_codec_dev_set_out_vol failed: %d", vol_err);
+        }
     } else {
-        ESP_ERROR_CHECK(esp_codec_dev_close(output_dev_));
+        const int err = esp_codec_dev_close(output_dev_);
+        if (err != ESP_CODEC_DEV_OK) {
+            ESP_LOGW(TAG, "esp_codec_dev_close(output) failed: %d", err);
+        }
     }
     AudioCodec::EnableOutput(enable);
 }
