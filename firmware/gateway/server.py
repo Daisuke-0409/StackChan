@@ -163,7 +163,17 @@ def get_current_speaker(device_id: str) -> Optional[dict[str, Any]]:
 
 def current_role(device_id: str) -> str:
     entry = get_current_speaker(device_id)
-    return entry["role"] if entry else people.ROLE_UNKNOWN
+    if entry:
+        return entry["role"]
+    # Nobody enrolled yet means this is still a single-user device, and has
+    # been for its whole life: every fact in memory was told to it by the
+    # one person who uses it. Treating that person as a stranger would hide
+    # his own name and address from him and quietly break what already
+    # works. Access control starts mattering the moment there is somebody to
+    # tell apart -- i.e. once anyone has enrolled.
+    if not _people_store.list_people():
+        return people.ROLE_MASTER
+    return people.ROLE_UNKNOWN
 
 
 def _memory_path(device_id: str) -> str:
