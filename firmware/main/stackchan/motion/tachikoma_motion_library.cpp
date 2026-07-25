@@ -65,21 +65,33 @@ constexpr MotionStep kThinkingSteps[] = {
 };
 
 // Happy is a short, energetic but safely clamped upward bounce, ending at center.
+// Deliberately much larger than the idle loop (yaw +-25 -> +-70, and four
+// swings instead of two): an emotion nobody notices is not an emotion. The
+// idle wobble reads as "alive", this has to read as "pleased" from across a
+// room. Durations are shortened alongside the amplitude so the movement is
+// bouncy rather than a slow sweep.
 constexpr MotionStep kHappySteps[] = {
-    Step(0, -4, 0, 0, 55, 0, 0, 0, 0, 2, 300, 400, 80, 150),
-    Step(-3, -6, -18, 25, 60, 1, 0, 2, 5, 0, 250, 350, 80, 160),
-    Step(3, -6, 18, -25, 60, 1, 0, 2, 5, 0, 250, 350, 80, 160),
-    Step(0, -5, 0, 0, 58, 0, 1, 2, 3, 2, 250, 400, 100, 200),
-    Step(0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 400, 550, 0, 0),
+    Step(0, -8, 0, 0, 70, 0, 0, 0, 0, 2, 200, 280, 40, 90),
+    Step(-6, -12, -40, 70, 78, 1, 0, 3, 6, 0, 180, 240, 40, 90),
+    Step(6, -12, 40, -70, 78, 1, 0, 3, 6, 0, 180, 240, 40, 90),
+    Step(-5, -10, -32, 55, 74, 1, 0, 3, 6, 0, 170, 230, 40, 80),
+    Step(5, -10, 32, -55, 74, 1, 0, 3, 6, 0, 170, 230, 40, 80),
+    Step(0, -9, 0, 0, 72, 0, 1, 2, 4, 2, 200, 300, 80, 160),
+    Step(0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 350, 500, 0, 0),
 };
 
 // Confused compares right, left, center and right once more, then safely returns to center.
+// Sad reads as a fall, not a wobble: the head lifts slightly, then pitch is
+// driven well below the idle centre (30 -> 5) and held there, hanging, before
+// creeping back. The slow durations are the point -- speeding this up would
+// make it look like a search rather than dejection.
 constexpr MotionStep kConfusedSteps[] = {
-    Step(4, 1, 20, -28, 35, 0, 1, 3, 2, 3, 600, 800, 400, 700),
-    Step(-4, 1, -20, 28, 35, 0, 1, 3, 2, 3, 650, 850, 300, 600),
-    Step(0, 1, 0, 0, 32, 0, 1, 2, 3, 2, 450, 650, 300, 600),
-    Step(3, 1, 15, -24, 35, 0, 1, 3, 3, 3, 550, 750, 300, 500),
-    Step(0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 550, 750, 0, 0),
+    Step(0, -4, 0, 0, 46, 0, 1, 2, 2, 2, 350, 500, 150, 300),
+    Step(6, 4, 30, -34, 22, 0, 1, 3, 3, 3, 700, 950, 350, 600),
+    Step(-6, 6, -30, 34, 12, 0, 1, 3, 3, 3, 750, 1000, 350, 600),
+    Step(0, 10, 0, 0, 5, 0, 1, 2, 2, 1, 650, 900, 900, 1400),
+    Step(0, 6, 0, 0, 16, 0, 1, 2, 2, 2, 700, 950, 300, 500),
+    Step(0, 0, 0, 0, 30, 0, 0, 0, 0, 0, 700, 950, 0, 0),
 };
 
 constexpr MotionPattern kPatterns[] = {

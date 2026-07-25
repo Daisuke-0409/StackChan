@@ -18,6 +18,7 @@
 
 #include "hal/audio_codec_guard.h"
 #include "hal/hal.h"
+#include "stackchan/motion/tachikoma_motion.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
 
@@ -42,15 +43,29 @@ constexpr uint32_t kIdlePollIntervalMs = 2000;
 constexpr uint32_t kActivePollIntervalMs = 200;
 constexpr char kSettingsNamespace[] = "tachi_speak";  // NVS namespace <= 15 chars
 
+// The gateway tags each reply's audio with how that reply felt, so the body
+// can react at the moment it starts speaking rather than after. Values map to
+// TachikomaReaction; anything unrecognized is ignored and the device just
+// speaks without moving, which is the safe default.
+constexpr char kEmotionHeader[] = "X-Tachikoma-Emotion";
+
 struct HttpBuffer {
     std::string body;
+    std::string emotion;
     bool overflowed = false;
 };
 
 esp_err_t HttpEvent(esp_http_client_event_t* event)
 {
     auto* buffer = static_cast<HttpBuffer*>(event->user_data);
-    if (event->event_id == HTTP_EVENT_ON_DATA && buffer != nullptr && event->data != nullptr) {
+    if (buffer == nullptr) {
+        return ESP_OK;
+    }
+    if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key != nullptr &&
+        event->header_value != nullptr && strcasecmp(event->header_key, kEmotionHeader) == 0) {
+        buffer->emotion = event->header_value;
+    }
+    if (event->event_id == HTTP_EVENT_ON_DATA && event->data != nullptr) {
         if (buffer->body.size() + event->data_len > kMaxAudioBytes) {
             buffer->overflowed = true;
             return ESP_ERR_NO_MEM;
@@ -58,6 +73,35 @@ esp_err_t HttpEvent(esp_http_client_event_t* event)
         buffer->body.append(static_cast<const char*>(event->data), event->data_len);
     }
     return ESP_OK;
+}
+
+// Plays the motion directly instead of going through HappyRequested /
+// ConfusedRequested.
+//
+// Those events move the state machine into Reacting, which does not work
+// while speaking: there is no Reacting+SpeechFinished transition rule, so
+// the SpeechFinished fired when playback ends would be rejected and the
+// device would sit in Speaking until it timed out into Error. Reacting is
+// for a reaction that *is* the whole activity; here the reaction has to ride
+// on top of one.
+//
+// Driving the motion manager directly gives exactly that. A one-shot records
+// the loop it interrupted and restores it when done, and
+// TachikomaStateManager::CheckOneShotCompletion() only raises
+// ReactionFinished when the state actually is Reacting, so completing here
+// is silent. The state machine stays in Speaking from start to finish.
+void PlayEmotionMotion(const std::string& emotion)
+{
+    if (emotion.empty()) {
+        return;
+    }
+    if (emotion == "happy") {
+        tachikoma_motion::PlayMotion(tachikoma_motion::MotionType::Happy);
+    } else if (emotion == "confused" || emotion == "sad") {
+        tachikoma_motion::PlayMotion(tachikoma_motion::MotionType::Confused);
+    } else {
+        mclog::tagWarn(kTag, "unknown emotion header value, ignoring");
+    }
 }
 
 // Percent-encodes a device_id for safe use in a URL query string. The
@@ -294,8 +338,13 @@ bool SpeechAnnouncer::FetchAndPlay(const SpeechQueueConfig& config, bool& had_au
     // AudioService instead) if this is ever extended to long or continuous
     // audio output.
     auto& state = tachikoma_state::GetTachikomaStateManager();
+    // SpeechStarted first: it sets the Speaking state, and the state change
+    // applies that state's loop motion. Playing the emotion after means the
+    // one-shot is layered on the loop it should return to.
     state.Notify(tachikoma_state::TachikomaEvent::SpeechStarted);
-    mclog::tagInfo(kTag, "playing pushed announcement bytes={}", buffer.body.size());
+    PlayEmotionMotion(buffer.emotion);
+    mclog::tagInfo(kTag, "playing pushed announcement bytes={} emotion={}", buffer.body.size(),
+                    buffer.emotion.empty() ? "none" : buffer.emotion.c_str());
     {
         // Held across the whole EnableOutput()+OutputData() sequence, not
         // just each call individually, so AudioService's idle

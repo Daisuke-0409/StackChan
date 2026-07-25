@@ -333,7 +333,59 @@ GEMINI_SYSTEM_PROMPT = (
     "箇条書き、マークダウン記法、アスタリスクなどの記号、URL、絵文字は使わず、"
     "話し言葉の文章だけで答えてください。"
     "調べた内容を伝えるときも、要点を2〜3文にまとめてください。"
+    # The tag is how the robot's body learns what the reply felt like. It is
+    # asked for first so it arrives in the opening stream chunk, before any
+    # sentence has finished -- the motion can then start with the speech
+    # instead of after it. _EMOTION_TAG_RE strips it before TTS.
+    "回答の先頭に、その回答の感情を [happy] [sad] [neutral] のいずれか一つで"
+    "必ず付けてください。嬉しい・楽しい・褒められたときは happy、"
+    "残念・わからない・失敗を伝えるときは sad、それ以外は neutral です。"
+    "タグの後に続けて、普通に回答を書いてください。"
 )
+
+# Deliberately tolerant: the model sometimes emits 【happy】 or "happy:" or
+# wraps the tag in whitespace. Anything that fails to match simply stays in
+# the text and is treated as neutral, which is the safe direction.
+_EMOTION_TAG_RE = re.compile(r"^\s*[\[\【]?\s*(happy|sad|neutral)\s*[\]\】]?\s*[:：]?\s*", re.IGNORECASE)
+# Matches a *prefix of* a tag, so a chunk that ends mid-tag ("[hap") is not
+# mistaken for a reply that simply has no tag.
+_EMOTION_TAG_MAYBE_RE = re.compile(
+    r"^\s*[\[\【]?\s*(h(a(p(p(y)?)?)?)?|s(a(d)?)?|n(e(u(t(r(a(l)?)?)?)?)?)?)$", re.IGNORECASE)
+
+# Reaction names the firmware understands (TachikomaReaction). "neutral"
+# deliberately maps to nothing -- most replies should not make it dance.
+_EMOTION_TO_REACTION = {"happy": "happy", "sad": "confused"}
+
+# One pending reaction per device, consumed by the next /v1/speak_queue fetch
+# so the motion starts exactly when the audio does.
+_pending_emotion: dict[str, str] = {}
+_pending_emotion_lock = threading.Lock()
+
+
+def _split_emotion_tag(text: str) -> tuple[str, Optional[str]]:
+    """Pulls a leading [happy]/[sad]/[neutral] tag off a reply.
+
+    Returns (text without the tag, reaction name or None).
+    """
+    match = _EMOTION_TAG_RE.match(text)
+    if not match:
+        return text, None
+    return text[match.end():], _EMOTION_TO_REACTION.get(match.group(1).lower())
+
+
+def set_pending_emotion(device_id: str, reaction: Optional[str]) -> None:
+    if not device_id:
+        return
+    with _pending_emotion_lock:
+        if reaction:
+            _pending_emotion[device_id] = reaction
+        else:
+            _pending_emotion.pop(device_id, None)
+
+
+def take_pending_emotion(device_id: str) -> Optional[str]:
+    with _pending_emotion_lock:
+        return _pending_emotion.pop(device_id, None)
 
 # google_search lets Gemini look things up when the answer needs current or
 # external information. Verified live 2026-07-26 with gemini-3.5-flash-lite:
@@ -427,7 +479,9 @@ def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str
         answer = "".join(p["text"] for p in parts if isinstance(p.get("text"), str))
     except (KeyError, IndexError, TypeError):
         return _result(502, "invalid_response")
-    answer = _speakable(answer) if isinstance(answer, str) else ""
+    answer, reaction = _split_emotion_tag(answer) if isinstance(answer, str) else ("", None)
+    set_pending_emotion(payload["device_id"], reaction)
+    answer = _speakable(answer)
     if not answer or len(answer.encode("utf-8")) > MAX_OUTPUT_BYTES:
         return _result(502, "invalid_response")
     _log_grounding(decoded.get("candidates", [{}])[0])
@@ -690,6 +744,8 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
 
     pending = ""
     first_chunk_logged = False
+    emotion_resolved = False
+    set_pending_emotion(device_id, None)  # clear anything left from a previous turn
     try:
         with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
                                     context=ssl.create_default_context()) as response:
@@ -699,6 +755,22 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
                     _log(f"gateway streaming first_chunk_ms={(time.monotonic() - t_start) * 1000:.0f}")
                 full_text_parts.append(delta)
                 pending += delta
+                if not emotion_resolved:
+                    # The tag sits at the very start of the reply, so it is
+                    # resolvable from the first chunk -- before any sentence
+                    # has been synthesized. Waiting for a sentence boundary
+                    # would put the motion behind the voice.
+                    stripped, reaction = _split_emotion_tag(pending)
+                    if reaction is not None:
+                        set_pending_emotion(device_id, reaction)
+                        _log(f"gateway emotion={reaction} "
+                             f"resolved_ms={(time.monotonic() - t_start) * 1000:.0f}")
+                    # Only commit once the tag is either found or ruled out;
+                    # a partial "[hap" must not be mistaken for no tag.
+                    if reaction is not None or not _EMOTION_TAG_MAYBE_RE.match(pending):
+                        emotion_resolved = True
+                        pending = stripped
+                        full_text_parts[:] = [stripped]
                 ready, pending = _extract_ready_sentences(pending)
                 for sentence in ready:
                     flush_sentence(sentence)
@@ -1006,9 +1078,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_audio(self, audio: bytes) -> None:
+    def _send_audio(self, audio: bytes, emotion: Optional[str] = None) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "audio/L16;rate=24000;channels=1")
+        # Rides along with the audio it belongs to, so the device starts the
+        # motion at the same moment it starts speaking. Sending it on the
+        # /v1/chat response instead would arrive a turn too late: the device
+        # only sees that after the whole reply has been generated.
+        if emotion:
+            self.send_header("X-Tachikoma-Emotion", emotion)
         self.send_header("Content-Length", str(len(audio)))
         self.end_headers()
         self.wfile.write(audio)
@@ -1034,7 +1112,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if audio is None:
                 self._send_no_content()
             else:
-                self._send_audio(audio)
+                self._send_audio(audio, take_pending_emotion(device_id))
         else:
             self._send(404, {"error": "not_found"})
 
