@@ -63,40 +63,79 @@ why (`98d0dec`), and the device's own `SpeechAnnouncer::kMaxAudioBytes`
 had the same 256 KiB ceiling on the receiving end (`7cea0b3`). Chat replies
 reach the speaker now.
 
-### Known issue (unresolved, 2026-07-24): recognized/spoken audio is garbled and fast
+### Resolved, 2026-07-24: recognized/spoken audio was garbled and fast (channel interleaving)
 
-While investigating the above, push-to-talk audio sent to STT was found to
-be garbled -- and speech played back through the (now-working) audio path
-sounds fast/garbled too.
+While investigating the "no voice" issue above, push-to-talk audio sent to
+STT was found to be garbled -- and speech played back through the audio
+path sounded fast/garbled too.
 
-**What was found and fixed today**: `TACHIKOMA_DEBUG_LOGGING=1` (`78b4557`)
-saved an uploaded recording as WAV; analyzing it showed even-indexed
-samples at ~13x the RMS of odd-indexed samples -- two different signals
-interleaved, not one noisy mono channel. Traced to
-`AUDIO_INPUT_REFERENCE=true` (`hal/board/config.h`), which makes
+`TACHIKOMA_DEBUG_LOGGING=1` (`78b4557`) saved an uploaded recording as WAV;
+analyzing it showed even-indexed samples at ~13x the RMS of odd-indexed
+samples -- two different signals interleaved, not one noisy mono channel.
+Traced to `AUDIO_INPUT_REFERENCE=true` (`hal/board/config.h`), which makes
 `AudioCodec::input_channels()` 2 (real mic + AEC reference), while
-`VoiceInputController` has declared `channels=1` and never checked
+`VoiceInputController` had declared `channels=1` and never checked
 `input_channels()` since the original Phase 5 implementation (`b76f04a`,
 2026-07-20). `DownmixToChannel0()` (`0f35305`) now extracts channel 0
-before the recording buffer is built.
+before the recording buffer is built. Confirmed fixed -- no more
+interleaved-channel garble in freshly recorded WAVs.
 
-**Not resolved**: after flashing the downmix fix, speech is still
-fast/garbled. This is not yet understood -- possibilities, none confirmed:
+### Resolved, 2026-07-25: Gemini STT hallucinated on near-silent audio
 
-- The downmix picked the wrong channel (channel 0 assumed to be the real
-  mic; if the hardware/driver actually interleaves reference-first, this
-  needs to extract index 1, not index 0, from each channel-pair).
-- A separate, still-unidentified sample-rate or frame-size handling bug
-  independent of the channel count (e.g. `kFrameSamples` / recording
-  buffer arithmetic assuming a rate or frame layout that doesn't match
-  `AUDIO_INPUT_SAMPLE_RATE=24000` in practice).
+Very short/near-empty recordings (e.g. from the recording-duration bug
+below, or a genuine false-trigger) were sent to Gemini STT as-is. Instead
+of reporting it couldn't hear anything, Gemini confidently returned a
+fluent, plausible-sounding but entirely fabricated Japanese sentence --
+worse than no transcription at all, since the device can't distinguish it
+from real speech.
 
-**First thing to do next session**: re-analyze the WAV files already saved
-in `TACHIKOMA_DEBUG_AUDIO_DIR` (default
-`%TEMP%\tachikoma_debug_audio`) -- both the pre-downmix ones from today
-and, ideally, a fresh one recorded after the downmix fix -- to reconfirm
-which of the interleaved channels (even-indexed vs. odd-indexed samples)
-is actually the coherent speech signal, not just assume channel 0. Re-check
-the sample-rate and frame-size handling in `voice_input_controller.cpp`
-against the codec's actual behavior at the same time, in case the channel
-mixup was only ever part of the problem.
+Fixed server-side only, no flash needed (`a1c5c84`): `process_transcribe()`
+in `gateway/server.py` now skips the STT call entirely when
+`len(audio) / 2 / sample_rate < MIN_TRANSCRIBE_AUDIO_SECONDS` (0.5s) and
+returns `{"text": ""}` directly. The device already treats an empty `text`
+field as `VoiceInputErrorCode::InvalidResponse`
+(`VoiceInputController::UploadAndTranscribe`), the same path a real STT
+error takes, so this needed no firmware change.
+
+### Known issue (unresolved, 2026-07-25): recorded audio is much shorter than the actual button-hold
+
+After the channel-interleaving fix above, a controlled live test (button
+held for a deliberate ~2.48s Press-to-Release, single clean pair confirmed
+via monitor logs) showed the uploaded recording only covers ~0.53s (~21%
+of the hold duration). Chattering/multiple Press-Release pairs has been
+ruled out -- this is one continuous hold producing one short recording.
+
+**Ruled out**: touch-sensor chattering; the input-side mutual exclusion
+between `VoiceInputController::Update()` and `AudioService::AudioInputTask()`
+(`cc9f262`, pause on `OnButtonPressed()` / resume on
+`StopRecordingAndUpload()` -- confirmed exactly one pause/resume pair per
+recording, no leaked pause state); `CoreS3AudioCodec::Read()`/`Write()`
+silently reporting success on a failed transfer (`8a332fe`, now returns
+actual `esp_codec_dev_read()`/`write()` status).
+
+**Suspected, not yet measured**: `VoiceInputController::Update()` is driven
+by the shared `_stackchan_update_task` (`hal.cpp`), a single FreeRTOS task
+also running LVGL UI updates, reminders, motion, and other Tachikoma
+state -- all behind one `vTaskDelay(pdMS_TO_TICKS(20))` per loop, plus a
+conditional extra `vTaskDelay(pdMS_TO_TICKS(100))` when
+`!hal_bridge::is_xiaozhi_idle()`. If this task's actual tick interval
+during recording is much coarser than the nominal ~20ms (or worse, than
+the ~6.67ms figure a smooth audio capture would need), or if
+`codec->InputData()` (`esp_codec_dev_read()`) itself blocks for a long time
+per call, that alone could explain capturing only ~21% of a hold. Neither
+has been measured yet -- this is a hypothesis, not a confirmed cause.
+
+**First thing to do next session**: measure, don't guess.
+1. Instrument `_stackchan_update_task`'s loop to log actual tick-to-tick
+   interval during an active recording (not just the nominal 20ms delay).
+2. Instrument `codec->InputData()` (or the `esp_codec_dev_read()` call it
+   wraps) to log per-call elapsed time during recording.
+3. Check whether anything else on that task, or a competing task, runs
+   heavy work concurrently with recording that would starve its ticks.
+
+Only once real numbers are in hand should a fix direction be chosen --
+the leading candidate is giving `VoiceInputController` its own dedicated
+recording task (mirroring `AudioService::AudioInputTask()`'s pattern)
+decoupled from the shared UI/state loop, but this is deliberately not
+decided yet and no firmware change should be made until the measurements
+justify it.
