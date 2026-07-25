@@ -1067,6 +1067,51 @@ class GatewayHandler(BaseHTTPRequestHandler):
         _log(f"gateway {self.command} {self.path} {args[1] if len(args) > 1 else ''}")
 
 
+VOICEVOX_DICT_PATH = os.environ.get(
+    "VOICEVOX_DICT_FILE", os.path.join(os.path.dirname(__file__), "voicevox_dict.json"))
+
+
+def _register_voicevox_words(env: dict[str, str]) -> None:
+    """Teach VOICEVOX how to read words it gets wrong.
+
+    Names are the common case: VOICEVOX reads 大輔 as "オオスケ", so the device
+    called its owner by the wrong name every time it used it. The engine keeps
+    its user dictionary in its own state, but that is invisible to this repo
+    and lost on a reinstall, so the intended readings live in a file here and
+    are re-applied at startup.
+
+    Format is a plain {"surface": "pronunciation"} map, pronunciation in
+    katakana:  {"大輔": "ダイスケ"}
+    """
+    try:
+        with open(VOICEVOX_DICT_PATH, encoding="utf-8") as f:
+            words = json.load(f)
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError) as exc:
+        _log(f"gateway voicevox dict unreadable ({type(exc).__name__}); skipping")
+        return
+    if not isinstance(words, dict):
+        return
+    base_url = env.get("VOICEVOX_URL", "http://127.0.0.1:50021").rstrip("/")
+    added = 0
+    for surface, pronunciation in words.items():
+        if not isinstance(surface, str) or not isinstance(pronunciation, str):
+            continue
+        params = urllib.parse.urlencode({"surface": surface, "pronunciation": pronunciation,
+                                         "accent_type": 0})
+        try:
+            request = urllib.request.Request(f"{base_url}/user_dict_word?{params}", data=b"", method="POST")
+            with urllib.request.urlopen(request, timeout=10):
+                added += 1
+        except Exception:
+            # Duplicate entries and a stopped engine both land here; neither
+            # is worth failing startup over.
+            continue
+    if added:
+        _log(f"gateway voicevox dictionary entries applied={added}")
+
+
 def _warm_voicevox(env: dict[str, str]) -> None:
     """Preload the configured VOICEVOX voice at startup.
 
@@ -1085,6 +1130,7 @@ def _warm_voicevox(env: dict[str, str]) -> None:
         with urllib.request.urlopen(request, timeout=60):
             pass
         _log(f"gateway voicevox speaker={speaker} preloaded in {(time.monotonic() - t0) * 1000:.0f}ms")
+        _register_voicevox_words(env)
     except Exception as exc:
         _log(f"gateway voicevox preload failed ({type(exc).__name__}); "
              f"TTS will fall back to gemini until the engine is reachable")
