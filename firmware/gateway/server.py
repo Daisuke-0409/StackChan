@@ -118,7 +118,11 @@ def _memory_path(device_id: str) -> str:
 
 def _load_memory(device_id: str) -> dict[str, Any]:
     try:
-        with open(_memory_path(device_id), encoding="utf-8") as f:
+        # utf-8-sig for the same reason as the VOICEVOX dictionary: these
+        # files get corrected by hand (a name STT spelled wrong, a fact to
+        # drop), and a Windows editor's BOM would otherwise make the whole
+        # memory look unreadable and silently start over from empty.
+        with open(_memory_path(device_id), encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return {"profile": [], "turns": []}
@@ -301,6 +305,23 @@ _GEMINI_STT_PROMPT = (
     "話者は「タチコマ」という名前のロボットに話しかけています。"
     "書き起こしたテキストのみを返し、説明や前置きは付けないでください。"
 )
+
+
+def _stt_prompt(env: dict[str, str]) -> str:
+    """The transcription prompt, plus any locally configured spellings.
+
+    A name has no single correct kanji from audio alone: "ダイスケ" came back
+    as 大助 and was stored in the profile that way, so the assistant then used
+    the wrong characters for its owner's name in every reply. STT_VOCABULARY
+    (comma-separated) lists the spellings this household actually uses. It
+    lives in .env rather than in this file because it is personal data.
+    """
+    vocabulary = [w.strip() for w in env.get("STT_VOCABULARY", "").split(",") if w.strip()]
+    if not vocabulary:
+        return _GEMINI_STT_PROMPT
+    return (_GEMINI_STT_PROMPT
+            + "次の固有名詞が出てきた場合は、必ずこの表記を使ってください: "
+            + "、".join(vocabulary) + "。")
 # Every word of a reply is read aloud, so formatting is not cosmetic here:
 # with web search enabled Gemini answers in markdown by default ("**気温**:",
 # "* 項目") and a bulleted list of headlines is unusable as speech. Keep the
@@ -866,7 +887,7 @@ def _gemini_stt_text(pcm: bytes, sample_rate: int, env: dict[str, str]) -> Optio
     wav_b64 = base64.b64encode(_pcm_to_wav(pcm, sample_rate)).decode("ascii")
     request_body = json.dumps({
         "contents": [{"role": "user", "parts": [
-            {"text": _GEMINI_STT_PROMPT},
+            {"text": _stt_prompt(env)},
             {"inlineData": {"mimeType": "audio/wav", "data": wav_b64}},
         ]}],
     }).encode("utf-8")
@@ -1084,7 +1105,10 @@ def _register_voicevox_words(env: dict[str, str]) -> None:
     katakana:  {"大輔": "ダイスケ"}
     """
     try:
-        with open(VOICEVOX_DICT_PATH, encoding="utf-8") as f:
+        # utf-8-sig, not utf-8: this file gets hand-edited on Windows, and
+        # PowerShell's Set-Content -Encoding utf8 writes a BOM that plain
+        # utf-8 decoding turns into a JSONDecodeError on the first character.
+        with open(VOICEVOX_DICT_PATH, encoding="utf-8-sig") as f:
             words = json.load(f)
     except FileNotFoundError:
         return
