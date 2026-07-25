@@ -37,12 +37,21 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
+try:  # package import when run as gateway.server, plain when run as a script
+    from . import biometrics, people
+except ImportError:  # pragma: no cover - depends on how the server is started
+    import biometrics
+    import people
+
 MAX_INPUT_BYTES = 512
 MAX_OUTPUT_BYTES = 4096
 MAX_SPEECH_AUDIO_BYTES = 720_000  # ~15s at 24kHz/16-bit/mono; sized for a real Gemini TTS reply,
                                    # not just the old fixed confirmation tone
 MAX_TRANSCRIBE_AUDIO_BYTES = 1536 * 1024  # >= VoiceInputController's kMaxRecordingSamples (30s
                                           # at 24kHz mono = 1.44 MB), with headroom
+# A 320x240 JPEG from the device's GC0308 is 10-25 KB; this is generous
+# enough for a raw or high-quality frame without inviting a large upload.
+MAX_VISION_IMAGE_BYTES = 512 * 1024
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
 MIN_TRANSCRIBE_AUDIO_SECONDS = 0.5  # below this, skip STT entirely and treat as "didn't hear
@@ -110,6 +119,52 @@ MEMORY_MAX_PROFILE_ITEMS = 40
 MEMORY_MAX_FACT_CHARS = 200
 _memory_lock = threading.Lock()
 
+PEOPLE_PATH = os.environ.get("TACHIKOMA_PEOPLE_FILE",
+                             os.path.join(os.path.dirname(__file__), "memory", "people.json"))
+_people_store = people.PeopleStore(PEOPLE_PATH)
+
+# Who the device is currently talking to, per device. Identification happens
+# on the audio upload; the chat request that follows is a separate HTTP call
+# and has no voice of its own to go on, so the answer is carried here.
+#
+# It expires. Somebody else picking up the conversation ten minutes later
+# must not inherit the last speaker's standing, and the safe direction when
+# in doubt is to forget rather than to keep trusting.
+SPEAKER_TTL_SECONDS = float(os.environ.get("SPEAKER_TTL_SECONDS", "180"))
+_speaker_lock = threading.Lock()
+_current_speaker: dict[str, dict[str, Any]] = {}
+
+
+def set_current_speaker(device_id: str, person: Optional[dict[str, Any]], score: float,
+                        modality: str) -> None:
+    if not device_id:
+        return
+    with _speaker_lock:
+        if person is None:
+            _current_speaker.pop(device_id, None)
+        else:
+            _current_speaker[device_id] = {
+                "person_id": person["id"], "name": person.get("name", ""),
+                "role": person.get("role", people.ROLE_GUEST),
+                "score": score, "modality": modality, "at": time.time(),
+            }
+
+
+def get_current_speaker(device_id: str) -> Optional[dict[str, Any]]:
+    with _speaker_lock:
+        entry = _current_speaker.get(device_id)
+        if entry is None:
+            return None
+        if time.time() - entry["at"] > SPEAKER_TTL_SECONDS:
+            _current_speaker.pop(device_id, None)
+            return None
+        return dict(entry)
+
+
+def current_role(device_id: str) -> str:
+    entry = get_current_speaker(device_id)
+    return entry["role"] if entry else people.ROLE_UNKNOWN
+
 
 def _memory_path(device_id: str) -> str:
     safe = re.sub(r"[^A-Za-z0-9_.-]", "_", device_id)[:64] or "unknown"
@@ -126,9 +181,31 @@ def _load_memory(device_id: str) -> dict[str, Any]:
             data = json.load(f)
     except (OSError, ValueError):
         return {"profile": [], "turns": []}
-    profile = [s for s in data.get("profile", []) if isinstance(s, str)]
-    turns = [t for t in data.get("turns", [])
-             if isinstance(t, dict) and t.get("role") in ("user", "model") and isinstance(t.get("text"), str)]
+    # A fact is {"text": ..., "visibility": ...}. Files written before
+    # visibility existed hold bare strings; those predate anyone but the
+    # operator ever being identified, so they are read back as master-only --
+    # the closed direction, which can be opened deliberately but never
+    # leaks by accident.
+    profile: list[dict[str, Any]] = []
+    for item in data.get("profile", []):
+        if isinstance(item, str):
+            profile.append({"text": item, "visibility": people.VISIBILITY_MASTER})
+        elif isinstance(item, dict) and isinstance(item.get("text"), str):
+            visibility = item.get("visibility")
+            profile.append({
+                "text": item["text"],
+                "visibility": visibility if visibility in people._VISIBILITY_MIN_RANK
+                else people.VISIBILITY_MASTER,
+            })
+    turns = []
+    for t in data.get("turns", []):
+        if isinstance(t, dict) and t.get("role") in ("user", "model") and isinstance(t.get("text"), str):
+            visibility = t.get("visibility")
+            turns.append({
+                "role": t["role"], "text": t["text"],
+                "visibility": visibility if visibility in people._VISIBILITY_MIN_RANK
+                else people.VISIBILITY_MASTER,
+            })
     return {"profile": profile[:MEMORY_MAX_PROFILE_ITEMS], "turns": turns[-MEMORY_MAX_TURNS:]}
 
 
@@ -146,13 +223,22 @@ def _save_memory(device_id: str, memory: dict[str, Any]) -> None:
         _log(f"gateway memory save failed: {type(exc).__name__}")
 
 
-def _memory_prompt_parts(device_id: str) -> tuple[str, list[dict[str, Any]]]:
-    """Returns (system-instruction suffix, prior conversation contents)."""
+def _memory_prompt_parts(device_id: str, role: str = people.ROLE_MASTER) -> tuple[str, list[dict[str, Any]]]:
+    """Returns (system-instruction suffix, prior conversation contents).
+
+    Filtered by who is listening. This is the whole access-control
+    mechanism: a fact the current speaker may not hear is not included, so
+    the model composing the answer never had it. Telling the model to keep
+    quiet about something it can see is not the same thing -- a
+    sympathetic-sounding question can still draw that out.
+    """
     with _memory_lock:
         memory = _load_memory(device_id)
+    audible = [f for f in memory["profile"] if people.can_hear(role, f["visibility"])]
+    withheld = len(memory["profile"]) - len(audible)
     suffix = ""
-    if memory["profile"]:
-        remembered = "\n".join(f"- {fact}" for fact in memory["profile"])
+    if audible:
+        remembered = "\n".join(f"- {fact['text']}" for fact in audible)
         suffix = (
             "\n\n以下はこのユーザーについて記憶している情報です。"
             "質問に答えるときは、必要に応じてこの情報を前提として使ってください"
@@ -160,17 +246,46 @@ def _memory_prompt_parts(device_id: str) -> tuple[str, list[dict[str, Any]]]:
             "ただし、聞かれてもいないのにこの情報をわざわざ復唱しないでください。\n"
             f"{remembered}"
         )
-    contents = [{"role": turn["role"], "parts": [{"text": turn["text"]}]} for turn in memory["turns"]]
+    contents = [{"role": turn["role"], "parts": [{"text": turn["text"]}]}
+                for turn in memory["turns"] if people.can_hear(role, turn["visibility"])]
+    if withheld:
+        # Counts only. Logging which facts were withheld would put them in
+        # the log, which is the one place this design is trying to keep them
+        # out of.
+        _log(f"gateway memory filtered role={role} withheld_facts={withheld}")
     return suffix, contents
 
 
-def _append_turn(device_id: str, user_text: str, model_text: str) -> None:
+def _append_turn(device_id: str, user_text: str, model_text: str, visibility: str) -> None:
     with _memory_lock:
         memory = _load_memory(device_id)
-        memory["turns"].append({"role": "user", "text": user_text})
-        memory["turns"].append({"role": "model", "text": model_text})
+        memory["turns"].append({"role": "user", "text": user_text, "visibility": visibility})
+        memory["turns"].append({"role": "model", "text": model_text, "visibility": visibility})
         memory["turns"] = memory["turns"][-MEMORY_MAX_TURNS:]
         _save_memory(device_id, memory)
+
+
+def _restrict_recent_turns(device_id: str, count: int = 4) -> int:
+    """Pull the last few exchanges back to master-only.
+
+    For "さっきの話は内緒ね" -- the cue arrives *after* the thing it is about
+    has already been stored, so marking only what follows would miss the
+    point entirely.
+    """
+    changed = 0
+    with _memory_lock:
+        memory = _load_memory(device_id)
+        for turn in memory["turns"][-count:]:
+            if turn["visibility"] != people.VISIBILITY_MASTER:
+                turn["visibility"] = people.VISIBILITY_MASTER
+                changed += 1
+        for fact in memory["profile"]:
+            if fact["visibility"] != people.VISIBILITY_MASTER:
+                fact["visibility"] = people.VISIBILITY_MASTER
+                changed += 1
+        if changed:
+            _save_memory(device_id, memory)
+    return changed
 
 
 _PROFILE_EXTRACT_PROMPT = (
@@ -183,7 +298,8 @@ _PROFILE_EXTRACT_PROMPT = (
 )
 
 
-def _update_profile(device_id: str, user_text: str, model_text: str, env: dict[str, str]) -> None:
+def _update_profile(device_id: str, user_text: str, model_text: str, env: dict[str, str],
+                    visibility: str = people.VISIBILITY_MASTER) -> None:
     """Refresh the durable facts for this device. Runs on a background thread
     after the reply has been sent -- never in the request path."""
     key = env.get("AI_PROVIDER_API_KEY", "")
@@ -191,11 +307,12 @@ def _update_profile(device_id: str, user_text: str, model_text: str, env: dict[s
         return
     with _memory_lock:
         existing = _load_memory(device_id)["profile"]
+    existing_texts = [f["text"] for f in existing]
     model = env.get("MEMORY_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
     request_body = json.dumps({
         "system_instruction": {"parts": [{"text": _PROFILE_EXTRACT_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text":
-            f"既存の事実:\n{json.dumps(existing, ensure_ascii=False)}\n\n"
+            f"既存の事実:\n{json.dumps(existing_texts, ensure_ascii=False)}\n\n"
             f"直近の会話:\nユーザー: {user_text}\nアシスタント: {model_text}"}]}],
         "generationConfig": {"responseMimeType": "application/json"},
     }).encode("utf-8")
@@ -218,21 +335,51 @@ def _update_profile(device_id: str, user_text: str, model_text: str, env: dict[s
         if isinstance(fact, str) and fact.strip():
             cleaned.append(fact.strip()[:MEMORY_MAX_FACT_CHARS])
     cleaned = cleaned[:MEMORY_MAX_PROFILE_ITEMS]
-    if cleaned == existing:
+    if cleaned == [f["text"] for f in existing]:
         return
+    # Keep the visibility already decided for a fact we have seen before;
+    # a re-extraction must not quietly widen something that was marked
+    # private. Genuinely new facts take this turn's visibility.
+    previous = {f["text"]: f["visibility"] for f in existing}
     with _memory_lock:
         memory = _load_memory(device_id)
-        memory["profile"] = cleaned
+        memory["profile"] = [
+            {"text": text, "visibility": previous.get(text, visibility)} for text in cleaned
+        ]
         _save_memory(device_id, memory)
-    # Count only -- the facts themselves are personal and stay out of the log.
-    _log(f"gateway memory profile updated device_id={device_id} facts={len(cleaned)}")
+    # Counts only -- the facts themselves are personal and stay out of the log.
+    _log(f"gateway memory profile updated device_id={device_id} facts={len(cleaned)} "
+         f"visibility={visibility}")
+
+
+def _visibility_for_turn(device_id: str, user_text: str) -> str:
+    """How widely what was just said may be repeated.
+
+    Starts from who is speaking -- what the operator says is his to keep,
+    what a colleague volunteers about themselves is not the household's
+    secret -- and then narrows if the words themselves asked for it.
+    """
+    role = current_role(device_id)
+    visibility = people.default_visibility_for(role)
+    if people.mentions_secret(user_text):
+        visibility = people.VISIBILITY_MASTER
+        # The cue usually refers to what was *just* said, not only to what
+        # comes next, so pull the recent exchanges closed too.
+        changed = _restrict_recent_turns(device_id)
+        _log(f"gateway privacy cue -> master-only (also restricted {changed} earlier entries)")
+    elif people.mentions_unsecret(user_text) and role == people.ROLE_MASTER:
+        visibility = people.VISIBILITY_HOUSEHOLD
+        _log("gateway privacy cue -> opened to household")
+    return visibility
 
 
 def _remember_exchange(device_id: str, user_text: str, model_text: str, env: dict[str, str]) -> None:
     if env.get("ENABLE_MEMORY", "1") != "1" or not device_id or not model_text:
         return
-    _append_turn(device_id, user_text, model_text)
-    threading.Thread(target=_update_profile, args=(device_id, user_text, model_text, env),
+    visibility = _visibility_for_turn(device_id, user_text)
+    _append_turn(device_id, user_text, model_text, visibility)
+    threading.Thread(target=_update_profile,
+                     args=(device_id, user_text, model_text, env, visibility),
                      daemon=True).start()
 
 
@@ -425,6 +572,158 @@ def _speakable(text: str) -> str:
 _GEMINI_TTS_READ_ALOUD_PREFIX = "次のテキストをそのまま読み上げてください: "
 
 
+# Said out loud, these start an enrolment: the speaker is telling the device
+# who they are. Keyword-matched for the same reason the privacy cues are --
+# a deterministic trigger the operator can rely on, rather than a judgement
+# that might fire on "自己紹介って苦手なんだよね".
+_ENROL_RE = re.compile(
+    r"(自己紹介|声を覚え|声をおぼえ|私の声|俺の声|僕の声|覚えておいて.*名前|名前を覚え)")
+# "俺は大輔", "私の名前は花子です", "花子といいます"
+_NAME_RES = [
+    re.compile(r"(?:名前は|なまえは)\s*([^\s。、！？!?]{1,12})"),
+    re.compile(r"(?:私|わたし|俺|おれ|僕|ぼく)は\s*([^\s。、！？!?]{1,12})(?:です|だ|だよ|ね)?"),
+    re.compile(r"([^\s。、！？!?]{1,12})\s*(?:といいます|と言います|と申します|です)"),
+]
+_ROLE_WORDS = [
+    (people.ROLE_HOUSEHOLD, re.compile(r"(彼女|嫁|妻|奥さん|家族|同居)")),
+    (people.ROLE_COLLEAGUE, re.compile(r"(同僚|会社|部下|上司|社員|仕事仲間)")),
+]
+
+
+def _extract_enrolment(text: str) -> Optional[tuple[str, Optional[str]]]:
+    """(name, role) if this utterance is someone introducing themselves."""
+    if not text or not _ENROL_RE.search(text):
+        return None
+    name = None
+    for pattern in _NAME_RES:
+        found = pattern.search(text)
+        if found:
+            name = found.group(1).strip()
+            break
+    if not name:
+        return None
+    role = None
+    for candidate_role, pattern in _ROLE_WORDS:
+        if pattern.search(text):
+            role = candidate_role
+            break
+    return name, role
+
+
+def _identify_or_enrol(device_id: str, pcm: bytes, sample_rate: int, text: str) -> None:
+    """Work out who just spoke, and enrol them if they said who they are.
+
+    Runs after transcription because the words decide whether this is an
+    introduction. Never raises: failing to recognize somebody has to leave
+    the conversation working, just without their standing.
+    """
+    if not device_id or not biometrics.voice_available():
+        return
+    embedding = biometrics.voice_embedding(pcm, sample_rate)
+    if embedding is None:
+        return
+
+    person, score = _people_store.identify(
+        "voice", embedding, people.VOICE_MATCH_THRESHOLD, people.VOICE_MATCH_MARGIN)
+
+    enrolment = _extract_enrolment(text)
+    if enrolment is not None:
+        name, stated_role = enrolment
+        if person is not None:
+            # Already known -- treat it as another sample of the same voice
+            # rather than a second person with the same name.
+            _people_store.add_embedding(person["id"], "voice", embedding)
+            if stated_role:
+                _people_store.set_role(person["id"], stated_role)
+            _log(f"gateway voice enrolment: existing person, sample added score={score:.2f}")
+        else:
+            # The very first person to introduce themselves is the operator.
+            # There is nobody enrolled who could have authorized it, and
+            # somebody has to be able to grant the rest.
+            first_ever = not _people_store.list_people()
+            role = people.ROLE_MASTER if first_ever else (stated_role or people.ROLE_GUEST)
+            person_id = _people_store.add_person(name, role)
+            _people_store.add_embedding(person_id, "voice", embedding)
+            person = _people_store.get(person_id)
+            _log(f"gateway voice enrolment: new person role={role} "
+                 f"{'(first ever -> master)' if first_ever else ''}")
+
+    if person is not None:
+        _people_store.note_encounter(person["id"])
+        set_current_speaker(device_id, person, score, "voice")
+        # Names are personal; the log records the decision, not the person.
+        _log(f"gateway speaker identified role={person.get('role')} score={score:.2f}")
+    else:
+        set_current_speaker(device_id, None, score, "voice")
+        if score:
+            _log(f"gateway speaker not identified (best={score:.2f}) -> least privilege")
+
+
+def process_vision(image_bytes: bytes, headers: dict[str, str] | None = None,
+                   env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    """One camera frame in; where to look and who it is, out.
+
+    Detection and recognition share the same inference, so pointing the head
+    at somebody and knowing who they are cost one pass between them.
+
+    `look_at` is normalized to -1..1 with the origin at the centre of the
+    frame, which is what Motion::lookAtNormalized on the device already
+    takes -- the firmware does not need to know the frame size, the lens, or
+    anything about faces.
+    """
+    headers = headers or {}
+    env = env or os.environ
+    if not _authorized(headers, env):
+        return _result(401, "authentication_failed")
+    if not image_bytes:
+        return _result(400, "invalid_input")
+    if not biometrics.face_available():
+        return _result(503, "server_error")
+
+    image = biometrics.decode_image(image_bytes)
+    if image is None:
+        return _result(400, "invalid_input")
+
+    faces = biometrics.detect_faces(image)
+    if not faces:
+        return 200, {"faces": 0, "look_at": None, "person": None}
+
+    # The largest face is the one being talked to. Somebody across the room
+    # is in frame but is not the conversation.
+    target = faces[0]
+    result: dict[str, Any] = {
+        "faces": len(faces),
+        "look_at": {"x": round(target["center_x"], 4), "y": round(target["center_y"], 4)},
+        "area_ratio": round(target["area_ratio"], 4),
+        "person": None,
+    }
+
+    device_id = headers.get("X-Device-Id", "")
+    if env.get("ENABLE_FACE_ID", "1") == "1":
+        embedding = biometrics.face_embedding(image, target)
+        if embedding is not None:
+            person, score = _people_store.identify(
+                "face", embedding, people.FACE_MATCH_THRESHOLD, people.FACE_MATCH_MARGIN)
+            if person is not None:
+                _people_store.note_encounter(person["id"])
+                result["person"] = {"role": person.get("role"), "score": round(score, 3)}
+                # A face confirms a voice; it does not outrank one. Only
+                # raise standing here when nobody has been identified by
+                # voice, so a photograph held up to the camera cannot
+                # promote itself over whoever is actually speaking.
+                if get_current_speaker(device_id) is None:
+                    set_current_speaker(device_id, person, score, "face")
+                _log(f"gateway face identified role={person.get('role')} score={score:.2f}")
+            else:
+                # Learn the face of whoever the voice already identified, so
+                # the next encounter can be recognized on sight.
+                speaker = get_current_speaker(device_id)
+                if speaker and speaker["modality"] == "voice" and target["area_ratio"] > 0.02:
+                    if _people_store.add_embedding(speaker["person_id"], "face", embedding):
+                        _log("gateway face remembered for the current speaker")
+    return 200, result
+
+
 def _log_grounding(candidate: dict[str, Any]) -> None:
     """Record what was searched and how many sources backed the answer.
 
@@ -446,7 +745,9 @@ def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str
         return _result(503, "server_error")
     model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
     url = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
-    suffix, prior = _memory_prompt_parts(payload["device_id"]) if env.get("ENABLE_MEMORY", "1") == "1" else ("", [])
+    listener_role = current_role(payload["device_id"])
+    suffix, prior = (_memory_prompt_parts(payload["device_id"], listener_role)
+                     if env.get("ENABLE_MEMORY", "1") == "1" else ("", []))
     body: dict[str, Any] = {
         "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + suffix}]},
         "contents": prior + [{"role": "user", "parts": [{"text": text}]}],
@@ -694,7 +995,9 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
     device_id = payload["device_id"]
     model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
     url = f"{GEMINI_API_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
-    suffix, prior = _memory_prompt_parts(device_id) if env.get("ENABLE_MEMORY", "1") == "1" else ("", [])
+    listener_role = current_role(device_id)
+    suffix, prior = (_memory_prompt_parts(device_id, listener_role)
+                     if env.get("ENABLE_MEMORY", "1") == "1" else ("", []))
     body: dict[str, Any] = {
         "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + suffix}]},
         "contents": prior + [{"role": "user", "parts": [{"text": text}]}],
@@ -1066,6 +1369,16 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
         stt_ms = (time.monotonic() - t_stt_start) * 1000
         detail = repr(body.get("text")) if status == 200 else body.get("error")
         _log(f"gateway debug transcribe status={status} stt_ms={stt_ms:.0f} text={detail}")
+
+    if status == 200 and env.get("ENABLE_SPEAKER_ID", "1") == "1":
+        # Synchronous on purpose. The chat request that decides what memory
+        # to load is a separate round trip that follows immediately, so
+        # doing this in the background would race it -- and losing that race
+        # means the operator is treated as a stranger and cannot see his own
+        # memory. Measured at 11-15ms for a 2-4s clip against ~1900ms of
+        # STT in the same call, so there is nothing to gain by deferring it.
+        _identify_or_enrol(headers.get("X-Device-Id", ""), bytes(audio), sample_rate,
+                           body.get("text", ""))
     return status, body
 
 
@@ -1125,6 +1438,17 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "invalid_input"})
                 return
             status, body = process_chat(payload, dict(self.headers), os.environ)
+            self._send(status, body)
+        elif self.path == "/v1/vision":
+            try:
+                length = min(int(self.headers.get("Content-Length", "0")), MAX_VISION_IMAGE_BYTES + 1024)
+                if length <= 0:
+                    raise ValueError("missing body")
+                image_bytes = self.rfile.read(length)
+            except ValueError:
+                self._send(400, {"error": "invalid_input"})
+                return
+            status, body = process_vision(image_bytes, dict(self.headers), os.environ)
             self._send(status, body)
         elif self.path == "/v1/speak":
             if not _authorized(dict(self.headers), os.environ):

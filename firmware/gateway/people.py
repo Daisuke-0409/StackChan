@@ -64,6 +64,19 @@ _VISIBILITY_MIN_RANK = {
 
 DEFAULT_VISIBILITY = VISIBILITY_MASTER
 
+# Cosine thresholds, measured against the encoder in biometrics.py using
+# distinct synthetic voices: same speaker scored 0.64-0.83, clearly different
+# speakers 0.38-0.46, while two voices of the same type and register reached
+# 0.77 against each other. So a single threshold cannot separate everybody --
+# which is why identify() also demands a margin over the runner-up and
+# reports nobody when two enrolled people sound alike. Refusing is correct
+# there; guessing is how the wrong person hears something private.
+VOICE_MATCH_THRESHOLD = 0.62
+VOICE_MATCH_MARGIN = 0.06
+# SFace's own documented cosine threshold for "same person".
+FACE_MATCH_THRESHOLD = 0.363
+FACE_MATCH_MARGIN = 0.05
+
 # Said out loud, these mark what follows as private. Keyword matching rather
 # than asking the model to judge: a missed cue would publish something that
 # was meant to stay in, and a false positive only over-restricts. The model's

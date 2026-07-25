@@ -10,3 +10,4 @@ phase3-*.err.log
 # Gateway conversation memory: personal data (name, location), never commit.
 firmware/gateway/memory/
 firmware/gateway/voicevox_dict.json
+firmware/gateway/models/
