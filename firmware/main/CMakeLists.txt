@@ -381,6 +381,20 @@ if(DEVELOPMENT_BUILD AND TACHIKOMA_TRANSCRIBE_QUEUE_URL AND TACHIKOMA_DEVICE_TOK
         TACHIKOMA_DEVICE_TOKEN="${TACHIKOMA_DEVICE_TOKEN}")
 endif()
 
+# TEMPORARY, investigation-only (2026-07-25 recording-duration bug -- see
+# firmware/README.md, "Known issue (unresolved): recorded audio is much
+# shorter than the actual button-hold"). Logs _stackchan_update_task's
+# actual tick-to-tick interval and VoiceInputController::Update()'s
+# per-call codec->InputData() elapsed time while a recording is active, so
+# the tick-starvation / slow-InputData() hypothesis can be measured instead
+# of guessed. Off by default -- one log line per ~20ms tick is too noisy to
+# leave on. Remove this option and its two call sites once the
+# investigation concludes.
+option(TACHIKOMA_DEBUG_TIMING "Enable tick/InputData timing instrumentation for the recording-duration investigation" OFF)
+if(TACHIKOMA_DEBUG_TIMING)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE TACHIKOMA_DEBUG_TIMING)
+endif()
+
 # Add generation rules
 add_custom_command(
     OUTPUT ${LANG_HEADER}

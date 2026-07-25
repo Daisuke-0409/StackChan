@@ -18,6 +18,13 @@
 #include <mooncake_log.h>
 #include <settings.h>
 #include <string_view>
+#ifdef TACHIKOMA_DEBUG_TIMING
+// TEMPORARY, investigation-only -- see the TACHIKOMA_DEBUG_TIMING option in
+// CMakeLists.txt. esp_timer_get_time() (microsecond, monotonic) rather than
+// GetHAL().millis(): a single InputData() call is expected to be fast, and
+// millisecond resolution could hide exactly the cost this is meant to catch.
+#include <esp_timer.h>
+#endif
 
 #include "ai_gateway/ai_gateway_client.h"
 #include "ai_gateway/speech_announcer.h"
@@ -39,7 +46,7 @@ constexpr uint32_t kMinRecordingMs = 300;
 // triggers still slip through (louder replies vibrate longer) or if this
 // proves longer than necessary once retested.
 constexpr uint32_t kPostSpeechCooldownMs = 1500;
-constexpr size_t kFrameSamples = 320;  // ~20ms at 16kHz mono, matched to the stackchan update tick
+constexpr size_t kFrameSamples = 320;  // ~20ms at 16kHz mono
 constexpr size_t kMaxRecordingSamples = 128 * 1024;  // 256 KiB of int16 PCM; mirrors SpeechAnnouncer's kMaxAudioBytes
 constexpr int kFallbackSampleRate = 16000;
 constexpr size_t kMaxResponseBytes = 4096;
@@ -212,7 +219,63 @@ void VoiceInputController::Update(uint32_t now)
         cooldown_until_ms_ = now + kPostSpeechCooldownMs;
     }
     last_observed_state_ = current_state;
+}
 
+void VoiceInputController::StartRecordingTask()
+{
+    if (recording_task_started_) {
+        return;
+    }
+    recording_task_started_ = true;
+    // Mirrors AudioService::AudioInputTask()'s CONFIG_USE_AUDIO_PROCESSOR
+    // configuration (stack 2048*3, priority 8, pinned to core 0): both tasks
+    // read the same physical mic and are mutually exclusive via
+    // AudioService::SetAudioInputPaused() (never run their capture work at
+    // the same time), so matching stack/priority/core keeps their scheduling
+    // behavior comparable instead of one starving the other.
+    xTaskCreatePinnedToCore(&VoiceInputController::RecordingTaskEntry, "voice_input_rec", 2048 * 3, this, 8, nullptr,
+                            0);
+}
+
+void VoiceInputController::RecordingTaskEntry(void* arg)
+{
+    static_cast<VoiceInputController*>(arg)->RecordingTask();
+}
+
+void VoiceInputController::RecordingTask()
+{
+#ifdef TACHIKOMA_DEBUG_TIMING
+    // TEMPORARY, investigation-only -- see the TACHIKOMA_DEBUG_TIMING option
+    // in CMakeLists.txt. Same tick_interval measurement as hal.cpp's shared
+    // task used to log, but for this task's own loop, so the fix can be
+    // verified against the same yardstick the original bug was measured with.
+    uint32_t debug_last_tick_ms = 0;
+    bool debug_had_last_tick = false;
+#endif
+    while (true) {
+        const uint32_t now = GetHAL().millis();
+#ifdef TACHIKOMA_DEBUG_TIMING
+        if (IsRecording()) {
+            if (debug_had_last_tick) {
+                mclog::tagInfo(kTag, "debug_timing rec_task_tick_interval_ms={}", now - debug_last_tick_ms);
+            }
+            debug_had_last_tick = true;
+            debug_last_tick_ms = now;
+        } else {
+            debug_had_last_tick = false;
+        }
+#endif
+        CaptureTick(now);
+        // ~4x tighter than the shared task's 20ms nominal (and well under
+        // what it actually measured, 30-85ms) so a slow iteration here still
+        // leaves headroom before a whole 20ms frame is missed. InputData()
+        // itself measured 22-64us, so polling this often costs nothing.
+        vTaskDelay(pdMS_TO_TICKS(5));
+    }
+}
+
+void VoiceInputController::CaptureTick(uint32_t now)
+{
     bool is_recording;
     uint32_t started_ms;
     {
@@ -234,7 +297,15 @@ void VoiceInputController::Update(uint32_t now)
         return;
     }
     std::vector<int16_t> frame(kFrameSamples);
-    if (!codec->InputData(frame)) {
+#ifdef TACHIKOMA_DEBUG_TIMING
+    const int64_t debug_input_data_start_us = esp_timer_get_time();
+#endif
+    const bool got_frame = codec->InputData(frame);
+#ifdef TACHIKOMA_DEBUG_TIMING
+    mclog::tagInfo(kTag, "debug_timing InputData_us={} got_frame={}",
+                    esp_timer_get_time() - debug_input_data_start_us, got_frame);
+#endif
+    if (!got_frame) {
         return;  // no new samples available this tick
     }
     // See DownmixToChannel0's declaration: this board's mic is 2-channel

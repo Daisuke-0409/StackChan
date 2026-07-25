@@ -81,7 +81,21 @@ public:
     void ConnectHeadTouchTrigger();
 
     // Call every tick from the same loop that drives SpeechAnnouncer::Update().
+    // Only tracks the post-speech cooldown window now -- the actual mic
+    // capture loop runs on its own task, see StartRecordingTask().
     void Update(uint32_t now);
+
+    // Spins up the dedicated FreeRTOS task that owns the mic-capture loop
+    // while recording_ is true. Call once from HAL init, alongside
+    // ConnectHeadTouchTrigger(). Split out of the shared _stackchan_update_task
+    // (hal.cpp): that task's ~20ms nominal tick was measured running 30-85ms
+    // in practice (LVGL/state/motion work sharing the same loop), and since
+    // the capture loop only ever drains one fixed 20ms frame per call
+    // regardless of elapsed time, a slow tick meant permanently lost audio --
+    // see firmware/README.md's recording-duration investigation. Idempotent:
+    // calling more than once has no additional effect.
+    void StartRecordingTask();
+
     void Stop();
 
     bool IsRecording() const;
@@ -99,6 +113,9 @@ private:
 
     static void WorkerTask(void* arg);
     void RunWorker(WorkerArgs* args);
+    static void RecordingTaskEntry(void* arg);
+    void RecordingTask();
+    void CaptureTick(uint32_t now);
     bool UploadAndTranscribe(const VoiceInputConfig& config, const std::vector<int16_t>& pcm, uint32_t sample_rate,
                              std::string& text, VoiceInputErrorCode& error);
     void StopRecordingAndUpload(uint32_t now);
@@ -126,6 +143,10 @@ private:
     // concurrently, so no mutex_ protection needed.
     bool head_touch_connected_ = false;
     size_t head_touch_connection_ = 0;
+
+    // Set once from StartRecordingTask() at boot; same single-caller
+    // reasoning as head_touch_connected_ above.
+    bool recording_task_started_ = false;
 };
 
 VoiceInputController& GetVoiceInputController();

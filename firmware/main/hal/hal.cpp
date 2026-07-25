@@ -52,6 +52,9 @@ void Hal::init()
     // Push-to-talk trigger: Si12T head Press/Release starts/stops recording.
     // Not DEVELOPMENT_BUILD-gated -- this is the real production trigger.
     stackchan::voice_input::GetVoiceInputController().ConnectHeadTouchTrigger();
+    // Dedicated mic-capture task -- see StartRecordingTask()'s declaration.
+    // Also not DEVELOPMENT_BUILD-gated: push-to-talk needs this in production too.
+    stackchan::voice_input::GetVoiceInputController().StartRecordingTask();
     io_expander_init();
     rtc_init();
     imu_init();
@@ -216,6 +219,15 @@ static void _stackchan_update_task(void* param)
 {
     bool is_setup_done = false;
     auto& state_manager = stackchan::tachikoma_state::GetTachikomaStateManager();
+#ifdef TACHIKOMA_DEBUG_TIMING
+    // TEMPORARY, investigation-only -- see the TACHIKOMA_DEBUG_TIMING option
+    // in CMakeLists.txt. Tracks whether the *previous* iteration ended with
+    // a recording in progress, so the interval logged is "time since the
+    // last tick that fed VoiceInputController::Update()", which is exactly
+    // the gap InputData() has to fill.
+    uint32_t debug_last_tick_ms = 0;
+    bool debug_had_last_tick = false;
+#endif
 
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -229,6 +241,17 @@ static void _stackchan_update_task(void* param)
         }
 
         const auto now = GetHAL().millis();
+#ifdef TACHIKOMA_DEBUG_TIMING
+        if (stackchan::voice_input::GetVoiceInputController().IsRecording()) {
+            if (debug_had_last_tick) {
+                mclog::tagInfo(_tag, "debug_timing tick_interval_ms={}", now - debug_last_tick_ms);
+            }
+            debug_had_last_tick = true;
+        } else {
+            debug_had_last_tick = false;
+        }
+        debug_last_tick_ms = now;
+#endif
         state_manager.Update(now);
         stackchan::ai_gateway::GetAiGatewayClient().Update(now);
         stackchan::ai_gateway::GetSpeechAnnouncer().Update(now);
