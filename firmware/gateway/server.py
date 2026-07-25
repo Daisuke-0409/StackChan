@@ -24,6 +24,7 @@ import datetime
 import json
 import math
 import os
+import re
 import ssl
 import struct
 import tempfile
@@ -40,7 +41,8 @@ MAX_INPUT_BYTES = 512
 MAX_OUTPUT_BYTES = 4096
 MAX_SPEECH_AUDIO_BYTES = 720_000  # ~15s at 24kHz/16-bit/mono; sized for a real Gemini TTS reply,
                                    # not just the old fixed confirmation tone
-MAX_TRANSCRIBE_AUDIO_BYTES = 256 * 1024  # matches VoiceInputController's kMaxRecordingSamples cap
+MAX_TRANSCRIBE_AUDIO_BYTES = 1536 * 1024  # >= VoiceInputController's kMaxRecordingSamples (30s
+                                          # at 24kHz mono = 1.44 MB), with headroom
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
 MIN_TRANSCRIBE_AUDIO_SECONDS = 0.5  # below this, skip STT entirely and treat as "didn't hear
@@ -85,6 +87,149 @@ def _log(message: str) -> None:
 # order without one clobbering the last.
 _speech_queue: dict[str, list[bytes]] = {}
 _speech_queue_lock = threading.Lock()
+
+# --- conversation memory -------------------------------------------------
+# Each /v1/chat request used to be sent to Gemini entirely on its own: the
+# device's session_id was echoed back and never used for anything, so the
+# assistant could not remember a name it had just been told, and asking about
+# local weather meant repeating your address every single time.
+#
+# Two layers, because they answer different questions:
+#   turns   -- the last few exchanges, so follow-ups like "じゃあ明日は?"
+#              resolve against what was just said.
+#   profile -- durable facts (name, where they live, preferences) that should
+#              still be known next week. Extracted in the background after a
+#              reply has already been sent, so remembering costs the user no
+#              waiting.
+#
+# Stored per device under MEMORY_DIR. This is personal data: keep it local,
+# out of git, and out of the access log.
+MEMORY_DIR = os.environ.get("TACHIKOMA_MEMORY_DIR", os.path.join(os.path.dirname(__file__), "memory"))
+MEMORY_MAX_TURNS = 20  # 10 exchanges
+MEMORY_MAX_PROFILE_ITEMS = 40
+MEMORY_MAX_FACT_CHARS = 200
+_memory_lock = threading.Lock()
+
+
+def _memory_path(device_id: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", device_id)[:64] or "unknown"
+    return os.path.join(MEMORY_DIR, f"{safe}.json")
+
+
+def _load_memory(device_id: str) -> dict[str, Any]:
+    try:
+        with open(_memory_path(device_id), encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return {"profile": [], "turns": []}
+    profile = [s for s in data.get("profile", []) if isinstance(s, str)]
+    turns = [t for t in data.get("turns", [])
+             if isinstance(t, dict) and t.get("role") in ("user", "model") and isinstance(t.get("text"), str)]
+    return {"profile": profile[:MEMORY_MAX_PROFILE_ITEMS], "turns": turns[-MEMORY_MAX_TURNS:]}
+
+
+def _save_memory(device_id: str, memory: dict[str, Any]) -> None:
+    path = _memory_path(device_id)
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        # Write-then-replace: a crash mid-write must not leave a truncated
+        # file that _load_memory would silently read as "no memory at all".
+        tmp = f"{path}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(memory, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except OSError as exc:
+        _log(f"gateway memory save failed: {type(exc).__name__}")
+
+
+def _memory_prompt_parts(device_id: str) -> tuple[str, list[dict[str, Any]]]:
+    """Returns (system-instruction suffix, prior conversation contents)."""
+    with _memory_lock:
+        memory = _load_memory(device_id)
+    suffix = ""
+    if memory["profile"]:
+        remembered = "\n".join(f"- {fact}" for fact in memory["profile"])
+        suffix = (
+            "\n\n以下はこのユーザーについて記憶している情報です。"
+            "質問に答えるときは、必要に応じてこの情報を前提として使ってください"
+            "（例えば天気を聞かれたら、記憶している居住地の天気を答えてください）。"
+            "ただし、聞かれてもいないのにこの情報をわざわざ復唱しないでください。\n"
+            f"{remembered}"
+        )
+    contents = [{"role": turn["role"], "parts": [{"text": turn["text"]}]} for turn in memory["turns"]]
+    return suffix, contents
+
+
+def _append_turn(device_id: str, user_text: str, model_text: str) -> None:
+    with _memory_lock:
+        memory = _load_memory(device_id)
+        memory["turns"].append({"role": "user", "text": user_text})
+        memory["turns"].append({"role": "model", "text": model_text})
+        memory["turns"] = memory["turns"][-MEMORY_MAX_TURNS:]
+        _save_memory(device_id, memory)
+
+
+_PROFILE_EXTRACT_PROMPT = (
+    "あなたは会話から、ユーザーに関する長期的に覚えておくべき事実だけを抽出する係です。"
+    "名前、居住地、家族、仕事、好み、繰り返し使う設定などが対象です。"
+    "その場限りの話題、天気、時刻、雑談の内容は含めないでください。"
+    "既存の事実と矛盾する新しい情報があれば、新しい方に置き換えてください。"
+    "出力は事実を表す短い日本語の文字列のJSON配列だけとし、説明は書かないでください。"
+    "覚えるべきことが何もなければ、既存の配列をそのまま返してください。"
+)
+
+
+def _update_profile(device_id: str, user_text: str, model_text: str, env: dict[str, str]) -> None:
+    """Refresh the durable facts for this device. Runs on a background thread
+    after the reply has been sent -- never in the request path."""
+    key = env.get("AI_PROVIDER_API_KEY", "")
+    if not key:
+        return
+    with _memory_lock:
+        existing = _load_memory(device_id)["profile"]
+    model = env.get("MEMORY_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
+    request_body = json.dumps({
+        "system_instruction": {"parts": [{"text": _PROFILE_EXTRACT_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text":
+            f"既存の事実:\n{json.dumps(existing, ensure_ascii=False)}\n\n"
+            f"直近の会話:\nユーザー: {user_text}\nアシスタント: {model_text}"}]}],
+        "generationConfig": {"responseMimeType": "application/json"},
+    }).encode("utf-8")
+    request = urllib.request.Request(f"{GEMINI_API_BASE_URL}/models/{model}:generateContent",
+                                     data=request_body, method="POST",
+                                     headers={"Content-Type": "application/json", "x-goog-api-key": key})
+    try:
+        with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
+                                    context=ssl.create_default_context()) as response:
+            decoded = json.loads(response.read(MAX_OUTPUT_BYTES * 4).decode("utf-8"))
+        parts = decoded["candidates"][0]["content"]["parts"]
+        facts = json.loads("".join(p["text"] for p in parts if isinstance(p.get("text"), str)))
+    except Exception:
+        # Memory is best-effort: never let this break or delay a conversation.
+        return
+    if not isinstance(facts, list):
+        return
+    cleaned: list[str] = []
+    for fact in facts:
+        if isinstance(fact, str) and fact.strip():
+            cleaned.append(fact.strip()[:MEMORY_MAX_FACT_CHARS])
+    cleaned = cleaned[:MEMORY_MAX_PROFILE_ITEMS]
+    if cleaned == existing:
+        return
+    with _memory_lock:
+        memory = _load_memory(device_id)
+        memory["profile"] = cleaned
+        _save_memory(device_id, memory)
+    # Count only -- the facts themselves are personal and stay out of the log.
+    _log(f"gateway memory profile updated device_id={device_id} facts={len(cleaned)}")
+
+
+def _remember_exchange(device_id: str, user_text: str, model_text: str, env: dict[str, str]) -> None:
+    if env.get("ENABLE_MEMORY", "1") != "1" or not device_id or not model_text:
+        return
+    _append_turn(device_id, user_text, model_text)
+    threading.Thread(target=_update_profile, args=(device_id, user_text, model_text, env),
+                     daemon=True).start()
 
 
 def enqueue_speech(device_id: str, audio: bytes, *, append: bool = False) -> tuple[int, dict[str, Any]]:
@@ -138,19 +283,88 @@ def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
 GEMINI_DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
 GEMINI_DEFAULT_TTS_MODEL = "gemini-2.5-flash-preview-tts"
 GEMINI_DEFAULT_TTS_VOICE = "Zephyr"  # chosen by ear over Kore + 6 alternates against real Japanese text
-GEMINI_DEFAULT_STT_MODEL = "gemini-flash-latest"  # gemini-2.5-flash 404'd ("no longer available to
-                                                   # new users") when verified live 2026-07-24; -latest
-                                                   # tracks whatever Google currently recommends
+GEMINI_DEFAULT_STT_MODEL = "gemini-3.5-flash-lite"  # gemini-2.5-flash 404'd ("no longer available
+                                                     # to new users") when verified live 2026-07-24.
+                                                     # gemini-flash-latest worked but measured
+                                                     # 3312ms on a 2.8s clip against this model's
+                                                     # 1859ms, and STT sits directly in the user's
+                                                     # wait for a reply. The one accuracy gap this
+                                                     # model had ("立ちコマ" for "タチコマ") is
+                                                     # closed by the name hint in _GEMINI_STT_PROMPT.
 GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
+# The name hint is not cosmetic: without it gemini-3.5-flash-lite transcribed
+# "タチコマ" as "立ちコマ"/"たちこま", and the device's own name is the single
+# most likely word in any utterance addressed to it. With the hint both test
+# phrases came back exactly right, and measurably faster (1859ms vs 2336ms).
 _GEMINI_STT_PROMPT = (
     "次の音声を一字一句そのまま日本語で書き起こしてください。"
+    "話者は「タチコマ」という名前のロボットに話しかけています。"
     "書き起こしたテキストのみを返し、説明や前置きは付けないでください。"
 )
-GEMINI_SYSTEM_PROMPT = "日本語で、簡潔に答えてください。"
+# Every word of a reply is read aloud, so formatting is not cosmetic here:
+# with web search enabled Gemini answers in markdown by default ("**気温**:",
+# "* 項目") and a bulleted list of headlines is unusable as speech. Keep the
+# instruction plain rather than a persona -- 781215a deliberately removed the
+# styled prompt -- but state the spoken-output constraints explicitly.
+GEMINI_SYSTEM_PROMPT = (
+    "日本語で、簡潔に答えてください。"
+    "回答はそのまま音声で読み上げられます。"
+    "箇条書き、マークダウン記法、アスタリスクなどの記号、URL、絵文字は使わず、"
+    "話し言葉の文章だけで答えてください。"
+    "調べた内容を伝えるときも、要点を2〜3文にまとめてください。"
+)
+
+# google_search lets Gemini look things up when the answer needs current or
+# external information. Verified live 2026-07-26 with gemini-3.5-flash-lite:
+# it searches only when warranted ("今日の東京の天気" -> 2 queries, 3266ms)
+# and skips it otherwise ("こんにちは、元気？" -> no search, 953ms), so
+# leaving it on costs ordinary conversation nothing.
+def _web_search_enabled(env: dict[str, str]) -> bool:
+    return env.get("ENABLE_WEB_SEARCH", "1") == "1"
+
+
+def _chat_tools(env: dict[str, str]) -> list[dict[str, Any]]:
+    return [{"google_search": {}}] if _web_search_enabled(env) else []
+
+
+_MARKUP_RE = re.compile(r"[*_`#>|]+")
+_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _speakable(text: str) -> str:
+    """Strip markup that would otherwise be pronounced.
+
+    The system prompt asks for plain speech, but a grounded answer still
+    slips in the occasional "**" or bare URL, and TTS reads those out
+    literally. Belt and braces: the prompt keeps replies clean, this keeps
+    the ones that are not from reaching the speaker.
+    """
+    text = _LINK_RE.sub(r"\1", text)
+    text = _URL_RE.sub("", text)
+    text = _MARKUP_RE.sub("", text)
+    # Bullet markers survive as leading "- " once the asterisks are gone.
+    text = re.sub(r"(?m)^[ \t]*[-・]\s*", "", text)
+    return re.sub(r"[ \t]+", " ", text).strip()
 # Bare short phrases can make Gemini TTS answer conversationally in text
 # instead of speaking the text -- reproduced and worked around the same way
 # in tachikoma_notifier/gemini_tts_synth.py.
 _GEMINI_TTS_READ_ALOUD_PREFIX = "次のテキストをそのまま読み上げてください: "
+
+
+def _log_grounding(candidate: dict[str, Any]) -> None:
+    """Record what was searched and how many sources backed the answer.
+
+    Deliberately queries and counts only, never the answer text or page
+    contents -- same rule as the rest of the access log, which never carries
+    conversation content by default.
+    """
+    metadata = candidate.get("groundingMetadata") or {}
+    queries = metadata.get("webSearchQueries") or []
+    if not queries:
+        return
+    sources = len(metadata.get("groundingChunks") or [])
+    _log(f"gateway web search queries={queries} sources={sources}")
 
 
 def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str]) -> tuple[int, dict[str, Any]]:
@@ -159,10 +373,15 @@ def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str
         return _result(503, "server_error")
     model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
     url = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
-    request_body = json.dumps({
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": text}]}],
-    }).encode("utf-8")
+    suffix, prior = _memory_prompt_parts(payload["device_id"]) if env.get("ENABLE_MEMORY", "1") == "1" else ("", [])
+    body: dict[str, Any] = {
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + suffix}]},
+        "contents": prior + [{"role": "user", "parts": [{"text": text}]}],
+    }
+    tools = _chat_tools(env)
+    if tools:
+        body["tools"] = tools
+    request_body = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=request_body, method="POST", headers={
         "Content-Type": "application/json", "x-goog-api-key": key,
     })
@@ -180,13 +399,95 @@ def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str
         return _result(504, "timeout")
 
     try:
-        answer = decoded["candidates"][0]["content"]["parts"][0]["text"]
+        # A grounded answer can arrive split across several parts, and parts
+        # carrying only groundingMetadata have no "text" at all -- taking
+        # parts[0]["text"] would drop most of the reply or raise.
+        parts = decoded["candidates"][0]["content"]["parts"]
+        answer = "".join(p["text"] for p in parts if isinstance(p.get("text"), str))
     except (KeyError, IndexError, TypeError):
         return _result(502, "invalid_response")
-    if not isinstance(answer, str) or not answer.strip() or len(answer.encode("utf-8")) > MAX_OUTPUT_BYTES:
+    answer = _speakable(answer) if isinstance(answer, str) else ""
+    if not answer or len(answer.encode("utf-8")) > MAX_OUTPUT_BYTES:
         return _result(502, "invalid_response")
-    return 200, {"text": answer.strip(), "request_id": payload["request_id"],
+    _log_grounding(decoded.get("candidates", [{}])[0])
+    return 200, {"text": answer, "request_id": payload["request_id"],
                  "session_id": payload["session_id"], "is_final": True}
+
+
+def _voicevox_tts_pcm(text: str, env: dict[str, str]) -> Optional[bytes]:
+    """Synthesize text with a local VOICEVOX engine; None (never raises) on failure.
+
+    Gemini TTS is a round trip to Google for every sentence and measured
+    2500-3484ms (mean 2958ms) on short replies -- the single largest chunk of
+    the delay between the user finishing a sentence and the device answering.
+    VOICEVOX runs on this machine, so synthesis is local and typically an
+    order of magnitude faster.
+
+    It is also an exact format match: VOICEVOX's default output is 24kHz
+    16-bit mono WAV, and /v1/speak_queue serves audio/L16;rate=24000;channels=1,
+    so only the RIFF header has to come off -- no resampling, no conversion.
+    """
+    base_url = env.get("VOICEVOX_URL", "http://127.0.0.1:50021").rstrip("/")
+    speaker = env.get("VOICEVOX_SPEAKER", "3")
+    # 8s, not 20s. A sentence takes ~700ms warm, so anything approaching this
+    # is a stuck engine, and the whole point of the local path is speed --
+    # waiting 20s before falling back to Gemini is far worse than the 2.7s
+    # Gemini would have taken outright. Seen live: one stalled sentence
+    # turned a 4s reply into a 24s one.
+    timeout = float(env.get("VOICEVOX_TIMEOUT_SECONDS", "8"))
+    try:
+        query_url = f"{base_url}/audio_query?{urllib.parse.urlencode({'text': text, 'speaker': speaker})}"
+        request = urllib.request.Request(query_url, data=b"", method="POST")
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            query = json.loads(response.read(1024 * 1024).decode("utf-8"))
+        # SpeechAnnouncer expects exactly 24kHz mono; do not let a preset or a
+        # future engine default silently change either one.
+        query["outputSamplingRate"] = 24000
+        query["outputStereo"] = False
+
+        synth_url = f"{base_url}/synthesis?{urllib.parse.urlencode({'speaker': speaker})}"
+        request = urllib.request.Request(synth_url, data=json.dumps(query).encode("utf-8"),
+                                         method="POST", headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            wav = response.read(MAX_SPEECH_AUDIO_BYTES * 2)
+    except Exception:
+        # Same contract as _gemini_tts_pcm: a TTS failure must never break the
+        # chat response, the caller falls back to the confirmation tone.
+        return None
+
+    # Strip the RIFF container: find the "data" chunk rather than assuming the
+    # canonical 44-byte header, since engines may emit extra chunks (LIST/fact).
+    if len(wav) < 12 or wav[0:4] != b"RIFF" or wav[8:12] != b"WAVE":
+        return None
+    offset = 12
+    while offset + 8 <= len(wav):
+        chunk_id = wav[offset:offset + 4]
+        chunk_size = int.from_bytes(wav[offset + 4:offset + 8], "little")
+        if chunk_id == b"data":
+            pcm = wav[offset + 8:offset + 8 + chunk_size]
+            return pcm or None
+        offset += 8 + chunk_size + (chunk_size & 1)
+    return None
+
+
+def _tts_pcm(text: str, env: dict[str, str]) -> Optional[bytes]:
+    """Synthesize via whichever TTS provider is configured.
+
+    Defaults to voicevox when TTS_PROVIDER is unset only if a VOICEVOX_URL was
+    given explicitly; otherwise stays on the previous gemini behavior so an
+    existing deployment does not change provider by upgrading this file.
+    """
+    provider = env.get("TTS_PROVIDER", "").lower()
+    if not provider:
+        provider = "voicevox" if env.get("VOICEVOX_URL") else "gemini"
+    if provider == "voicevox":
+        pcm = _voicevox_tts_pcm(text, env)
+        if pcm is not None:
+            return pcm
+        if env.get("TTS_FALLBACK_TO_GEMINI", "1") != "1":
+            return None
+        _log("gateway voicevox TTS failed; falling back to gemini for this sentence")
+    return _gemini_tts_pcm(text, env)
 
 
 def _gemini_tts_pcm(text: str, env: dict[str, str]) -> Optional[bytes]:
@@ -280,9 +581,19 @@ def _iter_gemini_sse_text_deltas(response: Any):
             continue
         try:
             chunk = json.loads(chunk_str)
-            delta = chunk["candidates"][0]["content"]["parts"][0]["text"]
+            candidate = chunk["candidates"][0]
+            # Join every text part, not parts[0]: a grounded chunk can carry
+            # several, and the grounding metadata rides in parts without any
+            # "text" key at all.
+            parts = candidate["content"]["parts"]
+            delta = "".join(p["text"] for p in parts if isinstance(p.get("text"), str))
         except (KeyError, IndexError, TypeError, json.JSONDecodeError):
             continue
+        if isinstance(chunk, dict):
+            try:
+                _log_grounding(chunk["candidates"][0])
+            except (KeyError, IndexError, TypeError):
+                pass
         if isinstance(delta, str) and delta:
             yield delta
 
@@ -308,10 +619,15 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
     device_id = payload["device_id"]
     model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
     url = f"{GEMINI_API_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
-    request_body = json.dumps({
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT}]},
-        "contents": [{"role": "user", "parts": [{"text": text}]}],
-    }).encode("utf-8")
+    suffix, prior = _memory_prompt_parts(device_id) if env.get("ENABLE_MEMORY", "1") == "1" else ("", [])
+    body: dict[str, Any] = {
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + suffix}]},
+        "contents": prior + [{"role": "user", "parts": [{"text": text}]}],
+    }
+    tools = _chat_tools(env)
+    if tools:
+        body["tools"] = tools
+    request_body = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(url, data=request_body, method="POST", headers={
         "Content-Type": "application/json", "x-goog-api-key": key,
     })
@@ -323,13 +639,15 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
 
     def flush_sentence(sentence: str) -> None:
         nonlocal enqueued_count, sentence_index
-        sentence = sentence.strip()
+        # Strip markup before synthesis, not after: TTS pronounces a stray
+        # "**" or a URL literally. See _speakable().
+        sentence = _speakable(sentence)
         if not sentence:
             return
         sentence_index += 1
         idx = sentence_index
         t_ready = time.monotonic()
-        pcm = _gemini_tts_pcm(sentence, env)
+        pcm = _tts_pcm(sentence, env)
         t_tts = time.monotonic()
         if pcm is None:
             _log(f"gateway streaming sentence={idx} tts_failed text_len={len(sentence)} "
@@ -375,7 +693,9 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
     if pending.strip():
         flush_sentence(pending)
 
-    full_text = "".join(full_text_parts).strip()
+    # Same cleanup the spoken sentences got, so the text the device receives
+    # matches what it just said instead of carrying leftover markup.
+    full_text = _speakable("".join(full_text_parts))
     if not full_text:
         return _result(502, "invalid_response")
     full_text = full_text[:MAX_OUTPUT_BYTES]
@@ -467,13 +787,16 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
         # Owns TTS/enqueue itself (per completed sentence, as they arrive)
         # instead of the single after-the-fact block below -- see
         # _gemini_stream_chat_and_speak's docstring.
-        return _gemini_stream_chat_and_speak(text, payload, env)
+        status, body = _gemini_stream_chat_and_speak(text, payload, env)
+        if status == 200:
+            _remember_exchange(payload["device_id"], text, body.get("text", ""), env)
+        return status, body
 
     status, body = _provider_response(text, payload, env)
     if status == 200:
         pcm = None
         if provider == "gemini":
-            pcm = _gemini_tts_pcm(body["text"], env)
+            pcm = _tts_pcm(body["text"], env)
         if pcm is None:
             # No real TTS (non-Gemini provider, or Gemini TTS failed this
             # time): enqueue a fixed tone instead, solely to verify the
@@ -490,6 +813,7 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
             _log(f"gateway enqueue_speech failed status={enqueue_status} "
                  f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)} "
                  f"device_id={payload['device_id']}")
+        _remember_exchange(payload["device_id"], text, body.get("text", ""), env)
     return status, body
 
 
@@ -743,10 +1067,34 @@ class GatewayHandler(BaseHTTPRequestHandler):
         _log(f"gateway {self.command} {self.path} {args[1] if len(args) > 1 else ''}")
 
 
+def _warm_voicevox(env: dict[str, str]) -> None:
+    """Preload the configured VOICEVOX voice at startup.
+
+    The engine loads a speaker's model on first use, so without this the
+    first sentence of the first reply of the day pays that cost while the
+    user waits.
+    """
+    if env.get("TTS_PROVIDER", "").lower() != "voicevox" and not env.get("VOICEVOX_URL"):
+        return
+    base_url = env.get("VOICEVOX_URL", "http://127.0.0.1:50021").rstrip("/")
+    speaker = env.get("VOICEVOX_SPEAKER", "3")
+    url = f"{base_url}/initialize_speaker?{urllib.parse.urlencode({'speaker': speaker})}"
+    try:
+        request = urllib.request.Request(url, data=b"", method="POST")
+        t0 = time.monotonic()
+        with urllib.request.urlopen(request, timeout=60):
+            pass
+        _log(f"gateway voicevox speaker={speaker} preloaded in {(time.monotonic() - t0) * 1000:.0f}ms")
+    except Exception as exc:
+        _log(f"gateway voicevox preload failed ({type(exc).__name__}); "
+             f"TTS will fall back to gemini until the engine is reachable")
+
+
 def main() -> None:
     host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
     port = int(os.environ.get("GATEWAY_PORT", "8080"))
     _log(f"Tachikoma Gateway listening on {host}:{port} (provider={os.environ.get('AI_PROVIDER', 'mock')})")
+    _warm_voicevox(dict(os.environ))
     if _debug_logging_enabled(os.environ):
         _log(f"TACHIKOMA_DEBUG_LOGGING=1: recognized speech text will be logged and uploaded audio "
              f"saved to {DEBUG_AUDIO_DIR} -- investigation-only, disable when done")

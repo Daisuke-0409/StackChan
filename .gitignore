@@ -7,3 +7,5 @@ phase3-*.log
 phase3-*.err.log
 *.log
 *.err.log
+# Gateway conversation memory: personal data (name, location), never commit.
+firmware/gateway/memory/
