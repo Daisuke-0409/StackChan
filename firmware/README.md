@@ -97,7 +97,63 @@ field as `VoiceInputErrorCode::InvalidResponse`
 (`VoiceInputController::UploadAndTranscribe`), the same path a real STT
 error takes, so this needed no firmware change.
 
-### Known issue (unresolved, 2026-07-25): recorded audio is much shorter than the actual button-hold
+### Resolved, 2026-07-25: recorded audio was much shorter than the actual button-hold (tick starvation)
+
+Following up on the unresolved issue below (kept for context, see the
+original writeup at the bottom of this section): `TACHIKOMA_DEBUG_TIMING`
+instrumentation (`e56043f`) measured, rather than guessed, both suspects.
+`codec->InputData()` itself was never the problem -- 22-64us per call,
+negligible, and `got_frame` was never `false` during a recording (the
+codec always had a frame ready when asked). The real cause was the shared
+`_stackchan_update_task`'s actual tick interval: mean 37.5ms against the
+nominal 20ms, with periodic ~78-85ms stall bursts (LVGL/state/motion work
+sharing the same loop) eating roughly a third of a hold's elapsed time.
+Since `VoiceInputController` drained exactly one fixed 20ms frame per
+tick regardless of how much real time had passed, a slow tick meant
+permanently lost audio, not delayed catch-up -- captured ~53% of a 4.61s
+hold in that first measurement (up from the original ~21% report below,
+which was simply a shorter hold with worse luck overlapping the stall
+bursts; same mechanism either way).
+
+Fix (`e56043f`): `VoiceInputController::Update()` now only tracks the
+post-speech cooldown window. The mic-capture loop moved to its own
+dedicated FreeRTOS task (`StartRecordingTask()`, mirroring
+`AudioService::AudioInputTask()`'s `CONFIG_USE_AUDIO_PROCESSOR`
+configuration -- stack `2048*3`, priority 8, pinned to core 0), polling
+independently of the shared task's LVGL/state/motion work. No new
+synchronization was needed: `recording_`/`buffer_`/etc. were already
+`mutex_`-protected for the existing head-touch-task/shared-task/worker-task
+split.
+
+**Implementation pitfall, worth remembering**: the task's poll delay was
+first written as `vTaskDelay(pdMS_TO_TICKS(5))`. `CONFIG_FREERTOS_HZ=100`
+(10ms tick) makes `pdMS_TO_TICKS(5)` truncate to `0` via integer division,
+turning that into `vTaskDelay(0)` -- a same-priority-only yield, not a
+real block. At priority 8, pinned to core 0, that starved the core's idle
+task and tripped the 10s task watchdog (`task_wdt`) on real hardware
+within seconds of a real recording. Fixed (`49234f0`) with `vTaskDelay(1)`
+(10ms, the finest non-zero step at this tick rate) -- still 2x tighter
+than the shared task's 20ms nominal.
+
+**Re-measured after the fix**: two live recordings (4.61s hold class),
+`rec_task_tick_interval_ms` averaged 18.3-18.4ms (slower than the intended
+10ms -- likely `TACHIKOMA_DEBUG_TIMING`'s own two `mclog` calls per
+iteration adding UART-write overhead; probably tighter still with the
+flag off) and `got_frame` was `false` zero times across both recordings.
+Captured-audio frame count now meets or slightly exceeds the Press-to-
+Release window in both tests (measurement-boundary noise, not a real
+overshoot) -- effectively full capture, versus the ~53%/~21% before the
+fix.
+
+**Not yet understood**: a second back-to-back recording's upload failed
+with `voice input upload/transcription failed` after a ~5.7s delay (looks
+timeout-shaped, not an instant auth rejection -- the first recording in
+the same session uploaded and transcribed successfully). Capture itself
+was unaffected (frame count still tracked the hold correctly). Reproducibility
+and root cause are unconfirmed; worth another look if it recurs.
+
+<details>
+<summary>Original report (2026-07-25, before the fix above)</summary>
 
 After the channel-interleaving fix above, a controlled live test (button
 held for a deliberate ~2.48s Press-to-Release, single clean pair confirmed
@@ -125,17 +181,4 @@ the ~6.67ms figure a smooth audio capture would need), or if
 per call, that alone could explain capturing only ~21% of a hold. Neither
 has been measured yet -- this is a hypothesis, not a confirmed cause.
 
-**First thing to do next session**: measure, don't guess.
-1. Instrument `_stackchan_update_task`'s loop to log actual tick-to-tick
-   interval during an active recording (not just the nominal 20ms delay).
-2. Instrument `codec->InputData()` (or the `esp_codec_dev_read()` call it
-   wraps) to log per-call elapsed time during recording.
-3. Check whether anything else on that task, or a competing task, runs
-   heavy work concurrently with recording that would starve its ticks.
-
-Only once real numbers are in hand should a fix direction be chosen --
-the leading candidate is giving `VoiceInputController` its own dedicated
-recording task (mirroring `AudioService::AudioInputTask()`'s pattern)
-decoupled from the shared UI/state loop, but this is deliberately not
-decided yet and no firmware change should be made until the measurements
-justify it.
+</details>
