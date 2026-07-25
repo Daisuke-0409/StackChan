@@ -31,7 +31,15 @@ constexpr std::string_view kTag = "SpeechAnnouncer";
 // what the gateway would even agree to serve. 768 KiB bounds ESP32 heap
 // usage for a single fetch, not a tuned production limit.
 constexpr size_t kMaxAudioBytes = 768 * 1024;
-constexpr uint32_t kPollIntervalMs = 2000;
+// Two rates, because one rate cannot serve both jobs. When nothing is
+// expected, polling is pure overhead and 2s is plenty. But during a
+// conversation turn the gateway is actively pushing this device's reply --
+// one enqueue per finished sentence -- and every poll interval is dead air
+// the user sits through. Measured before this split: a first sentence
+// enqueued at 00:33:51.031 was not fetched until 00:33:57.931, ~7s of
+// silence, which made the gateway's sentence-at-a-time streaming pointless.
+constexpr uint32_t kIdlePollIntervalMs = 2000;
+constexpr uint32_t kActivePollIntervalMs = 200;
 constexpr char kSettingsNamespace[] = "tachi_speak";  // NVS namespace <= 15 chars
 
 struct HttpBuffer {
@@ -137,11 +145,23 @@ void SpeechAnnouncer::Update(uint32_t now)
         }
     }
 
-    // Never fetch/play a pushed announcement while mid-conversation; leave
-    // it queued server-side and try again on a later, idle poll.
-    if (tachikoma_state::GetTachikomaStateManager().GetCurrentState() != tachikoma_state::TachikomaState::Idle) {
+    // Hold off only while the user is actually speaking -- playing over a
+    // live recording would both talk across them and feed the mic.
+    //
+    // Thinking and Speaking used to be excluded here too, on the reasoning
+    // that a pushed announcement should not interrupt a conversation. But
+    // the conversation's own reply arrives through this same queue, so that
+    // guard delayed every answer until the turn had already finished and
+    // fallen back to Idle. Thinking is precisely when the reply is expected,
+    // and Speaking is when the next sentence of it should follow the one
+    // just played, so both now poll -- at the faster rate.
+    const auto state = tachikoma_state::GetTachikomaStateManager().GetCurrentState();
+    const bool reply_expected = state == tachikoma_state::TachikomaState::Thinking ||
+                                state == tachikoma_state::TachikomaState::Speaking;
+    const uint32_t poll_interval = reply_expected ? kActivePollIntervalMs : kIdlePollIntervalMs;
+    if (state == tachikoma_state::TachikomaState::Listening) {
         std::lock_guard<std::mutex> lock(mutex_);
-        next_poll_ms_ = now + kPollIntervalMs;
+        next_poll_ms_ = now + poll_interval;
         return;
     }
 
@@ -149,7 +169,7 @@ void SpeechAnnouncer::Update(uint32_t now)
     uint32_t generation;
     {
         std::lock_guard<std::mutex> lock(mutex_);
-        next_poll_ms_ = now + kPollIntervalMs;
+        next_poll_ms_ = now + poll_interval;
         if (config.endpoint.empty() || config.device_token.empty()) {
             last_error_ = SpeechAnnounceErrorCode::NotConfigured;
             return;
