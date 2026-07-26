@@ -719,6 +719,20 @@ _ROLE_WORDS = [
 ]
 
 
+# "俺の名前は大輔です" hands back "大輔です" unless the copula is peeled off,
+# and the robot then addresses its owner as "大輔ですさん" forever. Longest
+# first, so です is not stripped before でした.
+_NAME_SUFFIX_RE = re.compile(r"(?:でした|といいます|と言います|と申します| です|です|だよ|だぜ|だな|だ|ですね|かな)$")
+
+
+def _clean_name(name: str) -> str:
+    previous = None
+    while name and name != previous:
+        previous = name
+        name = _NAME_SUFFIX_RE.sub("", name).strip("　 、。,.!?！？")
+    return name
+
+
 def _extract_enrolment(text: str) -> Optional[tuple[str, Optional[str]]]:
     """(name, role) if this utterance is someone introducing themselves."""
     if not text or not _ENROL_RE.search(text):
@@ -727,8 +741,10 @@ def _extract_enrolment(text: str) -> Optional[tuple[str, Optional[str]]]:
     for pattern in _NAME_RES:
         found = pattern.search(text)
         if found:
-            name = found.group(1).strip()
-            break
+            name = _clean_name(found.group(1).strip())
+            if name:
+                break
+            name = None
     if not name:
         return None
     role = None
