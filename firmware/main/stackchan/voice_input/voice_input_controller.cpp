@@ -14,6 +14,7 @@
 #include <esp_heap_caps.h>
 #include <esp_http_client.h>
 #include <esp_netif.h>
+#include <esp_timer.h>
 #include <new>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
@@ -587,20 +588,37 @@ bool VoiceInputController::UploadAndTranscribe(const VoiceInputConfig& config, c
     esp_http_client_set_post_field(client, reinterpret_cast<const char*>(pcm.data()),
                                    static_cast<int>(pcm.size() * sizeof(int16_t)));
 
+    const int64_t upload_start_us = esp_timer_get_time();
     const esp_err_t result = esp_http_client_perform(client);
     const int status = esp_http_client_get_status_code(client);
+    const int64_t upload_ms = (esp_timer_get_time() - upload_start_us) / 1000;
     esp_http_client_cleanup(client);
 
     if (result != ESP_OK) {
         error = (result == ESP_ERR_TIMEOUT) ? VoiceInputErrorCode::Timeout : VoiceInputErrorCode::ConnectionFailed;
+        // The known "second recording in a row fails" report has been
+        // unreproducible since 2026-07-25 partly because nothing recorded
+        // *how* it failed -- esp_err, HTTP status and elapsed time all
+        // existed here and none of them were logged. A ~5.7s failure looks
+        // very different depending on whether it was a refused connection,
+        // a TLS stall or a server error, and free PSRAM matters because an
+        // upload now holds a 1.44MB buffer while the next recording is
+        // already reserving its own.
+        mclog::tagWarn(kTag, "upload failed err={} ({}) status={} bytes={} elapsed_ms={} psram_free={}",
+                        static_cast<int>(result), esp_err_to_name(result), status,
+                        pcm.size() * sizeof(int16_t), static_cast<int>(upload_ms),
+                        heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
         return false;
     }
     if (status == 401 || status == 403) {
         error = VoiceInputErrorCode::AuthenticationFailed;
+        mclog::tagWarn(kTag, "upload rejected status={} elapsed_ms={}", status, static_cast<int>(upload_ms));
         return false;
     }
     if (status < 200 || status >= 300) {
         error = VoiceInputErrorCode::ServerError;
+        mclog::tagWarn(kTag, "upload server error status={} bytes={} elapsed_ms={}",
+                        status, pcm.size() * sizeof(int16_t), static_cast<int>(upload_ms));
         return false;
     }
 
@@ -638,7 +656,11 @@ void VoiceInputController::Complete(uint32_t generation, VoiceInputErrorCode err
         }
         mclog::tagWarn(kTag, "AiGatewayClient rejected transcribed text");
     } else {
-        mclog::tagWarn(kTag, "voice input upload/transcription failed");
+        // Naming the code, not just "failed": these are eleven different
+        // problems with eleven different fixes, and the one that matters
+        // (the second-recording failure) has stayed unexplained for exactly
+        // as long as this line refused to say which one it hit.
+        mclog::tagWarn(kTag, "voice input failed: {}", ToString(error));
     }
     tachikoma_state::GetTachikomaStateManager().Notify(tachikoma_state::TachikomaEvent::AiRequestFailed);
 }

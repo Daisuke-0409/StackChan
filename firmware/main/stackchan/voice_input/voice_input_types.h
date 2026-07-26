@@ -25,6 +25,29 @@ enum class VoiceInputErrorCode : uint8_t {
     Internal,
 };
 
+// Names the failure so a log line can say which of these eleven it was.
+// Kept beside the enum so adding a code without naming it is a compile
+// error rather than a silently unlabelled log.
+inline const char* ToString(VoiceInputErrorCode error)
+{
+    switch (error) {
+        case VoiceInputErrorCode::None: return "none";
+        case VoiceInputErrorCode::NotConfigured: return "not_configured";
+        case VoiceInputErrorCode::Busy: return "busy";
+        case VoiceInputErrorCode::Cooldown: return "cooldown";
+        case VoiceInputErrorCode::RecordingTooShort: return "recording_too_short";
+        case VoiceInputErrorCode::NetworkUnavailable: return "network_unavailable";
+        case VoiceInputErrorCode::ConnectionFailed: return "connection_failed";
+        case VoiceInputErrorCode::Timeout: return "timeout";
+        case VoiceInputErrorCode::AuthenticationFailed: return "authentication_failed";
+        case VoiceInputErrorCode::ServerError: return "server_error";
+        case VoiceInputErrorCode::InvalidResponse: return "invalid_response";
+        case VoiceInputErrorCode::Internal: return "internal";
+    }
+    return "unknown";
+}
+
+
 struct VoiceInputConfig {
     std::string endpoint;  // full URL to POST recorded PCM to, e.g. "https://host:port/v1/transcribe"
     std::string device_token;
