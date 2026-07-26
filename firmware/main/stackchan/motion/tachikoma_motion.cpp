@@ -337,6 +337,25 @@ bool IsMotionSuppressed()
     return g_motion_suppressed;
 }
 
+namespace {
+volatile uint32_t g_last_expressive_motion_ms = 0;
+volatile bool g_had_expressive_motion = false;
+}  // namespace
+
+void NoteExpressiveMotion(uint32_t now)
+{
+    g_last_expressive_motion_ms = now;
+    g_had_expressive_motion     = true;
+}
+
+bool WasExpressiveMotionRecent(uint32_t now, uint32_t window_ms)
+{
+    if (!g_had_expressive_motion) {
+        return false;
+    }
+    return static_cast<int32_t>(now - g_last_expressive_motion_ms) < static_cast<int32_t>(window_ms);
+}
+
 void ServoMotion::Apply(const MotionFrame& frame, stackchan::motion::Motion& motion)
 {
     if (frame.servo_command_sequence == last_command_sequence_ || motion.isModifyLocked()) {
@@ -361,6 +380,9 @@ void ServoMotion::Apply(const MotionFrame& frame, stackchan::motion::Motion& mot
     // rate-limited motion command. The existing Servo update releases torque again after the move settles.
     motion.setTorqueEnabled(true);
     const bool expressive = frame.motion == MotionType::Happy || frame.motion == MotionType::Confused;
+    if (expressive) {
+        NoteExpressiveMotion(GetHAL().millis());
+    }
     motion.moveWithSpeed(yaw, pitch, expressive ? kServoSpeedExpressive : kServoSpeedAmbient);
     last_command_sequence_ = frame.servo_command_sequence;
 }

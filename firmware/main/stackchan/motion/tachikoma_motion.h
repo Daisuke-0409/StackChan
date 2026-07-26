@@ -76,6 +76,18 @@ void StopMotion();
 // Not persisted, so a power cycle always returns to moving.
 void SetMotionSuppressed(bool suppressed);
 bool IsMotionSuppressed();
+
+// Records that a *large* movement was just commanded -- an emotion one-shot
+// or a turn toward a face, not the idle sway.
+//
+// The head-touch sensor rides on the moving part, so a big gesture shakes it
+// into a false press. Gating on Motion::isMoving() looks like the obvious
+// guard and is not: the idle loop keeps a spring animation running almost
+// continuously, so that test reads true nearly always and silently blocks
+// every real press. Only the movements big enough to fool the sensor set
+// this.
+void NoteExpressiveMotion(uint32_t now);
+bool WasExpressiveMotionRecent(uint32_t now, uint32_t window_ms);
 MotionType GetCurrentMotion();
 bool IsMotionPlaying();
 

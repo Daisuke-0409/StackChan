@@ -33,7 +33,7 @@
 #include "ai_gateway/speech_announcer.h"
 #include "hal/audio_codec_guard.h"
 #include "hal/hal.h"
-#include "stackchan/stackchan.h"
+#include "stackchan/motion/tachikoma_motion.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
 
@@ -56,6 +56,11 @@ constexpr uint32_t kMinRecordingMs = 300;
 // triggers still slip through (louder replies vibrate longer) or if this
 // proves longer than necessary once retested.
 constexpr uint32_t kPostSpeechCooldownMs = 1500;
+// How long after a large gesture a press is still assumed to be the sensor
+// ringing rather than a finger. Short on purpose: a real press a moment
+// after a gesture must still work, and over-blocking here is exactly the
+// failure that made the device ignore the button entirely.
+constexpr uint32_t kExpressiveMotionGuardMs = 600;
 // How much audio to ask the codec for per read. This must be derived from the
 // mic's real rate and channel count, never assumed: a fixed 320 int16 was the
 // bug that made every recording unintelligible. The mic produces
@@ -227,18 +232,20 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
         last_error_ = VoiceInputErrorCode::Cooldown;
         return;
     }
-    // The head-touch sensor is mounted on the part that moves, so the servos
-    // shake it. The speaker already had this problem (see the cooldown
-    // above); once gestures grew large enough to be worth watching, the
-    // motion did too, and the robot started opening conversations by itself
-    // whenever it turned to look at someone -- "顔を見た瞬間話しかけてくる".
+    // The head-touch sensor is mounted on the part that moves, so a large
+    // gesture shakes it into a false press -- which is how the robot started
+    // opening conversations by itself whenever it turned to look at someone.
     //
-    // Recording while the neck is driving would also put servo noise into
-    // the clip, so declining here costs nothing: a real press during a
-    // gesture is a fraction of a second from being possible again.
-    if (GetStackChan().motion().isMoving()) {
+    // This checks only for *large* movements. The first version tested
+    // Motion::isMoving(), which was wrong in the worst way: the idle loop
+    // keeps a spring animation running nearly all the time, so that read
+    // true almost always and silently refused every genuine press. The
+    // device went completely unresponsive -- "無言＆無動" -- because it was
+    // rejecting the button, not because anything had broken.
+    if (tachikoma_motion::WasExpressiveMotionRecent(now, kExpressiveMotionGuardMs)) {
         std::lock_guard<std::mutex> lock(mutex_);
         last_error_ = VoiceInputErrorCode::Busy;
+        mclog::tagInfo(kTag, "press ignored: large motion still settling");
         return;
     }
 

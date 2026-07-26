@@ -25,6 +25,7 @@
 #include "hal/board/stackchan_camera.h"
 #include "hal/camera_guard.h"
 #include "hal/hal.h"
+#include "stackchan/motion/tachikoma_motion.h"
 #include "stackchan/stackchan.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
@@ -341,6 +342,9 @@ void FaceTracker::WorkerTask(void* arg)
             } else {
                 // The gateway's y grows downward (image convention) while a
                 // positive pitch raises the head, so it is inverted here.
+                // Same guard as an emotion gesture: turning the head is
+                // exactly the movement that shakes the touch sensor.
+                tachikoma_motion::NoteExpressiveMotion(GetHAL().millis());
                 GetStackChan().motion().lookAtNormalized(x, -y, kLookSpeed);
                 mclog::tagInfo(kTag, "looking at x={} y={}", static_cast<int>(x * 100),
                                 static_cast<int>(-y * 100));
