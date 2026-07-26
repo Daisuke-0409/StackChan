@@ -228,6 +228,21 @@ class PeopleStore:
             self._save(data)
         return True
 
+    def delete_person(self, person_id: str) -> bool:
+        """Forget someone entirely, biometrics included.
+
+        The only way to withdraw a face and a voice that were recorded
+        without their owner sitting at this keyboard, so it deletes rather
+        than deactivates.
+        """
+        with self._lock:
+            data = self._load()
+            if person_id not in data["people"]:
+                return False
+            del data["people"][person_id]
+            self._save(data)
+        return True
+
     def note_encounter(self, person_id: str) -> None:
         with self._lock:
             data = self._load()

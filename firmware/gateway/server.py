@@ -38,10 +38,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
 try:  # package import when run as gateway.server, plain when run as a script
-    from . import biometrics, people
+    from . import biometrics, people, settings_store, webui
 except ImportError:  # pragma: no cover - depends on how the server is started
     import biometrics
     import people
+    import settings_store
+    import webui
 
 MAX_INPUT_BYTES = 512
 MAX_OUTPUT_BYTES = 4096
@@ -52,6 +54,56 @@ MAX_TRANSCRIBE_AUDIO_BYTES = 1536 * 1024  # >= VoiceInputController's kMaxRecord
 # A 320x240 JPEG from the device's GC0308 is 10-25 KB; this is generous
 # enough for a raw or high-quality frame without inviting a large upload.
 MAX_VISION_IMAGE_BYTES = 512 * 1024
+
+# Home-screen icon for the settings app. Inlined rather than kept as a file
+# because the gateway is a couple of Python modules started by a script,
+# and 3 KB of PNG is not worth an asset directory.
+_APP_ICON_PNG = base64.b64decode(
+    "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"
+    "jY41Y8H2AAAAAElFTkSuQmCC"
+)
+
 MIN_SAMPLE_RATE = 8000
 MAX_SAMPLE_RATE = 48000
 MIN_TRANSCRIBE_AUDIO_SECONDS = 0.5  # below this, skip STT entirely and treat as "didn't hear
@@ -384,7 +436,7 @@ def _visibility_for_turn(device_id: str, user_text: str) -> str:
 
 
 def _remember_exchange(device_id: str, user_text: str, model_text: str, env: dict[str, str]) -> None:
-    if env.get("ENABLE_MEMORY", "1") != "1" or not device_id or not model_text:
+    if not _memory_enabled(env) or not device_id or not model_text:
         return
     visibility = _visibility_for_turn(device_id, user_text)
     _append_turn(device_id, user_text, model_text, visibility)
@@ -584,7 +636,40 @@ def take_pending_emotion(device_id: str) -> Optional[str]:
 # and skips it otherwise ("こんにちは、元気？" -> no search, 953ms), so
 # leaving it on costs ordinary conversation nothing.
 def _web_search_enabled(env: dict[str, str]) -> bool:
-    return env.get("ENABLE_WEB_SEARCH", "1") == "1"
+    # The .env switch is the hard off; the app toggle is the everyday one, so
+    # either being off means off.
+    if env.get("ENABLE_WEB_SEARCH", "1") != "1":
+        return False
+    return bool(settings_store.get("web_search_enabled"))
+
+
+def _memory_enabled(env: dict[str, str]) -> bool:
+    if env.get("ENABLE_MEMORY", "1") != "1":
+        return False
+    return bool(settings_store.get("memory_enabled"))
+
+
+def _speaker_id_enabled(env: dict[str, str]) -> bool:
+    if env.get("ENABLE_SPEAKER_ID", "1") != "1":
+        return False
+    return bool(settings_store.get("speaker_id_enabled"))
+
+
+def _persona_suffix() -> str:
+    """Turns the operator's persona settings into prompt text.
+
+    Empty settings add nothing at all rather than a paragraph saying there is
+    no persona -- an instruction the model still has to read and weigh.
+    """
+    values = settings_store.load()
+    parts = []
+    first_person = str(values.get("first_person", "")).strip()
+    if first_person:
+        parts.append(f"あなたの一人称は「{first_person}」です。必ずこれを使ってください。")
+    persona = str(values.get("persona", "")).strip()
+    if persona:
+        parts.append(f"あなたの性格と話し方: {persona}")
+    return ("\n" + "\n".join(parts)) if parts else ""
 
 
 def _chat_tools(env: dict[str, str]) -> list[dict[str, Any]]:
@@ -703,6 +788,101 @@ def _identify_or_enrol(device_id: str, pcm: bytes, sample_rate: int, text: str) 
             _log(f"gateway speaker not identified (best={score:.2f}) -> least privilege")
 
 
+def _voicevox_speaker_options() -> list[dict[str, str]]:
+    """The voices actually installed, for the settings screen.
+
+    Asks the engine rather than shipping a list, because the catalogue
+    depends on which VOICEVOX build is installed. An unreachable engine
+    yields an empty list, which the UI shows as "voices unavailable" instead
+    of offering choices that would silently fail.
+    """
+    base_url = os.environ.get("VOICEVOX_URL", "http://127.0.0.1:50021").rstrip("/")
+    try:
+        with urllib.request.urlopen(f"{base_url}/speakers", timeout=5) as response:
+            speakers = json.loads(response.read(1024 * 1024).decode("utf-8"))
+    except Exception:
+        return []
+    options = []
+    for speaker in speakers:
+        for style in speaker.get("styles", []):
+            options.append({"value": str(style["id"]),
+                            "label": f"{speaker['name']} / {style['name']}"})
+    return options
+
+
+settings_store.register_option_provider("voicevox_speakers", _voicevox_speaker_options)
+
+
+def process_settings_get(headers: dict[str, str] | None = None,
+                         env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    headers = headers or {}
+    env = env or os.environ
+    if not _authorized(headers, env):
+        return _result(401, "authentication_failed")
+    return 200, {"schema": settings_store.schema(), "values": settings_store.load()}
+
+
+def process_settings_put(payload: dict[str, Any], headers: dict[str, str] | None = None,
+                         env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    headers = headers or {}
+    env = env or os.environ
+    if not _authorized(headers, env):
+        return _result(401, "authentication_failed")
+    if not isinstance(payload, dict):
+        return _result(400, "invalid_input")
+    values, rejected = settings_store.update(payload)
+    # Names of settings only -- their values can be persona text, which is
+    # the operator's writing and does not belong in a log.
+    _log(f"gateway settings updated keys={sorted(k for k in payload if k not in rejected)}"
+         + (f" rejected={rejected}" if rejected else ""))
+    return 200, {"values": values, "rejected": rejected}
+
+
+def process_people_list(headers: dict[str, str] | None = None,
+                        env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    """Who the device has met. Embeddings are never returned -- the app has
+    no use for them, and they are the most sensitive thing in the store."""
+    headers = headers or {}
+    env = env or os.environ
+    if not _authorized(headers, env):
+        return _result(401, "authentication_failed")
+    listed = []
+    for person in _people_store.list_people():
+        listed.append({
+            "id": person["id"],
+            "name": person.get("name", ""),
+            "role": person.get("role", people.ROLE_GUEST),
+            "encounters": person.get("encounters", 0),
+            "last_seen": person.get("last_seen"),
+            "first_seen": person.get("first_seen"),
+            "voice_samples": len(person.get("voice") or []),
+            "face_samples": len(person.get("face") or []),
+        })
+    listed.sort(key=lambda p: p.get("last_seen") or 0, reverse=True)
+    return 200, {"people": listed, "roles": list(people._ROLE_RANK.keys())}
+
+
+def process_people_update(payload: dict[str, Any], headers: dict[str, str] | None = None,
+                          env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
+    headers = headers or {}
+    env = env or os.environ
+    if not _authorized(headers, env):
+        return _result(401, "authentication_failed")
+    person_id = payload.get("id")
+    if not isinstance(person_id, str) or not person_id:
+        return _result(400, "invalid_input")
+    if payload.get("delete") is True:
+        if _people_store.delete_person(person_id):
+            _log("gateway person deleted")
+            return 200, {"ok": True}
+        return _result(404, "not_found")
+    role = payload.get("role")
+    if isinstance(role, str) and _people_store.set_role(person_id, role):
+        _log(f"gateway person role set to {role}")
+        return 200, {"ok": True}
+    return _result(400, "invalid_input")
+
+
 def process_vision(image_bytes: bytes, headers: dict[str, str] | None = None,
                    env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     """One camera frame in; where to look and who it is, out.
@@ -791,9 +971,9 @@ def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str
     url = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
     listener_role = current_role(payload["device_id"])
     suffix, prior = (_memory_prompt_parts(payload["device_id"], listener_role)
-                     if env.get("ENABLE_MEMORY", "1") == "1" else ("", []))
+                     if _memory_enabled(env) else ("", []))
     body: dict[str, Any] = {
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + suffix}]},
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + _persona_suffix() + suffix}]},
         "contents": prior + [{"role": "user", "parts": [{"text": text}]}],
     }
     tools = _chat_tools(env)
@@ -896,7 +1076,14 @@ def _tts_pcm(text: str, env: dict[str, str]) -> Optional[bytes]:
     Defaults to voicevox when TTS_PROVIDER is unset only if a VOICEVOX_URL was
     given explicitly; otherwise stays on the previous gemini behavior so an
     existing deployment does not change provider by upgrading this file.
+
+    Returns None when the operator has turned speech off, which the callers
+    already treat as "no audio for this sentence". The reply is still
+    generated, remembered and returned as text -- it simply is not spoken,
+    and a sentence nobody will hear costs no synthesis.
     """
+    if not settings_store.get("speech_enabled"):
+        return None
     provider = env.get("TTS_PROVIDER", "").lower()
     if not provider:
         provider = "voicevox" if env.get("VOICEVOX_URL") else "gemini"
@@ -1041,9 +1228,9 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
     url = f"{GEMINI_API_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
     listener_role = current_role(device_id)
     suffix, prior = (_memory_prompt_parts(device_id, listener_role)
-                     if env.get("ENABLE_MEMORY", "1") == "1" else ("", []))
+                     if _memory_enabled(env) else ("", []))
     body: dict[str, Any] = {
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + suffix}]},
+        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + _persona_suffix() + suffix}]},
         "contents": prior + [{"role": "user", "parts": [{"text": text}]}],
     }
     tools = _chat_tools(env)
@@ -1107,8 +1294,13 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
                     # resolvable from the first chunk -- before any sentence
                     # has been synthesized. Waiting for a sentence boundary
                     # would put the motion behind the voice.
+                    #
+                    # Stripping happens whether or not emotions are enabled:
+                    # the model is still asked for the tag, and a disabled
+                    # setting must not turn into the device saying the word
+                    # "happy" out loud. Only acting on it is optional.
                     stripped, reaction = _split_emotion_tag(pending)
-                    if reaction is not None:
+                    if reaction is not None and settings_store.get("emotion_enabled"):
                         set_pending_emotion(device_id, reaction)
                         _log(f"gateway emotion={reaction} "
                              f"resolved_ms={(time.monotonic() - t_start) * 1000:.0f}")
@@ -1140,10 +1332,14 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
         return _result(502, "invalid_response")
     full_text = full_text[:MAX_OUTPUT_BYTES]
 
-    if enqueued_count == 0:
+    if enqueued_count == 0 and settings_store.get("speech_enabled"):
         # Every sentence's TTS (or the stream itself) failed -- same
         # fallback the non-streaming path uses so /v1/chat still produces
         # *something* audible rather than silence with no explanation.
+        #
+        # Not when speech is switched off, though: there the silence is the
+        # point, and a confirmation beep is the one sound guaranteed to
+        # annoy someone who just asked for quiet.
         enqueue_speech(device_id, _generate_beep_pcm())
 
     return 200, {"text": full_text, "request_id": payload["request_id"],
@@ -1242,13 +1438,18 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
         pcm = None
         if provider == "gemini":
             pcm = _tts_pcm(body["text"], env)
-        if pcm is None:
+        # Speech switched off means say nothing at all -- not even the
+        # fallback tone. The reply is still returned and still remembered,
+        # so only the enqueue below is skipped, never the remembering.
+        speaking = bool(settings_store.get("speech_enabled"))
+        if pcm is None and speaking:
             # No real TTS (non-Gemini provider, or Gemini TTS failed this
             # time): enqueue a fixed tone instead, solely to verify the
             # transcribe->chat->speak_queue path is wired end-to-end. A TTS
             # failure never fails the /v1/chat response itself.
             pcm = _generate_beep_pcm()
-        enqueue_status, enqueue_body = enqueue_speech(payload["device_id"], pcm)
+        enqueue_status, enqueue_body = (200, {}) if pcm is None else enqueue_speech(
+            payload["device_id"], pcm)
         if enqueue_status != 200:
             # Previously silent: enqueue_speech()'s return value was
             # discarded here, so a rejection (e.g. 413 for audio over
@@ -1419,7 +1620,7 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
         detail = repr(body.get("text")) if status == 200 else body.get("error")
         _log(f"gateway debug transcribe status={status} stt_ms={stt_ms:.0f} text={detail}")
 
-    if status == 200 and env.get("ENABLE_SPEAKER_ID", "1") == "1":
+    if status == 200 and _speaker_id_enabled(env):
         # Synchronous on purpose. The chat request that decides what memory
         # to load is a separate round trip that follows immediately, so
         # doing this in the background would race it -- and losing that race
@@ -1458,6 +1659,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(audio)
 
+    def _send_raw(self, status: int, content_type: str, payload: bytes) -> None:
+        self.send_response(status)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(payload)))
+        # The settings app is served from the same origin it calls, so no
+        # caching headers are needed beyond keeping the phone from pinning a
+        # stale copy of the page after an update.
+        self.send_header("Cache-Control", "no-cache")
+        self.end_headers()
+        self.wfile.write(payload)
+
+    def _send_html(self, html: str) -> None:
+        self._send_raw(200, "text/html; charset=utf-8", html.encode("utf-8"))
+
+    def _read_json(self) -> dict[str, Any]:
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), MAX_INPUT_BYTES * 4)
+            if length <= 0:
+                return {}
+            decoded = json.loads(self.rfile.read(length).decode("utf-8"))
+            return decoded if isinstance(decoded, dict) else {}
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            return {}
+
     def _send_no_content(self) -> None:
         self.send_response(204)
         self.send_header("Content-Length", "0")
@@ -1465,7 +1690,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path == "/health":
+        if parsed.path in ("/", "/ui", "/ui/"):
+            self._send_html(webui.INDEX_HTML)
+        elif parsed.path == "/ui/manifest.json":
+            self._send_raw(200, "application/manifest+json", webui.MANIFEST_JSON.encode("utf-8"))
+        elif parsed.path == "/ui/icon.png":
+            self._send_raw(200, "image/png", _APP_ICON_PNG)
+        elif parsed.path == "/v1/settings":
+            status, body = process_settings_get(dict(self.headers), os.environ)
+            self._send(status, body)
+        elif parsed.path == "/v1/people":
+            status, body = process_people_list(dict(self.headers), os.environ)
+            self._send(status, body)
+        elif parsed.path == "/health":
             self._send(200, {"ok": True, "provider": os.environ.get("AI_PROVIDER", "mock")})
         elif parsed.path == "/v1/speak_queue":
             if not _authorized(dict(self.headers), os.environ):
@@ -1484,6 +1721,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         else:
             self._send(404, {"error": "not_found"})
 
+    def do_PUT(self) -> None:  # noqa: N802
+        if self.path == "/v1/settings":
+            status, body = process_settings_put(self._read_json(), dict(self.headers), os.environ)
+            self._send(status, body)
+        else:
+            self._send(404, {"error": "not_found"})
+
     def do_POST(self) -> None:  # noqa: N802
         if self.path == "/v1/chat":
             try:
@@ -1493,6 +1737,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 self._send(400, {"error": "invalid_input"})
                 return
             status, body = process_chat(payload, dict(self.headers), os.environ)
+            self._send(status, body)
+        elif self.path == "/v1/people":
+            status, body = process_people_update(self._read_json(), dict(self.headers), os.environ)
             self._send(status, body)
         elif self.path == "/v1/vision":
             try:
