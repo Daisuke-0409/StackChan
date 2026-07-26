@@ -6,6 +6,7 @@
 #include "voice_input_controller.h"
 
 #include <algorithm>
+#include <cmath>
 #include <application.h>
 #include <audio_codec.h>
 #include <board.h>
@@ -61,6 +62,26 @@ constexpr uint32_t kPostSpeechCooldownMs = 1500;
 // after a gesture must still work, and over-blocking here is exactly the
 // failure that made the device ignore the button entirely.
 constexpr uint32_t kExpressiveMotionGuardMs = 600;
+// --- hands-free follow-up ------------------------------------------------
+// How long the conversation stays open after a reply. Restarted by each
+// exchange, so a back-and-forth keeps going and a pause ends it.
+constexpr uint32_t kFollowUpWindowMs = 30000;
+// Root-mean-square over a frame that counts as speech. The mic runs at
+// maximum analogue gain, so a quiet room still sits well above zero; this
+// was chosen to sit above room tone and below conversational speech at a
+// metre. Too low and the television holds the conversation open forever.
+constexpr int32_t kFollowUpSpeechRms = 1400;
+constexpr int32_t kFollowUpSilenceRms = 900;   // hysteresis, so one quiet
+                                               // syllable does not end a
+                                               // sentence
+// Silence that ends an utterance. Long enough to survive the gap between
+// words, short enough that the reply does not feel delayed.
+constexpr uint32_t kFollowUpEndSilenceMs = 900;
+// Ignore anything shorter than this: a cough, a chair, a door.
+constexpr uint32_t kFollowUpMinSpeechMs = 400;
+// Audio kept before the threshold was crossed, so the first syllable is not
+// clipped off the front of the recording.
+constexpr size_t kFollowUpPrerollSamples = 24000 / 2;  // 0.5s at 24kHz
 // How much audio to ask the codec for per read. This must be derived from the
 // mic's real rate and channel count, never assumed: a fixed 320 int16 was the
 // bug that made every recording unintelligible. The mic produces
@@ -107,7 +128,21 @@ esp_err_t HttpEvent(esp_http_client_event_t* event)
     return ESP_OK;
 }
 
+constexpr char kContinuousKey[] = "continuous";
+
 }  // namespace
+
+bool IsContinuousConversationEnabled()
+{
+    Settings settings(kSettingsNamespace, false);
+    return settings.GetBool(kContinuousKey, true);
+}
+
+void SetContinuousConversationEnabled(bool enabled)
+{
+    Settings settings(kSettingsNamespace, true);
+    settings.SetBool(kContinuousKey, enabled);
+}
 
 bool HasExceededMaxDuration(uint32_t now, uint32_t started_ms, uint32_t max_duration_ms)
 {
@@ -256,6 +291,8 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
         }
         recording_ = true;
         recording_started_ms_ = now;
+        follow_up_speech_ = false;   // a deliberate press supersedes any
+                                     // hands-free utterance in progress
         buffer_.clear();
         buffer_.shrink_to_fit();  // release the previous recording's block first
         recording_capacity_samples_ = ReserveRecordingBuffer(buffer_);
@@ -324,14 +361,118 @@ void VoiceInputController::ConnectHeadTouchTrigger()
     });
 }
 
+void VoiceInputController::OpenFollowUp(uint32_t now)
+{
+    std::lock_guard<std::mutex> lock(mutex_);
+    const bool was_open = follow_up_open_;
+    follow_up_open_     = true;
+    follow_up_until_ms_ = now + kFollowUpWindowMs;
+    follow_up_speech_   = false;
+    follow_up_quiet_since_ms_ = now;
+    follow_up_preroll_.assign(kFollowUpPrerollSamples, 0);
+    follow_up_preroll_pos_    = 0;
+    follow_up_preroll_filled_ = false;
+    if (!was_open) {
+        mclog::tagInfo(kTag, "conversation open: just speak, no need to hold the head");
+    }
+}
+
+void VoiceInputController::CloseFollowUp(const char* why)
+{
+    bool was_open = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        was_open         = follow_up_open_;
+        follow_up_open_  = false;
+        follow_up_speech_ = false;
+        // Give the memory back; this is 24000 samples that only matter
+        // while the window is open.
+        follow_up_preroll_.clear();
+        follow_up_preroll_.shrink_to_fit();
+    }
+    if (was_open) {
+        mclog::tagInfo(kTag, "conversation closed: {}", why);
+    }
+}
+
+void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>& frame)
+{
+    // Level of this frame. Mean of squares in 64-bit: a 20ms frame of loud
+    // audio overflows int32 well before the divide.
+    int64_t sum = 0;
+    for (int16_t sample : frame) {
+        sum += static_cast<int64_t>(sample) * sample;
+    }
+    const int32_t rms = frame.empty()
+        ? 0 : static_cast<int32_t>(std::sqrt(static_cast<double>(sum) / frame.size()));
+
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!follow_up_open_ || recording_ || busy_) {
+        return;
+    }
+
+    if (!follow_up_speech_) {
+        // Keep the tail of the recent past so the utterance does not start
+        // mid-word once the threshold is crossed.
+        for (int16_t sample : frame) {
+            follow_up_preroll_[follow_up_preroll_pos_] = sample;
+            follow_up_preroll_pos_ = (follow_up_preroll_pos_ + 1) % follow_up_preroll_.size();
+            if (follow_up_preroll_pos_ == 0) {
+                follow_up_preroll_filled_ = true;
+            }
+        }
+        if (rms >= kFollowUpSpeechRms) {
+            follow_up_speech_          = true;
+            follow_up_speech_start_ms_ = now;
+            follow_up_quiet_since_ms_  = now;
+            // Hand the pre-roll over as the start of the recording, oldest
+            // sample first.
+            buffer_.clear();
+            buffer_.reserve(recording_capacity_samples_ > 0 ? recording_capacity_samples_
+                                                            : kMinRecordingCapacitySamples);
+            if (follow_up_preroll_filled_) {
+                buffer_.insert(buffer_.end(), follow_up_preroll_.begin() + follow_up_preroll_pos_,
+                               follow_up_preroll_.end());
+            }
+            buffer_.insert(buffer_.end(), follow_up_preroll_.begin(),
+                           follow_up_preroll_.begin() + follow_up_preroll_pos_);
+            recording_           = true;
+            recording_started_ms_ = now;
+            recording_capacity_samples_ = buffer_.capacity();
+            mclog::tagInfo(kTag, "follow-up speech detected (rms={})", rms);
+        }
+        return;
+    }
+
+    if (rms >= kFollowUpSilenceRms) {
+        follow_up_quiet_since_ms_ = now;
+    }
+}
+
 void VoiceInputController::Update(uint32_t now)
 {
     const auto current_state = tachikoma_state::GetTachikomaStateManager().GetCurrentState();
     if (last_observed_state_ == tachikoma_state::TachikomaState::Speaking &&
         current_state == tachikoma_state::TachikomaState::Idle) {
         cooldown_until_ms_ = now + kPostSpeechCooldownMs;
+        // A reply has just finished, which is exactly when someone is most
+        // likely to say the next thing. Hold the conversation open so they
+        // do not have to reach for the head again.
+        if (IsContinuousConversationEnabled()) {
+            OpenFollowUp(now);
+        }
     }
     last_observed_state_ = current_state;
+
+    bool expired = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        expired = follow_up_open_ && !recording_ && !busy_ &&
+                  static_cast<int32_t>(now - follow_up_until_ms_) >= 0;
+    }
+    if (expired) {
+        CloseFollowUp("nobody spoke");
+    }
 }
 
 void VoiceInputController::StartRecordingTask()
@@ -402,19 +543,54 @@ void VoiceInputController::RecordingTask()
 bool VoiceInputController::CaptureTick(uint32_t now)
 {
     bool is_recording;
+    bool listening;
     uint32_t started_ms;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         is_recording = recording_;
-        started_ms = recording_started_ms_;
+        listening    = follow_up_open_ && !busy_;
+        started_ms   = recording_started_ms_;
     }
-    if (!is_recording) {
+    // The mic is read while an utterance is being captured *and* while the
+    // conversation is merely open, because deciding that somebody started
+    // talking needs the same frames.
+    if (!is_recording && !listening) {
         return false;
     }
 
     if (HasExceededMaxDuration(now, started_ms, kMaxRecordingMs)) {
         StopRecordingAndUpload(now);
         return false;
+    }
+    // A hands-free utterance ends itself: there is no button release to
+    // mark the end, so a stretch of quiet does it instead.
+    if (is_recording) {
+        bool ended = false;
+        bool too_short = false;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (follow_up_open_ && follow_up_speech_ &&
+                static_cast<int32_t>(now - follow_up_quiet_since_ms_) >=
+                    static_cast<int32_t>(kFollowUpEndSilenceMs)) {
+                ended     = true;
+                too_short = static_cast<int32_t>(follow_up_quiet_since_ms_ - follow_up_speech_start_ms_) <
+                            static_cast<int32_t>(kFollowUpMinSpeechMs);
+                follow_up_speech_ = false;
+            }
+        }
+        if (ended && too_short) {
+            // A cough or a chair. Drop it and keep listening rather than
+            // sending the gateway a second of nothing.
+            std::lock_guard<std::mutex> lock(mutex_);
+            recording_ = false;
+            buffer_.clear();
+            mclog::tagInfo(kTag, "follow-up sound too short, ignoring");
+            return true;
+        }
+        if (ended) {
+            StopRecordingAndUpload(now);
+            return false;
+        }
     }
 
     auto* codec = Board::GetInstance().GetAudioCodec();
@@ -448,6 +624,18 @@ bool VoiceInputController::CaptureTick(uint32_t now)
     // this point -- buffer_, the upload's declared "channels=1" -- assumes
     // mono. No-ops when input_channels() is 1.
     frame = DownmixToChannel0(frame, codec->input_channels());
+
+    if (listening) {
+        FollowUpTick(now, frame);
+        bool still_listening_only;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            still_listening_only = !recording_;
+        }
+        if (still_listening_only) {
+            return true;  // measured, nothing to store yet
+        }
+    }
 
     bool cap_reached = false;
     {

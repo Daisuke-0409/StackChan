@@ -82,21 +82,42 @@ FACE_MATCH_MARGIN = 0.05
 # was meant to stay in, and a false positive only over-restricts. The model's
 # own judgement can be layered on later as an *additional* trigger, never as
 # a replacement.
+# Both spellings of every word: speech recognition picks kanji or kana by
+# context, and the operator does not get to know which it chose. A cue that
+# only matches 話 silently fails on はなし, which is the same phrase.
 _SECRET_PATTERNS = [
-    r"ここだけの話", r"内緒", r"ないしょ", r"秘密",
-    r"二人だけ", r"ふたりだけ", r"俺と(?:お前|君|あなた)だけ",
-    r"他(?:の人|人)には(?:言わない|言うな|内緒|秘密)",
-    r"誰にも(?:言わない|言うな)",
-    r"オフレコ",
+    r"ここだけの(?:話|はなし)", r"内緒", r"ないしょ", r"秘密", r"ひみつ",
+    r"(?:二人|ふたり|2人)(?:だけ|の秘密|のひみつ)",
+    r"(?:俺|おれ|私|わたし|僕|ぼく)と(?:お前|おまえ|君|きみ|あなた)だけ",
+    r"他(?:の人|人)には(?:言わない|言うな|いわない|内緒|ないしょ|秘密|ひみつ)",
+    r"誰にも(?:言わない|言うな|いわない|いうな)",
+    r"だれにも(?:言わない|いわない)",
+    r"オフレコ", r"言わないで", r"いわないで",
 ]
 _SECRET_RE = re.compile("|".join(_SECRET_PATTERNS))
 
 # Cancels the above, for when the operator wants a fact shared again.
-_UNSECRET_RE = re.compile(r"(?:もう)?(?:みんな|全員|誰にでも|彼女にも|皆)に(?:言って|話して|教えて)(?:いい|ok|OK)")
+# The "彼女にも" branch already carries its own に, so requiring another one
+# after the group meant it could never match -- "彼女にも話していいよ" fell
+# through and the fact stayed closed.
+_UNSECRET_RE = re.compile(
+    r"(?:もう)?(?:みんな|全員|誰にでも|皆|彼女|家族|みなさん)に(?:も)?\s*(?:言って|話して|教えて|共有して)(?:いい|ok|OK|大丈夫)")
+
+
+# Words that merely contain a cue without asking for one. Checked first, so
+# "秘密基地の話をして" is a request about a treehouse rather than an
+# instruction to keep it. Known and accepted: a genuine question *about* the
+# word ("内緒話って英語でなんて言うの") still trips the cue. Over-restricting
+# only means a fact stays more private than it needed to, which is the
+# direction this is supposed to fail in.
+_SECRET_EXCEPTIONS = re.compile(r"秘密基地|ひみつ基地|秘密兵器")
 
 
 def mentions_secret(text: str) -> bool:
-    return bool(_SECRET_RE.search(text or ""))
+    text = text or ""
+    if _SECRET_EXCEPTIONS.search(text) and not re.search(r"ここだけ|オフレコ|誰にも|だれにも", text):
+        return False
+    return bool(_SECRET_RE.search(text))
 
 
 def mentions_unsecret(text: str) -> bool:

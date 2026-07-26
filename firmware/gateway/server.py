@@ -423,6 +423,13 @@ def _visibility_for_turn(device_id: str, user_text: str) -> str:
     """
     role = current_role(device_id)
     visibility = people.default_visibility_for(role)
+    # The operator reported saying "ここだけの話" and nothing happened, and
+    # there was no way to tell whether the cue had missed or the
+    # transcription had. Logging the decision (never the words -- that is the
+    # one thing this feature exists to keep quiet) makes the difference
+    # visible next time.
+    _log(f"gateway visibility decision role={role} secret_cue={people.mentions_secret(user_text)} "
+         f"open_cue={people.mentions_unsecret(user_text)} chars={len(user_text)}")
     if people.mentions_secret(user_text):
         visibility = people.VISIBILITY_MASTER
         # The cue usually refers to what was *just* said, not only to what
@@ -1060,6 +1067,15 @@ def _voicevox_tts_pcm(text: str, env: dict[str, str]) -> Optional[bytes]:
         # future engine default silently change either one.
         query["outputSamplingRate"] = 24000
         query["outputStereo"] = False
+        # The speaking-rate setting existed in the app but was never sent, so
+        # moving the slider did nothing. It also matters for latency: TTS is
+        # the largest per-sentence cost and scales with how long the audio
+        # is, so a faster voice is a faster reply as well as a quicker one.
+        try:
+            speed = float(settings_store.get("voice_speed") or 1.0)
+        except (TypeError, ValueError):
+            speed = 1.0
+        query["speedScale"] = max(0.5, min(2.0, speed))
 
         synth_url = f"{base_url}/synthesis?{urllib.parse.urlencode({'speaker': speaker})}"
         request = urllib.request.Request(synth_url, data=json.dumps(query).encode("utf-8"),

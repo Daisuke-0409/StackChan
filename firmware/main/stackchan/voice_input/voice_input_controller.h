@@ -65,6 +65,11 @@ std::vector<int16_t> DownmixToChannel0(const std::vector<int16_t>& interleaved, 
 enum class TriggerAction { None, Press, Release };
 TriggerAction MapHeadTouchGesture(HeadPetGesture gesture);
 
+// Hands-free continuation. On by default; the settings app can turn it off
+// for anyone who would rather press to talk every time.
+bool IsContinuousConversationEnabled();
+void SetContinuousConversationEnabled(bool enabled);
+
 class VoiceInputController {
 public:
     // Stores endpoint/token in a dedicated NVS namespace. Values are never logged.
@@ -153,6 +158,32 @@ private:
     // Set once from StartRecordingTask() at boot; same single-caller
     // reasoning as head_touch_connected_ above.
     bool recording_task_started_ = false;
+
+    // --- hands-free follow-up ---------------------------------------------
+    // After a reply finishes, the conversation stays open for a while: the
+    // user can just keep talking instead of holding the head for every turn.
+    // The head touch is what *starts* a conversation; this is what lets it
+    // continue.
+    //
+    // Speech detection is done here rather than through the AFE's VAD
+    // because AudioService owns the mic while its processor runs, and
+    // recording already has to take that mic away. Reading frames we are
+    // already reading and measuring their level avoids handing the codec
+    // back and forth several times a second.
+    bool follow_up_open_ = false;
+    uint32_t follow_up_until_ms_ = 0;
+    bool follow_up_speech_ = false;      // currently inside an utterance
+    uint32_t follow_up_speech_start_ms_ = 0;
+    uint32_t follow_up_quiet_since_ms_ = 0;
+    // A short ring of recent audio, so an utterance does not lose the
+    // syllable that crossed the threshold in the first place.
+    std::vector<int16_t> follow_up_preroll_;
+    size_t follow_up_preroll_pos_ = 0;
+    bool follow_up_preroll_filled_ = false;
+
+    void OpenFollowUp(uint32_t now);
+    void CloseFollowUp(const char* why);
+    void FollowUpTick(uint32_t now, const std::vector<int16_t>& frame);
 };
 
 VoiceInputController& GetVoiceInputController();
