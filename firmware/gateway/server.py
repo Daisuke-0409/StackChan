@@ -518,6 +518,40 @@ _EMOTION_TO_REACTION = {"happy": "happy", "sad": "confused"}
 _pending_emotion: dict[str, str] = {}
 _pending_emotion_lock = threading.Lock()
 
+# Manner mode: stop moving, keep talking. Asked for out loud rather than by
+# gesture, because every head-touch gesture is already taken -- press and
+# release are push-to-talk, and the swipes are the petting reaction.
+_MANNER_ON_RE = re.compile(r"(マナーモード|静かにして|動かないで|じっとして)(?!.*(解除|やめ|off|オフ|終わ))")
+_MANNER_OFF_RE = re.compile(r"(マナーモード|静か).*(解除|やめて|終わり|オフ|off)|(動いて(いい|ok|OK)|普通に戻)")
+_pending_command: dict[str, str] = {}
+_pending_command_lock = threading.Lock()
+
+
+def detect_manner_command(text: str) -> Optional[str]:
+    """"motion_off" / "motion_on" / None for what was just said."""
+    if not text:
+        return None
+    if _MANNER_OFF_RE.search(text):
+        return "motion_on"
+    if _MANNER_ON_RE.search(text):
+        return "motion_off"
+    return None
+
+
+def set_pending_command(device_id: str, command: Optional[str]) -> None:
+    if not device_id:
+        return
+    with _pending_command_lock:
+        if command:
+            _pending_command[device_id] = command
+        else:
+            _pending_command.pop(device_id, None)
+
+
+def take_pending_command(device_id: str) -> Optional[str]:
+    with _pending_command_lock:
+        return _pending_command.pop(device_id, None)
+
 
 def _split_emotion_tag(text: str) -> tuple[str, Optional[str]]:
     """Pulls a leading [happy]/[sad]/[neutral] tag off a reply.
@@ -1188,6 +1222,11 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
     if not isinstance(text, str) or not text or len(text.encode("utf-8")) > MAX_INPUT_BYTES:
         return _result(400, "invalid_input")
 
+    command = detect_manner_command(text)
+    if command:
+        set_pending_command(payload["device_id"], command)
+        _log(f"gateway manner command={command}")
+
     provider = env.get("AI_PROVIDER", "mock").lower()
     if provider == "gemini" and _gemini_streaming_enabled(env):
         # Owns TTS/enqueue itself (per completed sentence, as they arrive)
@@ -1401,9 +1440,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(raw)
 
-    def _send_audio(self, audio: bytes, emotion: Optional[str] = None) -> None:
+    def _send_audio(self, audio: bytes, emotion: Optional[str] = None,
+                    command: Optional[str] = None) -> None:
         self.send_response(200)
         self.send_header("Content-Type", "audio/L16;rate=24000;channels=1")
+        # Rides with the reply that acknowledges it, so "manner mode please"
+        # and the device going still happen at the same moment.
+        if command:
+            self.send_header("X-Tachikoma-Command", command)
         # Rides along with the audio it belongs to, so the device starts the
         # motion at the same moment it starts speaking. Sending it on the
         # /v1/chat response instead would arrive a turn too late: the device
@@ -1435,7 +1479,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
             if audio is None:
                 self._send_no_content()
             else:
-                self._send_audio(audio, take_pending_emotion(device_id))
+                self._send_audio(audio, take_pending_emotion(device_id),
+                                 take_pending_command(device_id))
         else:
             self._send(404, {"error": "not_found"})
 

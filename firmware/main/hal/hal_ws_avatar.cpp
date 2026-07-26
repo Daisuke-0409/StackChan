@@ -13,6 +13,8 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <jpg/image_to_jpeg.h>
+#include <mutex>
+#include "camera_guard.h"
 #include <wifi_station.h>
 #include <ArduinoJson.hpp>
 #include <settings.h>
@@ -389,33 +391,39 @@ public:
             return;
         }
 
-        _time_count = esp_timer_get_time();
-        if (camera->StreamCaptures()) {
-            _interval = esp_timer_get_time() - _time_count;
-            mclog::info("camera capture time: {} ms", _interval / 1000);
-
-            const uint8_t* frameData = camera->GetFrameData();
-            size_t frameSize         = camera->GetFrameSize();
-            int width                = camera->GetFrameWidth();
-            int height               = camera->GetFrameHeight();
-            int format               = camera->GetFrameFormat();
-
-            uint8_t* jpeg_data = nullptr;
-            size_t jpeg_len    = 0;
-
-            // 压缩为 JPEG
+        uint8_t* jpeg_data = nullptr;
+        size_t jpeg_len    = 0;
+        {
+            // Held across capture *and* encode: GetFrameData() points into
+            // the buffer StreamCaptures() just reallocated, and the face
+            // tracker calls the same camera. See hal/camera_guard.h.
+            std::lock_guard<std::mutex> camera_lock(stackchan::hal::GetCameraMutex());
             _time_count = esp_timer_get_time();
-            if (image_to_jpeg((uint8_t*)frameData, frameSize, width, height, (v4l2_pix_fmt_t)format, 20, &jpeg_data,
-                              &jpeg_len)) {
+            if (camera->StreamCaptures()) {
                 _interval = esp_timer_get_time() - _time_count;
-                // mclog::info("jpeg encode time: {} ms, size: {}", _interval / 1000, jpeg_len);
-                mclog::info("jpeg encode time: {} ms", _interval / 1000);
+                mclog::info("camera capture time: {} ms", _interval / 1000);
 
-                if (jpeg_data) {
-                    sendPacket(DataType::Jpeg, jpeg_data, jpeg_len);  // Type 2 for JPEG
-                    free(jpeg_data);
+                const uint8_t* frameData = camera->GetFrameData();
+                size_t frameSize         = camera->GetFrameSize();
+                int width                = camera->GetFrameWidth();
+                int height               = camera->GetFrameHeight();
+                int format               = camera->GetFrameFormat();
+
+                // 压缩为 JPEG
+                _time_count = esp_timer_get_time();
+                if (image_to_jpeg((uint8_t*)frameData, frameSize, width, height, (v4l2_pix_fmt_t)format, 20, &jpeg_data,
+                                  &jpeg_len)) {
+                    _interval = esp_timer_get_time() - _time_count;
+                    mclog::info("jpeg encode time: {} ms", _interval / 1000);
                 }
             }
+        }
+        // Outside the lock: the JPEG is our own buffer now, and sending it
+        // can block for as long as the socket wants without holding the
+        // camera away from the tracker.
+        if (jpeg_data) {
+            sendPacket(DataType::Jpeg, jpeg_data, jpeg_len);  // Type 2 for JPEG
+            free(jpeg_data);
         }
     }
 

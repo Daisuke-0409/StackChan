@@ -18,6 +18,7 @@
 
 #include "hal/audio_codec_guard.h"
 #include "hal/hal.h"
+#include "face_tracker.h"
 #include "stackchan/motion/tachikoma_motion.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
@@ -48,10 +49,14 @@ constexpr char kSettingsNamespace[] = "tachi_speak";  // NVS namespace <= 15 cha
 // TachikomaReaction; anything unrecognized is ignored and the device just
 // speaks without moving, which is the safe default.
 constexpr char kEmotionHeader[] = "X-Tachikoma-Emotion";
+// Manner mode arrives the same way: on the reply that acknowledges it, so
+// the device goes still exactly as it says it will.
+constexpr char kCommandHeader[] = "X-Tachikoma-Command";
 
 struct HttpBuffer {
     std::string body;
     std::string emotion;
+    std::string command;
     bool overflowed = false;
 };
 
@@ -62,8 +67,12 @@ esp_err_t HttpEvent(esp_http_client_event_t* event)
         return ESP_OK;
     }
     if (event->event_id == HTTP_EVENT_ON_HEADER && event->header_key != nullptr &&
-        event->header_value != nullptr && strcasecmp(event->header_key, kEmotionHeader) == 0) {
-        buffer->emotion = event->header_value;
+        event->header_value != nullptr) {
+        if (strcasecmp(event->header_key, kEmotionHeader) == 0) {
+            buffer->emotion = event->header_value;
+        } else if (strcasecmp(event->header_key, kCommandHeader) == 0) {
+            buffer->command = event->header_value;
+        }
     }
     if (event->event_id == HTTP_EVENT_ON_DATA && event->data != nullptr) {
         if (buffer->body.size() + event->data_len > kMaxAudioBytes) {
@@ -90,6 +99,28 @@ esp_err_t HttpEvent(esp_http_client_event_t* event)
 // TachikomaStateManager::CheckOneShotCompletion() only raises
 // ReactionFinished when the state actually is Reacting, so completing here
 // is silent. The state machine stays in Speaking from start to finish.
+// Manner mode stops the body, not the conversation: state transitions and
+// speech carry on exactly as before, only the servos stay put. Held here
+// rather than in the motion layer so a reboot clears it -- a robot that
+// silently stayed frozen after a power cycle would just look broken.
+void ApplyCommand(const std::string& command)
+{
+    if (command.empty()) {
+        return;
+    }
+    if (command == "motion_off") {
+        tachikoma_motion::SetMotionSuppressed(true);
+        GetFaceTracker().SetMotionAllowed(false);
+        mclog::tagInfo(kTag, "manner mode ON: body still, voice unchanged");
+    } else if (command == "motion_on") {
+        tachikoma_motion::SetMotionSuppressed(false);
+        GetFaceTracker().SetMotionAllowed(true);
+        mclog::tagInfo(kTag, "manner mode OFF");
+    } else {
+        mclog::tagWarn(kTag, "unknown command header value, ignoring");
+    }
+}
+
 void PlayEmotionMotion(const std::string& emotion)
 {
     if (emotion.empty()) {
@@ -338,6 +369,9 @@ bool SpeechAnnouncer::FetchAndPlay(const SpeechQueueConfig& config, bool& had_au
     // AudioService instead) if this is ever extended to long or continuous
     // audio output.
     auto& state = tachikoma_state::GetTachikomaStateManager();
+    // Command before speech: "manner mode please" should take effect on the
+    // very reply that acknowledges it, not the one after.
+    ApplyCommand(buffer.command);
     // SpeechStarted first: it sets the Speaking state, and the state change
     // applies that state's loop motion. Playing the emotion after means the
     // one-shot is layered on the loop it should return to.

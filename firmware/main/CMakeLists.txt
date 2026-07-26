@@ -374,6 +374,15 @@ endif()
 # Optional development-only provisioning for the push-to-talk transcribe
 # queue (Phase 5 Step 5/6). Shares TACHIKOMA_DEVICE_TOKEN for the same reason
 # as the speech queue above.
+# Optional development-only provisioning for the face-tracking / vision
+# endpoint. Shares TACHIKOMA_DEVICE_TOKEN for the same reason as the others.
+set(TACHIKOMA_VISION_URL "" CACHE STRING "Development vision endpoint URL")
+if(DEVELOPMENT_BUILD AND TACHIKOMA_VISION_URL AND TACHIKOMA_DEVICE_TOKEN)
+    target_compile_definitions(${COMPONENT_LIB} PRIVATE
+        TACHIKOMA_VISION_URL="${TACHIKOMA_VISION_URL}"
+        TACHIKOMA_DEVICE_TOKEN="${TACHIKOMA_DEVICE_TOKEN}")
+endif()
+
 set(TACHIKOMA_TRANSCRIBE_QUEUE_URL "" CACHE STRING "Development transcribe queue URL")
 if(DEVELOPMENT_BUILD AND TACHIKOMA_TRANSCRIBE_QUEUE_URL AND TACHIKOMA_DEVICE_TOKEN)
     target_compile_definitions(${COMPONENT_LIB} PRIVATE

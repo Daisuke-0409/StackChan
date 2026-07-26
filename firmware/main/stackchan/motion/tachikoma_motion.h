@@ -69,6 +69,13 @@ ServoMotion& GetServoMotion();
 void SetMotion(MotionType motion);
 void PlayMotion(MotionType motion);
 void StopMotion();
+
+// Manner mode. Suppresses servo commands only: the motion state machine,
+// the display, state transitions and speech all carry on untouched, so the
+// device still converses normally -- it just holds still while doing it.
+// Not persisted, so a power cycle always returns to moving.
+void SetMotionSuppressed(bool suppressed);
+bool IsMotionSuppressed();
 MotionType GetCurrentMotion();
 bool IsMotionPlaying();
 

@@ -303,9 +303,33 @@ void MotionController::UpdateDevelopmentTestSequence(uint32_t now)
 #endif
 }
 
+namespace {
+// Plain bool rather than atomic: written from the announcer's worker task,
+// read from the update task, and a tick's worth of staleness on a
+// "hold still" flag is not worth a barrier.
+volatile bool g_motion_suppressed = false;
+}  // namespace
+
+void SetMotionSuppressed(bool suppressed)
+{
+    g_motion_suppressed = suppressed;
+}
+
+bool IsMotionSuppressed()
+{
+    return g_motion_suppressed;
+}
+
 void ServoMotion::Apply(const MotionFrame& frame, stackchan::motion::Motion& motion)
 {
     if (frame.servo_command_sequence == last_command_sequence_ || motion.isModifyLocked()) {
+        return;
+    }
+    if (g_motion_suppressed) {
+        // Consume the sequence anyway: on leaving manner mode the head
+        // should pick up the motion running *then*, not replay whatever
+        // frame it was holding when the mode was switched on.
+        last_command_sequence_ = frame.servo_command_sequence;
         return;
     }
 
