@@ -205,26 +205,34 @@ void FaceTracker::Update(uint32_t now)
     RunOnce(now);
 }
 
+void FaceTracker::ReportError(FaceTrackerErrorCode error, const char* detail)
+{
+    // Only on a change. This runs every few seconds forever, so logging each
+    // occurrence would bury the device log -- but staying silent is worse:
+    // the first build of this shipped with every failure path returning
+    // quietly, and a tracker that simply never posted looked identical to
+    // one that was working and seeing nobody.
+    bool changed = false;
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        changed     = last_error_ != error;
+        last_error_ = error;
+    }
+    if (changed) {
+        mclog::tagWarn(kTag, "not tracking: {}", detail);
+    }
+}
+
 void FaceTracker::RunOnce(uint32_t now)
 {
     (void)now;
     const auto config = LoadConfig();
     if (config.endpoint.empty() || config.device_token.empty()) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        last_error_ = FaceTrackerErrorCode::NotConfigured;
+        ReportError(FaceTrackerErrorCode::NotConfigured, "no vision endpoint provisioned in NVS");
         return;
     }
     if (!IsNetworkStackReady(esp_netif_get_nr_of_ifs())) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        last_error_ = FaceTrackerErrorCode::NetworkUnavailable;
-        return;
-    }
-
-    size_t jpeg_len = 0;
-    uint8_t* jpeg = CaptureJpeg(jpeg_len);
-    if (jpeg == nullptr || jpeg_len == 0) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        last_error_ = FaceTrackerErrorCode::EncodeFailed;
+        ReportError(FaceTrackerErrorCode::NetworkUnavailable, "network stack not up yet");
         return;
     }
 
@@ -235,12 +243,20 @@ void FaceTracker::RunOnce(uint32_t now)
         generation = ++generation_;
     }
 
-    // The upload blocks for as long as the network takes, which must not
-    // happen on the shared update task -- that task also drives LVGL, the
-    // state machine and the motion loop.
-    auto* args = new WorkerArgs{this, config, jpeg, jpeg_len, generation};
+    // Capture, encode and upload all happen on the worker, and none of them
+    // may happen here.
+    //
+    // The first version of this captured and JPEG-encoded inline. RunOnce()
+    // is called from the shared update task, which is holding LvglLockGuard
+    // for the whole iteration and also drives the state machine, the speech
+    // announcer's polling and the motion loop. StreamCaptures() blocks on
+    // VIDIOC_DQBUF until a frame arrives, and if the pipeline is not
+    // actually delivering frames it does not come back -- which stalled the
+    // entire task. Observed on hardware: the device stopped polling the
+    // gateway altogether and could no longer hold a conversation, while
+    // still looking alive because heap logging runs on a different task.
+    auto* args = new WorkerArgs{this, config, nullptr, 0, generation};
     if (xTaskCreate(&FaceTracker::WorkerTask, "face_tracker", 6144, args, 2, nullptr) != pdPASS) {
-        free(jpeg);
         delete args;
         std::lock_guard<std::mutex> lock(mutex_);
         busy_       = false;
@@ -253,6 +269,28 @@ void FaceTracker::WorkerTask(void* arg)
     auto* args    = static_cast<WorkerArgs*>(arg);
     auto* tracker = args->tracker;
     auto error    = FaceTrackerErrorCode::None;
+
+    if (hal_bridge::board_get_camera() == nullptr) {
+        tracker->ReportError(FaceTrackerErrorCode::CameraUnavailable, "board has no camera instance");
+        {
+            std::lock_guard<std::mutex> lock(tracker->mutex_);
+            tracker->busy_ = false;
+        }
+        delete args;
+        vTaskDelete(nullptr);
+        return;
+    }
+    args->jpeg = CaptureJpeg(args->jpeg_len);
+    if (args->jpeg == nullptr || args->jpeg_len == 0) {
+        tracker->ReportError(FaceTrackerErrorCode::EncodeFailed, "capture or jpeg encode failed");
+        {
+            std::lock_guard<std::mutex> lock(tracker->mutex_);
+            tracker->busy_ = false;
+        }
+        delete args;
+        vTaskDelete(nullptr);
+        return;
+    }
 
     HttpBuffer buffer;
     esp_http_client_config_t http_config = {};
@@ -308,7 +346,11 @@ void FaceTracker::WorkerTask(void* arg)
     {
         std::lock_guard<std::mutex> lock(tracker->mutex_);
         if (args->generation == tracker->generation_) {
-            tracker->busy_      = false;
+            tracker->busy_ = false;
+            if (tracker->last_error_ != error) {
+                mclog::tagInfo(kTag, "vision post {}", error == FaceTrackerErrorCode::None
+                                                            ? "ok" : "failed");
+            }
             tracker->last_error_ = error;
         }
     }

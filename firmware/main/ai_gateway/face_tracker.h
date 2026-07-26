@@ -68,6 +68,7 @@ private:
     FaceTracker() = default;
 
     void RunOnce(uint32_t now);
+    void ReportError(FaceTrackerErrorCode error, const char* detail);
     static void WorkerTask(void* arg);
 
     mutable std::mutex mutex_;
