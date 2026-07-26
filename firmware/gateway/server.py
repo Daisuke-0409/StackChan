@@ -1647,10 +1647,15 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
 
     t_stt_start = time.monotonic()
     status, body = _stt_response(bytes(audio), sample_rate, env)
+    stt_ms = (time.monotonic() - t_stt_start) * 1000
+    # Timing always, content only when debugging. STT is the largest single
+    # component of the wait and it scales with how long the clip is, so
+    # "why does it feel slower today" is answerable from the log rather than
+    # from guesswork -- but the words themselves stay out of it.
+    _log(f"gateway transcribe status={status} audio_s={duration_s:.1f} stt_ms={stt_ms:.0f}")
     if debug:
-        stt_ms = (time.monotonic() - t_stt_start) * 1000
         detail = repr(body.get("text")) if status == 200 else body.get("error")
-        _log(f"gateway debug transcribe status={status} stt_ms={stt_ms:.0f} text={detail}")
+        _log(f"gateway debug transcribe text={detail}")
 
     if status == 200 and _speaker_id_enabled(env):
         # Synchronous on purpose. The chat request that decides what memory

@@ -299,6 +299,10 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
         last_error_ = VoiceInputErrorCode::None;
     }
 
+    // A deliberate press ends any hands-free window: the press path takes
+    // the mic itself, and leaving the window open would have two owners.
+    CloseFollowUp("press");
+
     // Stop xiaozhi's own wake-word/processor task from also reading the
     // mic for the duration of this recording -- see
     // AudioService::SetAudioInputPaused()'s declaration for why both
@@ -363,6 +367,21 @@ void VoiceInputController::ConnectHeadTouchTrigger()
 
 void VoiceInputController::OpenFollowUp(uint32_t now)
 {
+    // The mic has to stay on to hear anybody. StopRecordingAndUpload turns
+    // the codec input off and hands the mic back to AudioService, which is
+    // right after a press-to-talk turn and wrong here: the window opened,
+    // reported itself open, and then heard nothing at all because there was
+    // no input to read. Take the mic back for as long as the conversation
+    // is held open, and give it back in CloseFollowUp.
+    Application::GetInstance().GetAudioService().SetAudioInputPaused(true);
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec != nullptr) {
+        std::lock_guard<std::mutex> codec_lock(stackchan::hal::GetAudioCodecMutex());
+        codec->EnableOutput(false);
+        codec->EnableInput(false);
+        codec->EnableInput(true);
+    }
+
     std::lock_guard<std::mutex> lock(mutex_);
     const bool was_open = follow_up_open_;
     follow_up_open_     = true;
@@ -390,9 +409,15 @@ void VoiceInputController::CloseFollowUp(const char* why)
         follow_up_preroll_.clear();
         follow_up_preroll_.shrink_to_fit();
     }
-    if (was_open) {
-        mclog::tagInfo(kTag, "conversation closed: {}", why);
+    if (!was_open) {
+        return;
     }
+    auto* codec = Board::GetInstance().GetAudioCodec();
+    if (codec != nullptr) {
+        codec->EnableInput(false);
+    }
+    Application::GetInstance().GetAudioService().SetAudioInputPaused(false);
+    mclog::tagInfo(kTag, "conversation closed: {}", why);
 }
 
 void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>& frame)
