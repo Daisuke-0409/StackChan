@@ -37,9 +37,6 @@ constexpr char kSettingsNamespace[] = "tachi_vision";  // NVS namespace <= 15 ch
 // Fast enough that the head follows rather than lurches after; slow enough
 // that a 320x240 JPEG upload and a round trip fit comfortably inside it.
 constexpr uint32_t kActivePollIntervalMs = 700;
-// While idle the point is only to notice that somebody has walked up, not to
-// track them. Rare on purpose: this is a camera in someone's home.
-constexpr uint32_t kIdlePollIntervalMs = 6000;
 
 // Below this the face is too small to be the person being spoken to -- more
 // likely someone crossing the room behind them -- and chasing it would make
@@ -191,6 +188,15 @@ void FaceTracker::Update(uint32_t now)
         state == tachikoma_state::TachikomaState::Booting) {
         return;
     }
+    // Only while a conversation is happening. Tracking faces at rest meant
+    // the head turned toward whoever walked past, which reads as the robot
+    // moving for no reason -- and every one of those turns was a current
+    // spike and a shake of the touch sensor on a device that was otherwise
+    // sitting still. Looking up when spoken to is the behaviour worth
+    // having; watching the room is not.
+    if (!conversing) {
+        return;
+    }
 
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -200,7 +206,7 @@ void FaceTracker::Update(uint32_t now)
         if (static_cast<int32_t>(now - next_poll_ms_) < 0) {
             return;
         }
-        next_poll_ms_ = now + (conversing ? kActivePollIntervalMs : kIdlePollIntervalMs);
+        next_poll_ms_ = now + kActivePollIntervalMs;
     }
     RunOnce(now);
 }

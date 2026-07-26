@@ -33,6 +33,7 @@
 #include "ai_gateway/speech_announcer.h"
 #include "hal/audio_codec_guard.h"
 #include "hal/hal.h"
+#include "stackchan/stackchan.h"
 #include "stackchan/state/tachikoma_state_manager.h"
 #include "stackchan/state/tachikoma_state_types.h"
 
@@ -224,6 +225,20 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
     if (static_cast<int32_t>(now - cooldown_until_ms_) < 0) {
         std::lock_guard<std::mutex> lock(mutex_);
         last_error_ = VoiceInputErrorCode::Cooldown;
+        return;
+    }
+    // The head-touch sensor is mounted on the part that moves, so the servos
+    // shake it. The speaker already had this problem (see the cooldown
+    // above); once gestures grew large enough to be worth watching, the
+    // motion did too, and the robot started opening conversations by itself
+    // whenever it turned to look at someone -- "顔を見た瞬間話しかけてくる".
+    //
+    // Recording while the neck is driving would also put servo noise into
+    // the clip, so declining here costs nothing: a real press during a
+    // gesture is a fraction of a second from being possible again.
+    if (GetStackChan().motion().isMoving()) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        last_error_ = VoiceInputErrorCode::Busy;
         return;
     }
 

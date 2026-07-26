@@ -23,14 +23,25 @@ namespace {
 // visible from across a room, still a fifth of the yaw the hardware would
 // allow, and unchanged in speed (kServoSpeed) so nothing moves more
 // abruptly than before, just further.
-constexpr int kServoYawMinTenths   = -750;  // -75 degrees
-constexpr int kServoYawMaxTenths   = 750;   // +75 degrees
+// Backed off from +-75 / 70 after the device began resetting mid-gesture.
+// The symptom was a USB serial port vanishing while open, an uptime counter
+// restarting, and the gateway seeing the device come and go -- a brownout,
+// not a bug in any of the code. Servos pull their largest current at the
+// start of a move, and tripling the travel while raising the spring
+// stiffness eightfold asked for more peak current than the supply could
+// hold up, even on a charger.
+//
+// 45 degrees of yaw still reads clearly across a room; what it does not do
+// is reset the robot. If a future power path can carry more, this is the
+// number to raise, and the way to tell is whether the uptime counter in the
+// device log survives a gesture.
+constexpr int kServoYawMinTenths   = -450;  // -45 degrees
+constexpr int kServoYawMaxTenths   = 450;   // +45 degrees
 constexpr int kServoPitchMinTenths = 30;    // Physical lower limit is +3 degrees
-// Not 3x like yaw: pitch only has 3..87 degrees to work with, and
 // ScsServo::handle_stall permanently narrows the runtime limit for the rest
-// of the session whenever it trips, so crowding the hardware end would cost
-// range rather than gain it. 70 keeps a margin below 87.
-constexpr int kServoPitchMaxTenths = 700;   // +70 degrees
+// of the session whenever it trips, so crowding the hardware end (87) would
+// cost range rather than gain it.
+constexpr int kServoPitchMaxTenths = 480;   // +48 degrees
 // Servo::moveWithSpeed maps this to spring stiffness as
 // k = 10 + (speed/1000)^2 * 640, so it is not a velocity -- it is how hard
 // the servo pulls toward the target. At 140 the stiffness is only ~22, which
@@ -45,7 +56,13 @@ constexpr int kServoPitchMaxTenths = 700;   // +70 degrees
 // 500 -- the same value Motion::lookAtNormalized already defaults to -- for
 // stiffness ~170, settling in about 0.3s, which fits inside their steps.
 constexpr int kServoSpeedAmbient  = 140;
-constexpr int kServoSpeedExpressive = 500;
+// 300, not 500. Stiffness is quadratic in this number (k = 10 + (s/1000)^2 *
+// 640), so 500 gave k~170 against the ambient 22 -- the head snapped between
+// positions rather than moving between them, which is what "ぎこちない、
+// かくばった動き" describes, and each snap is a current spike. 300 gives
+// k~68: still several times the ambient stiffness, so a gesture arrives well
+// inside its step, but it accelerates into the move instead of jumping.
+constexpr int kServoSpeedExpressive = 300;
 constexpr uint32_t kDisplayPeriodMs = 33;   // About 25-30 Hz on the existing 20 ms task.
 constexpr uint32_t kSwitchDurationMs = 350; // Smooth transition between motion types.
 
