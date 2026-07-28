@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import shutil
 import ssl
 import struct
 import tempfile
@@ -163,13 +164,32 @@ _speech_queue_lock = threading.Lock()
 #              reply has already been sent, so remembering costs the user no
 #              waiting.
 #
-# Stored per device under MEMORY_DIR. This is personal data: keep it local,
-# out of git, and out of the access log.
+# Stored under MEMORY_DIR. This is personal data: keep it local, out of git,
+# and out of the access log.
+#
+# One persona, several bodies. The store used to be named after the device
+# (its MAC), which put the project's own premise the wrong way round: a second
+# robot would recognise the same person -- people.json has never been
+# per-device -- and still remember nothing that was ever said to the first
+# one. Same face, same voice, no shared past. Every body now reads and writes
+# the same store; TACHIKOMA_MEMORY_SCOPE=device restores the old split for
+# anyone who genuinely wants two personas rather than one with two bodies.
+#
+# MEMORY_DIR may point at a share (a NAS) so the store outlives any single PC.
+# Run only ONE gateway against a file-backed store: _save_memory() replaces
+# the file atomically on a local filesystem, and that guarantee does not carry
+# across SMB, so two writers would quietly drop each other's turns. Several
+# gateways at once need a database rather than a shared folder.
 MEMORY_DIR = os.environ.get("TACHIKOMA_MEMORY_DIR", os.path.join(os.path.dirname(__file__), "memory"))
+MEMORY_SCOPE = os.environ.get("TACHIKOMA_MEMORY_SCOPE", "shared").strip().lower()
+MEMORY_BRAIN_ID = os.environ.get("TACHIKOMA_BRAIN_ID", "tachikoma").strip() or "tachikoma"
 MEMORY_MAX_TURNS = 20  # 10 exchanges
 MEMORY_MAX_PROFILE_ITEMS = 40
 MEMORY_MAX_FACT_CHARS = 200
 _memory_lock = threading.Lock()
+# Paths whose one-time adoption of a pre-sharing store has been considered.
+# Guarded by _memory_lock, like everything else that touches the store.
+_adopted_legacy: set[str] = set()
 
 PEOPLE_PATH = os.environ.get("TACHIKOMA_PEOPLE_FILE",
                              os.path.join(os.path.dirname(__file__), "memory", "people.json"))
@@ -228,18 +248,78 @@ def current_role(device_id: str) -> str:
     return people.ROLE_UNKNOWN
 
 
+def _memory_key(device_id: str) -> str:
+    """Whose memory a body reads and writes.
+
+    Shared by default, so which robot happens to be in the room stops being
+    part of the robot's identity. The device is still the unit of *routing* --
+    who to speak to, which head to move -- but no longer the unit of memory.
+    """
+    if MEMORY_SCOPE == "device":
+        return device_id
+    return MEMORY_BRAIN_ID
+
+
 def _memory_path(device_id: str) -> str:
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", device_id)[:64] or "unknown"
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", _memory_key(device_id))[:64] or "unknown"
+    # people.json holds every enrolled voiceprint and face, and settings.json
+    # the operator's configuration. A brain id that landed on either would
+    # overwrite it with conversation history and undo every enrolment, so a
+    # brain never gets to own those two names.
+    if f"{safe}.json" in (os.path.basename(PEOPLE_PATH),
+                          os.path.basename(settings_store.SETTINGS_PATH)):
+        safe = f"brain_{safe}"
     return os.path.join(MEMORY_DIR, f"{safe}.json")
 
 
+def _adopt_legacy_device_store(path: str) -> None:
+    """Carry a pre-sharing, device-named store over to the shared one. Once.
+
+    Without this, turning sharing on reads as amnesia rather than as a
+    settings change: the same people are still enrolled, and yet yesterday is
+    gone. Copies rather than moves, so the old file stays put as a fallback.
+
+    Ambiguity is left alone deliberately. Two device stores mean two histories
+    that a machine cannot interleave without inventing an order for them, and
+    guessing wrong here writes a false past into the only place the robot
+    trusts.
+    """
+    if MEMORY_SCOPE == "device" or path in _adopted_legacy:
+        return
+    _adopted_legacy.add(path)
+    if os.path.exists(path):
+        return
+    try:
+        names = [n for n in os.listdir(MEMORY_DIR) if n.endswith(".json")]
+    except OSError:
+        return
+    reserved = {os.path.basename(PEOPLE_PATH),
+                os.path.basename(settings_store.SETTINGS_PATH),
+                os.path.basename(path)}
+    candidates = sorted(n for n in names if n not in reserved)
+    if not candidates:
+        return
+    if len(candidates) > 1:
+        _log(f"gateway memory: {len(candidates)} device stores predate sharing; "
+             f"adopting none, merge by hand to keep that history")
+        return
+    try:
+        shutil.copyfile(os.path.join(MEMORY_DIR, candidates[0]), path)
+    except OSError as exc:
+        _log(f"gateway memory: could not adopt {candidates[0]}: {type(exc).__name__}")
+        return
+    _log(f"gateway memory: adopted {candidates[0]} as the shared store")
+
+
 def _load_memory(device_id: str) -> dict[str, Any]:
+    path = _memory_path(device_id)
+    _adopt_legacy_device_store(path)
     try:
         # utf-8-sig for the same reason as the VOICEVOX dictionary: these
         # files get corrected by hand (a name STT spelled wrong, a fact to
         # drop), and a Windows editor's BOM would otherwise make the whole
         # memory look unreadable and silently start over from empty.
-        with open(_memory_path(device_id), encoding="utf-8-sig") as f:
+        with open(path, encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, ValueError):
         return {"profile": [], "turns": []}

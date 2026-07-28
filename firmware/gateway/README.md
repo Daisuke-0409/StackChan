@@ -162,7 +162,8 @@ Before this, every `/v1/chat` request went to Gemini entirely on its own --
 the moment it finished saying it, and asking about local weather meant
 saying your address every time.
 
-Two layers, kept per device under `gateway/memory/<device_id>.json`:
+Two layers, kept under `gateway/memory/<brain_id>.json` (`tachikoma.json` by
+default -- see *One persona, several bodies* below):
 
 - **turns** -- the last 20 messages (10 exchanges), replayed as conversation
   history so follow-ups resolve against what was just said.
@@ -189,7 +190,39 @@ store.
 
 **This directory holds personal data** (real names, home locations). It is
 gitignored, stays on this machine, and is never written to the access log --
-only the number of facts is logged. Delete a device's file to make it forget.
+only the number of facts is logged. Delete the store to make it forget.
+
+### One persona, several bodies
+
+The store was originally named after the device, which quietly contradicted
+the premise of the project. `people.json` -- who is enrolled, their voice,
+their face, what they may be told -- was never per-device, so a second robot
+would recognise you on sight and still have no idea what you told the first
+one yesterday. Same face, same voice, no shared past.
+
+Every body now reads and writes the same store. The device is still the unit
+of *routing* -- which head speaks, which head moves, who it is currently
+talking to -- but no longer the unit of memory.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `TACHIKOMA_MEMORY_SCOPE` | `shared` | `device` restores the old per-body split |
+| `TACHIKOMA_BRAIN_ID` | `tachikoma` | Store filename, i.e. which persona |
+| `TACHIKOMA_MEMORY_DIR` | `gateway/memory` | Where the store lives |
+
+A store written before sharing existed is adopted automatically the first
+time the shared one is missing: it is *copied*, the original is left alone,
+and the adoption is logged. Two such stores are left alone entirely -- two
+histories cannot be interleaved without inventing an order for them, and
+guessing writes a false past into the one place the robot trusts. Merge those
+by hand.
+
+`TACHIKOMA_MEMORY_DIR` may point at a network share so the store outlives any
+one PC, but **run only one gateway against a file-backed store**.
+`_save_memory()` writes to a temporary file and renames it, which is atomic
+on a local filesystem and not across SMB; two gateways would silently drop
+each other's turns. Several gateways at once need a database, not a shared
+folder -- that is the Phase 8 NAS work, not this.
 
 ## Web search
 
