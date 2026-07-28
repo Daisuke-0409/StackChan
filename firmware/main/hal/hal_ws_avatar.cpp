@@ -13,6 +13,7 @@
 #include <esp_log.h>
 #include <arpa/inet.h>
 #include <jpg/image_to_jpeg.h>
+#include <chrono>
 #include <mutex>
 #include "camera_guard.h"
 #include <wifi_station.h>
@@ -397,9 +398,14 @@ public:
             // Held across capture *and* encode: GetFrameData() points into
             // the buffer StreamCaptures() just reallocated, and the face
             // tracker calls the same camera. See hal/camera_guard.h.
-            std::lock_guard<std::mutex> camera_lock(stackchan::hal::GetCameraMutex());
+            //
+            // Bounded: a stuck face-tracker capture must cost this stream a
+            // frame, not freeze the video for good.
+            std::unique_lock<std::timed_mutex> camera_lock(
+                stackchan::hal::GetCameraMutex(),
+                std::chrono::milliseconds(stackchan::hal::kCameraLockTimeoutMs));
             _time_count = esp_timer_get_time();
-            if (camera->StreamCaptures()) {
+            if (camera_lock.owns_lock() && camera->StreamCaptures()) {
                 _interval = esp_timer_get_time() - _time_count;
                 mclog::info("camera capture time: {} ms", _interval / 1000);
 

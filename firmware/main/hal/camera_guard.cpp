@@ -7,9 +7,9 @@
 
 namespace stackchan::hal {
 
-std::mutex& GetCameraMutex()
+std::timed_mutex& GetCameraMutex()
 {
-    static std::mutex mutex;
+    static std::timed_mutex mutex;
     return mutex;
 }
 

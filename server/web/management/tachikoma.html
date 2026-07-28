@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>タチコマ</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 12px;
+    font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", sans-serif;
+    background: #12141a; color: #e8eaf0;
+  }
+  h1 { font-size: 17px; margin: 0 0 10px; font-weight: 600; }
+  #status { font-size: 13px; padding: 7px 10px; border-radius: 7px; background: #1e2129; margin-bottom: 10px; }
+  #status.ok  { background: #14361f; color: #7fe0a0; }
+  #status.bad { background: #3a1a1a; color: #ffa0a0; }
+  #view {
+    width: 100%; aspect-ratio: 4 / 3; background: #000; border-radius: 10px;
+    object-fit: contain; display: block; border: 1px solid #2a2e38;
+  }
+  #meta { font-size: 11px; color: #8890a0; margin: 6px 2px 12px; font-variant-numeric: tabular-nums; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+  button {
+    flex: 1 1 auto; min-width: 104px; min-height: 46px;
+    font-size: 14px; font-family: inherit;
+    border: 1px solid #333845; border-radius: 9px;
+    background: #1c2029; color: #e8eaf0; cursor: pointer;
+  }
+  button:active { background: #2a3040; }
+  button:disabled { opacity: .4; cursor: default; }
+  button.on { background: #1d4a2c; border-color: #2f7a47; }
+  h2 { font-size: 12px; color: #8890a0; margin: 16px 2px 7px; font-weight: 600; letter-spacing: .04em; }
+  #log {
+    font-family: ui-monospace, Consolas, monospace; font-size: 11px; line-height: 1.55;
+    background: #0d0f14; border: 1px solid #22262f; border-radius: 8px;
+    padding: 8px; height: 128px; overflow-y: auto; white-space: pre-wrap; color: #97a0b0;
+  }
+</style>
+</head>
+<body>
+
+<h1>タチコマ</h1>
+<div id="status">接続していません</div>
+
+<img id="view" alt="タチコマのカメラ映像">
+<div id="meta">映像なし</div>
+
+<h2>カメラ</h2>
+<div class="row">
+  <button id="btnCam">映像を開始</button>
+  <button id="btnShot">1枚撮る</button>
+</div>
+
+<h2>ダンス・モーション</h2>
+<div class="row">
+  <button data-look="0,0">正面</button>
+  <button data-look="-1,0">左</button>
+  <button data-look="1,0">右</button>
+  <button data-look="0,1">上</button>
+  <button data-look="0,-1">下</button>
+</div>
+<div class="row">
+  <button id="btnDance">ダンス</button>
+  <button id="btnName">名前を取得</button>
+</div>
+
+<h2>ログ</h2>
+<div id="log"></div>
+
+<script>
+// The device's MAC: the server keys every client pool on it, and an App client
+// says which StackChan it wants by presenting a token for that MAC.
+const MAC = "80:45:6B:4D:E7:AC";
+
+// Server's RSA public half. Not a secret -- the private key only exists in the
+// server's config, outside the repository. The page encrypts with it exactly
+// the way the firmware does, so the server cannot tell us apart from a device.
+const SERVER_PUBLIC_KEY_PEM = `-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAiaExoh8NomaHUP7ScuK/
+LQh1gZF6/7gmr8Apblwt3NiE6ebtwUUzq63Kf9QJZaWWV1uQ2EmiwTVjfdzfmVcJ
+mNMlh7n19ZOIv9oTwQapTOpMP8n5DAtM/ipYWrA7IbElOMhggCPtamtdDTWRlxq5
+hm2myzGmv9Dgn4VvyeEPARQzNLYPpnRvdJ7LR11CWZ5xSWT0eRFUzpJhF8ZS9W8P
+xB9fv+9/esSCID0ERerYvpgheOEgGCke/ogWQJrHY7tju1DGm2tFPIvOrToLrPyz
+XZcixENN4m8IcodjxWX9Fw0e+khfBm3nOkr6ksQ0fqCHNdtU7Lcg0F/EmwfJyHQj
+MQIDAQAB
+-----END PUBLIC KEY-----`;
+
+const T = {
+  Jpeg: 0x02, ControlAvatar: 0x03, ControlMotion: 0x04,
+  OnCamera: 0x05, OffCamera: 0x06, TextMessage: 0x07,
+  GetDeviceName: 0x0E, Ping: 0x10, Pong: 0x11,
+  Dance: 0x14, DeviceOffline: 0x16, DeviceOnline: 0x17,
+  AimedTakePhoto: 0x1A,
+};
+
+const $ = id => document.getElementById(id);
+const logEl = $("log");
+function log(msg) {
+  const t = new Date().toLocaleTimeString("ja-JP");
+  logEl.textContent += `[${t}] ${msg}\n`;
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setStatus(text, kind) {
+  const el = $("status");
+  el.textContent = text;
+  el.className = kind || "";
+}
+
+function pemToArrayBuffer(pem) {
+  const b64 = pem.replace(/-----[^-]+-----/g, "").replace(/\s+/g, "");
+  const raw = atob(b64);
+  const buf = new Uint8Array(raw.length);
+  for (let i = 0; i < raw.length; i++) buf[i] = raw.charCodeAt(i);
+  return buf.buffer;
+}
+
+// Same construction as secret_logic.cpp on the device:
+//   base64(RSA-OAEP-SHA256("<mac>|<nonce>|<unix seconds>"))
+// The server allows +/-10s, so this is minted immediately before connecting
+// and is useless to anyone by the time it reaches a log file.
+async function mintToken() {
+  const key = await crypto.subtle.importKey(
+    "spki", pemToArrayBuffer(SERVER_PUBLIC_KEY_PEM),
+    { name: "RSA-OAEP", hash: "SHA-256" }, false, ["encrypt"]);
+  const nonce = [...crypto.getRandomValues(new Uint8Array(6))]
+    .map(b => b.toString(16).padStart(2, "0")).join("");
+  const plain = `${MAC}|${nonce}|${Math.floor(Date.now() / 1000)}`;
+  const cipher = await crypto.subtle.encrypt(
+    { name: "RSA-OAEP" }, key, new TextEncoder().encode(plain));
+  return btoa(String.fromCharCode(...new Uint8Array(cipher)));
+}
+
+let ws = null;
+let cameraOn = false;
+let frames = 0, bytes = 0, lastShown = 0;
+let lastObjectUrl = null;
+
+// [type:1][length:4 big endian][payload]
+function frame(type, payload) {
+  const body = payload ? (payload instanceof Uint8Array ? payload
+                                                        : new TextEncoder().encode(payload))
+                       : new Uint8Array(0);
+  const out = new Uint8Array(5 + body.length);
+  out[0] = type;
+  new DataView(out.buffer).setUint32(1, body.length, false);
+  out.set(body, 5);
+  return out;
+}
+function send(type, payload) {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { log("未接続のため送信できません"); return; }
+  ws.send(frame(type, payload));
+}
+
+async function connect() {
+  setStatus("トークンを生成中…");
+  let token;
+  try {
+    token = await mintToken();
+  } catch (e) {
+    setStatus("トークン生成に失敗: " + e.message, "bad");
+    log("mintToken failed: " + e);
+    // WebCrypto is only exposed on secure origins; plain http://<ip> is not
+    // one of them, which is the usual cause here.
+    if (!window.isSecureContext) {
+      log("このページは secure context ではありません。http://<IP> だと WebCrypto が使えません。");
+      log("localhost で開くか、HTTPS 化が必要です。");
+    }
+    return;
+  }
+
+  const deviceId = "browser-" + Math.random().toString(36).slice(2, 8);
+  const proto = location.protocol === "https:" ? "wss" : "ws";
+  const url = `${proto}://${location.host}/stackChan/ws`
+            + `?deviceType=App&deviceId=${encodeURIComponent(deviceId)}`
+            + `&token=${encodeURIComponent(token)}`;
+
+  setStatus("接続中…");
+  ws = new WebSocket(url);
+  ws.binaryType = "arraybuffer";
+
+  ws.onopen = () => { setStatus("接続しました", "ok"); log("connected as " + deviceId); };
+  ws.onclose = e => { setStatus("切断されました (code " + e.code + ")", "bad"); log("closed " + e.code); ws = null; cameraOn = false; $("btnCam").classList.remove("on"); $("btnCam").textContent = "映像を開始"; };
+  ws.onerror = () => { setStatus("接続エラー", "bad"); log("websocket error"); };
+
+  ws.onmessage = ev => {
+    if (typeof ev.data === "string") { log("text: " + ev.data); return; }
+    const buf = new Uint8Array(ev.data);
+    if (buf.length < 5) return;
+    const type = buf[0];
+    const body = buf.subarray(5);
+
+    if (type === T.Jpeg) {
+      frames++; bytes += body.length;
+      const now = performance.now();
+      // Repainting every frame on a phone is wasted work; ~20fps is plenty.
+      if (now - lastShown > 50) {
+        lastShown = now;
+        if (lastObjectUrl) URL.revokeObjectURL(lastObjectUrl);
+        lastObjectUrl = URL.createObjectURL(new Blob([body], { type: "image/jpeg" }));
+        $("view").src = lastObjectUrl;
+      }
+      $("meta").textContent = `${frames} フレーム / ${(bytes / 1024).toFixed(0)} KB / 最新 ${(body.length / 1024).toFixed(1)} KB`;
+      return;
+    }
+    if (type === T.Ping) { send(T.Pong); return; }
+    if (type === T.DeviceOnline)  { log("タチコマ: オンライン"); return; }
+    if (type === T.DeviceOffline) { log("タチコマ: オフライン（実機が繋がっていません）"); return; }
+    log(`recv type=0x${type.toString(16).padStart(2, "0")} len=${body.length}`
+        + (body.length && body.length < 120 ? " " + new TextDecoder().decode(body) : ""));
+  };
+}
+
+$("btnCam").onclick = () => {
+  cameraOn = !cameraOn;
+  // The whole payload is the MAC for these two: the server does
+  // getStackChanClient(string(payload)) to find which device to subscribe to,
+  // so it has to be the same colon-separated form the token carries. Sending
+  // an empty payload looks up "" and is silently dropped.
+  send(cameraOn ? T.OnCamera : T.OffCamera, MAC);
+  $("btnCam").classList.toggle("on", cameraOn);
+  $("btnCam").textContent = cameraOn ? "映像を停止" : "映像を開始";
+  log(cameraOn ? "カメラON要求" : "カメラOFF要求");
+};
+$("btnShot").onclick = () => { send(T.AimedTakePhoto); log("撮影要求"); };
+$("btnName").onclick = () => { send(T.GetDeviceName); log("名前を要求"); };
+
+// Movement goes through Dance, not ControlMotion.
+//
+// ControlMotion is unusable from a browser here: the server reads the target
+// MAC as payload[:12], but the client pool is keyed on the colon-separated MAC
+// the token carries ("80:45:6B:4D:E7:AC", 17 chars), so a 12-byte slice can
+// never match and the message is dropped. Dance routes by the MAC the client
+// authenticated with and needs no prefix at all.
+//
+// A dance is an array of keyframes and a keyframe carries yawServo/pitchServo,
+// so a single-keyframe "dance" is just a servo move. Angles are tenths of a
+// degree, matching the {"angle":450,"speed":900} in the server README.
+function moveHead(yawTenths, pitchTenths, durationMs = 600) {
+  send(T.Dance, JSON.stringify([{
+    yawServo:   { angle: yawTenths,   speed: 700 },
+    pitchServo: { angle: pitchTenths, speed: 700 },
+    durationMs: durationMs,
+  }]));
+}
+
+document.querySelectorAll("[data-look]").forEach(b => {
+  b.onclick = () => {
+    const [x, y] = b.dataset.look.split(",").map(Number);
+    const yaw = x * 350;      // ~35 degrees left/right
+    const pitch = 450 + y * 200;  // 450 is level, per the README example
+    moveHead(yaw, pitch);
+    log(`首を動かす yaw=${yaw} pitch=${pitch}`);
+  };
+});
+
+$("btnDance").onclick = () => {
+  const seq = [
+    { yawServo: { angle: -300, speed: 900 }, pitchServo: { angle: 450, speed: 900 }, durationMs: 400 },
+    { yawServo: { angle:  300, speed: 900 }, pitchServo: { angle: 550, speed: 900 }, durationMs: 400 },
+    { yawServo: { angle: -200, speed: 900 }, pitchServo: { angle: 350, speed: 900 }, durationMs: 400 },
+    { yawServo: { angle:  200, speed: 900 }, pitchServo: { angle: 550, speed: 900 }, durationMs: 400 },
+    { yawServo: { angle:    0, speed: 700 }, pitchServo: { angle: 450, speed: 700 }, durationMs: 600 },
+  ];
+  send(T.Dance, JSON.stringify(seq));
+  log(`ダンス要求 (${seq.length} キーフレーム)`);
+};
+
+connect();
+</script>
+</body>
+</html>

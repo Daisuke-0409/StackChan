@@ -924,6 +924,19 @@ def process_vision(image_bytes: bytes, headers: dict[str, str] | None = None,
         return _result(401, "authentication_failed")
     if not image_bytes:
         return _result(400, "invalid_input")
+
+    # Debug aid: keep the most recent frame on disk so the operator can see
+    # what the camera actually sees. Off by default and gitignored -- a frame
+    # is a photograph of whoever is in the room, which is the same personal
+    # data the memory store and the logs are careful not to leak.
+    if env.get("TACHIKOMA_SAVE_VISION_FRAMES") == "1":
+        try:
+            with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "last_frame.jpg"), "wb") as handle:
+                handle.write(image_bytes)
+        except OSError:
+            pass  # A debug aid must never take the vision endpoint down.
+
     if not biometrics.face_available():
         return _result(503, "server_error")
 

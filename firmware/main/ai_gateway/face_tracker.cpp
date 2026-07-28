@@ -7,6 +7,7 @@
 
 #include <board.h>
 #include <cJSON.h>
+#include <chrono>
 #include <cstring>
 #include <esp_crt_bundle.h>
 #include <esp_heap_caps.h>
@@ -47,6 +48,28 @@ constexpr float kMinFaceAreaRatio = 0.010f;
 // breath the person takes.
 constexpr float kDeadzone = 0.08f;
 constexpr int kLookSpeed = 400;
+
+// Turning the head to follow a face is off, and the recognition half of this
+// file is not.
+//
+// The head-touch sensor is mounted on the part that moves, so a turn shakes it
+// into a false press -- the failure the comment above the guard in
+// voice_input_controller.cpp describes. That guard starts its 600ms window
+// when the movement is *requested*, but a kLookSpeed=400 sweep is still
+// settling well after that, so the ring-down lands after the window has
+// closed and reads as a finger. The result is self-sustaining: a false press
+// opens a conversation, being in conversation is what makes this code turn the
+// head, and the next turn triggers the next false press. Observed in the
+// office as the robot interrupting a phone call unprompted.
+//
+// Suppressing the movement breaks that loop at the physical cause. Frames are
+// still captured and still posted to /v1/vision, so face recognition and
+// "who am I talking to" are unaffected -- only the servos stay put.
+//
+// Re-enable once a press can be told from a vibration (a hold-time threshold
+// on the touch sensor is the obvious fix); until then the robot must never
+// speak unless a person actually touched it.
+constexpr bool kFaceTrackingMovesHead = false;
 
 constexpr int kJpegQuality = 20;
 constexpr size_t kMaxResponseBytes = 2048;
@@ -98,7 +121,15 @@ uint8_t* CaptureJpeg(size_t& out_len)
     {
         // The frame pointer is only valid until the next capture, and the
         // app's WebSocket stream drives the same camera. See camera_guard.h.
-        std::lock_guard<std::mutex> camera_lock(stackchan::hal::GetCameraMutex());
+        //
+        // Bounded: if the app's stream is mid-capture we would rather miss
+        // this look than park the worker on the lock. Another frame is 700ms
+        // away.
+        std::unique_lock<std::timed_mutex> camera_lock(
+            stackchan::hal::GetCameraMutex(), std::chrono::milliseconds(stackchan::hal::kCameraLockTimeoutMs));
+        if (!camera_lock.owns_lock()) {
+            return nullptr;
+        }
         if (!camera->StreamCaptures()) {
             return nullptr;
         }
@@ -337,6 +368,8 @@ void FaceTracker::WorkerTask(void* arg)
                 mclog::tagInfo(kTag, "face too small to be the speaker, ignoring");
             } else if (std::abs(x) < kDeadzone && std::abs(y) < kDeadzone) {
                 // Already looking at them.
+            } else if (!kFaceTrackingMovesHead) {
+                mclog::tagInfo(kTag, "face located; head movement disabled");
             } else if (!tracker->IsMotionAllowed()) {
                 mclog::tagInfo(kTag, "manner mode: face located but not turning");
             } else {

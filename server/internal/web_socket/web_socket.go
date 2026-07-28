@@ -76,7 +76,19 @@ var (
 
 // GetMac get MAC address from request header
 func GetMac(r *ghttp.Request) (string, error) {
-	if token := r.Header.Get(model.Authorization); token != "" {
+	// A browser cannot set request headers on a WebSocket handshake -- the
+	// WebSocket API has no place to put them -- so a page acting as an App
+	// client passes the same token as a query parameter instead. It is the
+	// identical RSA blob and goes through the identical checks below; only
+	// where it is carried differs. Putting a credential in a URL is normally
+	// a bad idea because URLs get logged and kept in history, but this one is
+	// rejected 10 seconds after it is minted, which is shorter than the log
+	// line is useful for.
+	token := r.Header.Get(model.Authorization)
+	if token == "" {
+		token = r.Get("token").String()
+	}
+	if token != "" {
 		decodedToken, err := base64.StdEncoding.DecodeString(token)
 		if err != nil {
 			logger.Errorf(r.Context(), "Error base64 decoding token: %v", err)
@@ -89,7 +101,11 @@ func GetMac(r *ghttp.Request) (string, error) {
 		}
 		tokenStr := string(decrypted)
 		parts := strings.Split(tokenStr, "|")
-		if len(parts) < 2 {
+		// mac|nonce|timestamp: three fields, and the timestamp is read from
+		// parts[2]. The guard used to allow len == 2 through, which then
+		// indexed past the end of the slice and panicked the handler on any
+		// two-field token.
+		if len(parts) < 3 {
 			return "", errors.New("invalid token")
 		}
 		mac := parts[0]
