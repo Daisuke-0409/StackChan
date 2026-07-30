@@ -422,6 +422,12 @@ void VoiceInputController::CloseFollowUp(const char* why)
 
 void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>& frame)
 {
+    // Read the state before taking mutex_: the state manager holds its own, and
+    // taking two locks in an order nothing else guarantees is how deadlocks get
+    // built.
+    const bool speaking = tachikoma_state::GetTachikomaStateManager().GetCurrentState() ==
+                          tachikoma_state::TachikomaState::Speaking;
+
     // Level of this frame. Mean of squares in 64-bit: a 20ms frame of loud
     // audio overflows int32 well before the divide.
     int64_t sum = 0;
@@ -433,6 +439,34 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
 
     std::lock_guard<std::mutex> lock(mutex_);
     if (!follow_up_open_ || recording_ || busy_) {
+        return;
+    }
+
+    // The loudest thing this microphone ever hears is the robot. Measured on
+    // hardware 2026-07-30: room tone stays under the 1400 threshold, while a
+    // reply coming out of the speaker reads 7000-23400 -- five to sixteen times
+    // it. Without this guard the robot hears itself, records itself, and sends
+    // that to be transcribed; by the time the text comes back the state machine
+    // has returned to Idle, where UserSpeechEnded and SpeechFinished are both
+    // rejected, and the exchange dies with AiGatewayClient rejected transcribed
+    // text. From the outside that is exactly "the second thing I say never
+    // works" -- the first exchange uses the head touch and is fine.
+    //
+    // OpenFollowUp() runs on the Speaking -> Idle edge, so the window opens
+    // while the speaker is still ringing; and a multi-sentence reply plays as
+    // several queued announcements, dropping to Idle between them. Refreshing
+    // the hold for as long as the state is Speaking covers both, without
+    // depending on when Update() next runs.
+    if (speaking) {
+        follow_up_hold_until_ms_ = now + kPostSpeechCooldownMs;
+        // Drop the pre-roll too. It exists so an utterance keeps the syllable
+        // that crossed the threshold, and half a second of the robot's own
+        // voice spliced onto the front of the next one is worse than nothing.
+        follow_up_preroll_pos_    = 0;
+        follow_up_preroll_filled_ = false;
+        return;
+    }
+    if (static_cast<int32_t>(now - follow_up_hold_until_ms_) < 0) {
         return;
     }
 

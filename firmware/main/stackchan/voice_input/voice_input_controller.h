@@ -172,6 +172,13 @@ private:
     // back and forth several times a second.
     bool follow_up_open_ = false;
     uint32_t follow_up_until_ms_ = 0;
+    // Until when the follow-up detector must ignore the microphone, because
+    // what it can hear is the robot itself. Refreshed from FollowUpTick() for
+    // as long as the state is Speaking, so it always outlasts the audio and
+    // covers the gap between the queued sentences of one reply. Lives under
+    // mutex_ with the rest of the follow-up state, unlike cooldown_until_ms_
+    // above, which only Update() and the button path touch.
+    uint32_t follow_up_hold_until_ms_ = 0;
     bool follow_up_speech_ = false;      // currently inside an utterance
     uint32_t follow_up_speech_start_ms_ = 0;
     uint32_t follow_up_quiet_since_ms_ = 0;
