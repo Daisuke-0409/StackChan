@@ -48,13 +48,20 @@ API キーはすべて PC 側に留まり、デバイスは一切触らない。
 | モーション | `firmware/main/stackchan/motion/` |
 | コーデック(I2S/I2C) | `firmware/main/hal/board/cores3_audio_codec.cc` |
 
-### もう1つのリポジトリ (重要)
+### PC側の半分 — `notifier/` (2026-07-30 統合)
 
-**タチコマ計画は2リポジトリ構成。** ここ(StackChan)だけ見ていると半分しか見えない。
+**もともと別リポジトリ (`Daisuke-0409/Tachikoma`、ブランチ mail) だったものを、
+`git subtree` でこのリポジトリの `notifier/` に取り込んだ。34コミットの履歴ごと。**
+
+分けていた理由が無くなったため統合した。承認リレーは「PC側で判断してロボットに
+喋らせる」機能で2つのリポジトリにまたがっており、片方を直すたびに別々にコミット
+する必要があった。加えて、リポジトリ名 `Tachikoma` が**ロボット本体に見える**ため
+「古い方」と誤解されやすかった。
+
+旧リポジトリはアーカイブ (読み取り専用) にして残す。削除はしない。
 
 ```
-C:\Users\mylit\エージェントAIプロトタイプver0.1     ブランチ mail
-  tachikoma_notifier/     PC側の通知・承認基盤
+notifier/tachikoma_notifier/     PC側の通知・承認基盤
 ```
 
 Claude Code など開発エージェントの Hook イベントを受け、状態を音声で知らせる。
@@ -407,7 +414,7 @@ C:\Users\mylit\エージェントAIプロトタイプver0.1\tachikoma_notifier\
 
 ## 8. 参照
 
-- **運用手順(ダイスケがやること): `firmware/docs/operations.md`**
+- **環境構築と運用手順のすべて: `README.md`** (これ1本で足りる)
 - **会社セッションの記録: `firmware/docs/2026-07-28-office-session.md`**
   (自前サーバ構築・認証突破・上流コードの落とし穴・積み残し)
 - 直近の詳細な作業記録: `firmware/docs/2026-07-26-session-summary.md`
