@@ -210,9 +210,11 @@ talking to -- but no longer the unit of memory.
 | `TACHIKOMA_BRAIN_ID` | `tachikoma` | Store filename, i.e. which persona |
 | `TACHIKOMA_MEMORY_DIR` | `gateway/memory` | Where the store lives |
 
-A store written before sharing existed is adopted automatically the first
-time the shared one is missing: it is *copied*, the original is left alone,
-and the adoption is logged. Two such stores are left alone entirely -- two
+A store written before sharing existed is adopted automatically **at startup**
+when the shared one is missing: it is *copied*, the original is left alone,
+and the adoption is logged next to the store the gateway ended up using. It
+happens at boot rather than on the first question so that moving a store
+between machines can be confirmed before anyone depends on it. Two such stores are left alone entirely -- two
 histories cannot be interleaved without inventing an order for them, and
 guessing writes a false past into the one place the robot trusts. Merge those
 by hand.

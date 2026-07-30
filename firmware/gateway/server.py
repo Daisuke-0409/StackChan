@@ -1994,10 +1994,32 @@ def _warm_voicevox(env: dict[str, str]) -> None:
              f"TTS will fall back to gemini until the engine is reachable")
 
 
+def _announce_memory_store() -> None:
+    """Settle and report which store this gateway is using, at startup.
+
+    Adoption of a pre-sharing store used to happen the first time memory was
+    read, which is the first time somebody speaks -- so after moving a store
+    between machines there was no way to confirm it had been carried over
+    except to ask the robot something and hope. Do it at boot instead, where
+    the answer can be read before anyone is relying on it.
+    """
+    if not _memory_enabled(dict(os.environ)):
+        _log("gateway memory disabled; nothing is remembered between requests")
+        return
+    path = _memory_path("")
+    with _memory_lock:
+        _adopt_legacy_device_store(path)
+    if os.path.exists(path):
+        _log(f"gateway memory store: {os.path.basename(path)}")
+    else:
+        _log(f"gateway memory store: {os.path.basename(path)} (new, nothing remembered yet)")
+
+
 def main() -> None:
     host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
     port = int(os.environ.get("GATEWAY_PORT", "8080"))
     _log(f"Tachikoma Gateway listening on {host}:{port} (provider={os.environ.get('AI_PROVIDER', 'mock')})")
+    _announce_memory_store()
     _warm_voicevox(dict(os.environ))
     if _debug_logging_enabled(os.environ):
         _log(f"TACHIKOMA_DEBUG_LOGGING=1: recognized speech text will be logged and uploaded audio "
