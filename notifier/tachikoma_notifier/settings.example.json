@@ -1,0 +1,73 @@
+{
+  "hooks": {
+    "Notification": [
+      {
+        "matcher": "permission_prompt",
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8787/events",
+            "headers": {
+              "Authorization": "Bearer $TACHIKOMA_NOTIFY_TOKEN"
+            },
+            "allowedEnvVars": [
+              "TACHIKOMA_NOTIFY_TOKEN"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8787/events",
+            "headers": {
+              "Authorization": "Bearer $TACHIKOMA_NOTIFY_TOKEN"
+            },
+            "allowedEnvVars": [
+              "TACHIKOMA_NOTIFY_TOKEN"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "PostToolUseFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8787/events",
+            "headers": {
+              "Authorization": "Bearer $TACHIKOMA_NOTIFY_TOKEN"
+            },
+            "allowedEnvVars": [
+              "TACHIKOMA_NOTIFY_TOKEN"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "StopFailure": [
+      {
+        "hooks": [
+          {
+            "type": "http",
+            "url": "http://127.0.0.1:8787/events",
+            "headers": {
+              "Authorization": "Bearer $TACHIKOMA_NOTIFY_TOKEN"
+            },
+            "allowedEnvVars": [
+              "TACHIKOMA_NOTIFY_TOKEN"
+            ],
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
