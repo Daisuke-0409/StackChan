@@ -1789,6 +1789,13 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
         # means the operator is treated as a stranger and cannot see his own
         # memory. Measured at 11-15ms for a 2-4s clip against ~1900ms of
         # STT in the same call, so there is nothing to gain by deferring it.
+        #
+        # That 11-15ms is the *warm* cost. The first call also loads the
+        # encoder, which took 12.8s here, and being inside this request is
+        # what made the first conversation after every restart look like a
+        # hang. _warm_biometrics() now pays that at boot; if this ever feels
+        # slow again, check the log for the "biometrics warmed" line before
+        # suspecting the microphone.
         _identify_or_enrol(headers.get("X-Device-Id", ""), bytes(audio), sample_rate,
                            body.get("text", ""))
     return status, body
@@ -2089,6 +2096,35 @@ def _warm_voicevox(env: dict[str, str]) -> None:
              f"TTS will fall back to gemini until the engine is reachable")
 
 
+def _warm_biometrics() -> None:
+    """Load the biometric models at boot instead of inside the first question.
+
+    They load on first use, and first use is inside /v1/transcribe -- the
+    request somebody is already waiting on, having just spoken. Measured on
+    this machine: 12.8s for the first voice embedding against 0-16ms for every
+    one after it. So the first conversation after a restart looked like the
+    robot had hung, while every later one was fine, which is a maddening thing
+    to debug from the outside. Worse, a wait that long can outlast the device's
+    own HTTP timeout, and then there is no reply at all rather than a late one.
+
+    On a thread, because the device polls every two seconds and should find the
+    server already listening rather than blocked on torch. The loaders take a
+    lock, so a real request that arrives mid-warm waits for this same load
+    instead of starting a second one.
+    """
+    def load() -> None:
+        t0 = time.monotonic()
+        voice = biometrics.voice_available()
+        voice_ms = (time.monotonic() - t0) * 1000
+        t1 = time.monotonic()
+        face = biometrics.face_available()
+        face_ms = (time.monotonic() - t1) * 1000
+        _log(f"gateway biometrics warmed voice={voice} in {voice_ms:.0f}ms "
+             f"face={face} in {face_ms:.0f}ms")
+
+    threading.Thread(target=load, daemon=True).start()
+
+
 def _announce_memory_store() -> None:
     """Settle and report which store this gateway is using, at startup.
 
@@ -2115,6 +2151,7 @@ def main() -> None:
     port = int(os.environ.get("GATEWAY_PORT", "8080"))
     _log(f"Tachikoma Gateway listening on {host}:{port} (provider={os.environ.get('AI_PROVIDER', 'mock')})")
     _announce_memory_store()
+    _warm_biometrics()
     _warm_voicevox(dict(os.environ))
     if _debug_logging_enabled(os.environ):
         _log(f"TACHIKOMA_DEBUG_LOGGING=1: recognized speech text will be logged and uploaded audio "
