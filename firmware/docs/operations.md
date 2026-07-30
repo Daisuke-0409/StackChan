@@ -39,6 +39,22 @@ powershell -File C:\Users\mylit\StackChanDev\StackChan\firmware\gateway\run_gate
 含まれていること**を確認する。含まれていなければ実機は繋がらない（PCのIPが
 変わったということ。5章の手順で焼き直すか、ルータでIPを固定する）。
 
+続けて、どの記憶を使っているかも出る。
+
+```
+gateway memory store: tachikoma.json
+```
+
+前の記憶を引き継いだときは、その直前にこう出る。**出るのは初回だけ**。
+
+```
+gateway memory: adopted 80456B4DE03C.json as the shared store
+```
+
+`(new, nothing remembered yet)` と付いていたら、**空から始まっている**。
+持ち帰った記憶を統合する前ならそれで正しい。そうでなければ、
+保存先（`TACHIKOMA_MEMORY_DIR`）が意図と違う場所を指している。
+
 VOICEVOX を先に起動しておくと声がずんだもんになり、応答も速い（1文あたり約755ms）。
 起動していなければ自動的に Gemini TTS に切り替わる。止まりはしない。
 
@@ -208,19 +224,31 @@ ESP32 が再起動する**（DTR/RTS がリセット線に繋がっている）�
 
 ---
 
-## 7. 次に会社へ行ったときにやること（今回限り）
+## 7. 移行の残り（2026-07-30 時点）
 
-営業時間しか入れないので、この順で。所要15分程度。
+**済んだこと**: 2026-07-29 に会社でコードを取り込み、push まで完了
+（`fa3f091`）。**会社にコードは届いている。**
+
+**残っていること**:
+
+会社で（営業時間しか入れないので、この順で。10分程度）
 
 1. **タスクスケジューラの `Tachikoma Gateway` を無効化し、実行中なら止める**
+   — 放置すると会社PCが独自の記憶を書き続け、家の記憶と枝分かれする
 2. **記憶を持ち帰る** — `firmware/gateway/memory/` から2ファイル:
    - `80456B4DE7AC.json`（会社の体の記憶）
    - `people.json`（会社で登録した人）
 3. **転送役を置く** — `gateway/.env.forwarder.example` を `.env.forwarder` に
    コピーし、`FORWARDER_TARGET` に家のTailscaleアドレスを書く。
    `run_forwarder.ps1` を起動して `http://localhost:8080/healthz` を確認
-4. **Tailscale にログイン**（未ログインなら）
-5. 家に戻ったら3章の手順で記憶を統合する
+
+家で
+
+4. **ゲートウェイを一度起動する**（まだ一度もやっていない）。
+   起動ログの `gateway memory: adopted ...` と `gateway memory store: ...` で
+   引き継ぎを確認する
+5. **持ち帰った記憶は `memory/` の外に置いてから**、3章の手順で統合する。
+   中に入れると記憶ファイルが2つになり、引き継ぎが自動で止まる
 
 会社の体の向き先（実機に焼いてあるゲートウェイURL）は**変えなくてよい**。
 今までどおり会社PCを指していれば、転送役がその先を引き受ける。
