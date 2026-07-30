@@ -150,7 +150,7 @@ Happy/Confused は**状態ではなくリアクション**で、`Reacting` 状�
 - 2026-07-29 10:01 に会社でパッチを取り込み push 済み (`fa3f091`)。
   **会社にコードは届いている**
 - 会社PCでの転送役の設置 (`.env.forwarder` 作成・起動) は**未確認**
-- Tailscale: 家のPC `oo.tail20a9df.ts.net` は**HTTPS証明書が利用可能**。
+- Tailscale: 家のPCは**HTTPS証明書が利用可能** (`tailscale cert` が通る状態)。
   iPhone も同じ tailnet に在籍。会社PC (`DESKTOP-4UM3G9C`) も登録済み
 
 ### 権限システムの現在地 (2026-07-26 夜)
@@ -227,11 +227,11 @@ CRMの顧客データを扱う段階で再検討すること。
 
 **人が使う面 (小さい・実装ではなく設定)**
 ブラウザ操作ページ、CRM、**Even G2 の Web アプリ**。Tailscale の HTTPS で足りる。
-インターネットには公開されない。家のPCは `oo.tail20a9df.ts.net` で
+インターネットには公開されない。家のPCは自分の tailnet 名 (`tailscale status --json` の Self.DNSName) で
 **証明書が既に利用可能**なので、次の1コマンドで済む:
 
 ```powershell
-& "C:\Program Files\Tailscale\tailscale.exe" serve --bg --https=443 http://127.0.0.1:8080
+& "C:\Program Files\Tailscale\tailscale.exe" serve --bg --https=443 http://127.0.0.1:8080   # https://<tailnet名>/ で公開される
 ```
 
 これで同時に解けるもの: スマホからブラウザ操作ページが開ける
