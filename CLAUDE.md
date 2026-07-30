@@ -396,7 +396,47 @@ powershell -File firmware\gateway\run_gateway.ps1
 - **2回連続録音の2回目でアップロードが失敗する**ことがある(タイムアウト寄り、
   再現性未確認)。承認フローは短い発話が連続するため、着手前に原因特定を
   優先する
+- **2回目の発話が通らない。2026-07-30 夜、未解決のまま。** 詳細は下記
 - **会社PCに転送役が設置済みかどうか未確認。**「済んでいない」ではなく「不明」
+
+### 2回目の発話が通らない (2026-07-30、継続中)
+
+**症状**: 再起動直後の1回目は成功する。2回目以降が通らない。
+1回目は頭タッチ、2回目はハンズフリー継続の経路 — **別のコードを通っている**。
+
+**実機ログで確認した事実** (2026-07-30 22:0x):
+
+```
+follow-up speech detected (rms=7061 / 17059 / 20288 / 23432)
+W TachikomaState: Rejected SpeechFinished in Idle
+W TachikomaState: Rejected UserSpeechEnded in Idle
+[VoiceInput] transcribed text len=73        ← 認識は成功している
+[AiGateway] request failed id= error=internal
+[VoiceInput] AiGatewayClient rejected transcribed text
+TachikomaState: Idle -> Error by AiRequestFailed
+```
+
+**マイクも声量も問題ない。73文字認識できている。送る直前にデバイスが捨てている。**
+
+**打った手 (`7a2b9a0`)**: 自分の声を拾わないようにした
+(`Speaking` 中と終了後1500msはハンズフリー検出を止める)。
+RMS 7061〜23432 は再生中の実測で、しきい値 1400 の5〜16倍だった。
+**焼いて検証済み (Hash verified) だが、症状は解消しなかった。**
+この修正自体は実測に基づく本物のバグ潰しなので戻す必要はない。
+
+**次に疑うべき本命**: `Rejected UserSpeechEnded in Idle` が出ている。
+ハンズフリー経路が `UserSpeechStarted` を撃たずに `UserSpeechEnded` を撃っている、
+つまり**状態機械を `Listening` に入れないまま発話を終わらせている**可能性が高い。
+そうであれば自分の声とは無関係に**すべてのハンズフリー発話が失敗する**。
+`voice_input_controller.cpp` の follow-up 経路が state manager に何を通知しているかを、
+頭タッチ経路 (`OnButtonPressed` → `UserSpeechStarted`) と**並べて比較する**こと。
+
+**調査の障害**: 書き込み後、シリアルキャプチャが0バイトで取れていない
+(USB-Serial/JTAG がリセットで再列挙されるため)。**先にゲートウェイのログを
+ファイルに出す** (自動起動タスク `Tachikoma Gateway` が
+`StackChanDev\logs\gateway.log` に追記する) ようにしてから調査を再開すること。
+「2回目のリクエストがゲートウェイに届いているか」が分かれ道:
+届いていれば PC 側、届いていなければ実機側。
 - **ブランチ名「mail」の意図が不明** (PC側リポジトリ)。コード・コミット・README の
   いずれにもメール関連の実装が無い。ダイスケに心当たりがあれば
 
