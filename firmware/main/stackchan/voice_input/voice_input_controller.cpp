@@ -437,10 +437,13 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
     const int32_t rms = frame.empty()
         ? 0 : static_cast<int32_t>(std::sqrt(static_cast<double>(sum) / frame.size()));
 
+    // Set inside the lock, acted on outside it. Telling the state manager that
+    // speech began means calling into a component with its own mutex, and doing
+    // that while holding this one pairs two locks in an order nothing else
+    // guarantees.
+    bool speech_started = false;
+    {
     std::lock_guard<std::mutex> lock(mutex_);
-    if (!follow_up_open_ || recording_ || busy_) {
-        return;
-    }
 
     // The loudest thing this microphone ever hears is the robot. Measured on
     // hardware 2026-07-30: room tone stays under the 1400 threshold, while a
@@ -457,6 +460,13 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
     // several queued announcements, dropping to Idle between them. Refreshing
     // the hold for as long as the state is Speaking covers both, without
     // depending on when Update() next runs.
+    //
+    // This has to come before the follow_up_open_ check, not after it. The
+    // window is shut for the whole time the robot is speaking and opens the
+    // instant it stops, so a hold armed only while the window was open would
+    // never be armed before the moment it is needed -- which is exactly what
+    // happened: 8ms after "conversation open" the robot heard its own tail at
+    // rms 7560 and started recording it.
     if (speaking) {
         follow_up_hold_until_ms_ = now + kPostSpeechCooldownMs;
         // Drop the pre-roll too. It exists so an utterance keeps the syllable
@@ -464,6 +474,9 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
         // voice spliced onto the front of the next one is worse than nothing.
         follow_up_preroll_pos_    = 0;
         follow_up_preroll_filled_ = false;
+        return;
+    }
+    if (!follow_up_open_ || recording_ || busy_) {
         return;
     }
     if (static_cast<int32_t>(now - follow_up_hold_until_ms_) < 0) {
@@ -498,13 +511,25 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
             recording_           = true;
             recording_started_ms_ = now;
             recording_capacity_samples_ = buffer_.capacity();
+            speech_started = true;
             mclog::tagInfo(kTag, "follow-up speech detected (rms={})", rms);
         }
-        return;
+    } else if (rms >= kFollowUpSilenceRms) {
+        follow_up_quiet_since_ms_ = now;
+    }
     }
 
-    if (rms >= kFollowUpSilenceRms) {
-        follow_up_quiet_since_ms_ = now;
+    if (speech_started) {
+        // The event the head-touch path fires at the equivalent moment (see
+        // OnButtonPressed). Without it the state machine never leaves Idle,
+        // and then StopRecordingAndUpload()'s UserSpeechEnded -- which both
+        // paths share -- arrives in a state that has no rule for it and is
+        // rejected. The reply that follows is rejected too, for the same
+        // reason. Every hands-free utterance failed this way regardless of
+        // what was said or how loudly, while the first exchange of a
+        // conversation, which uses the head touch, always worked.
+        tachikoma_state::GetTachikomaStateManager().Notify(
+            tachikoma_state::TachikomaEvent::UserSpeechStarted);
     }
 }
 
@@ -640,10 +665,24 @@ bool VoiceInputController::CaptureTick(uint32_t now)
         if (ended && too_short) {
             // A cough or a chair. Drop it and keep listening rather than
             // sending the gateway a second of nothing.
-            std::lock_guard<std::mutex> lock(mutex_);
-            recording_ = false;
-            buffer_.clear();
-            mclog::tagInfo(kTag, "follow-up sound too short, ignoring");
+            {
+                std::lock_guard<std::mutex> lock(mutex_);
+                recording_ = false;
+                buffer_.clear();
+                mclog::tagInfo(kTag, "follow-up sound too short, ignoring");
+            }
+            // Starting the recording announced UserSpeechStarted, which moved
+            // the machine into Listening. Abandoning it has to move back out,
+            // or the state stays Listening with nothing listening: the next
+            // announcement is rejected (SpeechStarted has no rule there) and
+            // so is the next genuine utterance. {Listening, SpeechFinished,
+            // Idle} is the existing rule for leaving Listening without having
+            // produced anything; AiRequestFailed would work too but routes
+            // through Error, which is far too much ceremony for a cough.
+            //
+            // Outside the lock: the state manager holds its own.
+            tachikoma_state::GetTachikomaStateManager().Notify(
+                tachikoma_state::TachikomaEvent::SpeechFinished);
             return true;
         }
         if (ended) {
