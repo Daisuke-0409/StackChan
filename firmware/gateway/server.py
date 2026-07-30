@@ -1818,104 +1818,167 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
-    def do_GET(self) -> None:  # noqa: N802
-        parsed = urllib.parse.urlsplit(self.path)
-        if parsed.path in ("/", "/ui", "/ui/"):
-            self._send_html(webui.INDEX_HTML)
-        elif parsed.path == "/ui/manifest.json":
-            self._send_raw(200, "application/manifest+json", webui.MANIFEST_JSON.encode("utf-8"))
-        elif parsed.path == "/ui/icon.png":
-            self._send_raw(200, "image/png", _APP_ICON_PNG)
-        elif parsed.path == "/v1/settings":
-            status, body = process_settings_get(dict(self.headers), os.environ)
-            self._send(status, body)
-        elif parsed.path == "/v1/people":
-            status, body = process_people_list(dict(self.headers), os.environ)
-            self._send(status, body)
-        elif parsed.path == "/health":
-            self._send(200, {"ok": True, "provider": os.environ.get("AI_PROVIDER", "mock")})
-        elif parsed.path == "/v1/speak_queue":
-            if not _authorized(dict(self.headers), os.environ):
-                self._send(401, {"error": "authentication_failed"})
-                return
-            device_id = urllib.parse.parse_qs(parsed.query).get("device_id", [""])[0]
-            if not device_id:
-                self._send(400, {"error": "invalid_input"})
-                return
-            audio = dequeue_speech(device_id)
-            if audio is None:
-                self._send_no_content()
-            else:
-                self._send_audio(audio, take_pending_emotion(device_id),
-                                 take_pending_command(device_id))
-        else:
+    def _read_bounded_body(self, limit: int) -> Optional[bytes]:
+        """The uploaded bytes, or None if the request does not describe a body.
+
+        Every upload endpoint used to carry its own copy of this: read
+        Content-Length, cap it, and treat a missing or unparsable one as a bad
+        request. The cap is the endpoint's own limit plus slack rather than the
+        limit itself, so the size check that actually rejects still belongs to
+        the endpoint, which knows which error to report.
+
+        Always read the body before rejecting anything else about the request:
+        leaving it unread desynchronises a kept-alive connection, and the next
+        request on it is then parsed out of the middle of this one's payload.
+        """
+        try:
+            length = min(int(self.headers.get("Content-Length", "0")), limit + 1024)
+        except ValueError:
+            return None
+        if length <= 0:
+            return None
+        return self.rfile.read(length)
+
+    # ---- routes -------------------------------------------------------
+    #
+    # One method per endpoint, gathered into the tables at the end of the
+    # class. The tables are the point: what this server answers used to be
+    # spread through two if/elif chains deep enough that reading them meant
+    # tracking which branch you were in.
+
+    def _get_ui(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send_html(webui.INDEX_HTML)
+
+    def _get_ui_manifest(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send_raw(200, "application/manifest+json", webui.MANIFEST_JSON.encode("utf-8"))
+
+    def _get_ui_icon(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send_raw(200, "image/png", _APP_ICON_PNG)
+
+    def _get_settings(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send(*process_settings_get(dict(self.headers), os.environ))
+
+    def _get_people(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send(*process_people_list(dict(self.headers), os.environ))
+
+    def _get_health(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send(200, {"ok": True, "provider": os.environ.get("AI_PROVIDER", "mock")})
+
+    def _get_speak_queue(self, parsed: urllib.parse.SplitResult) -> None:
+        if not _authorized(dict(self.headers), os.environ):
+            self._send(401, {"error": "authentication_failed"})
+            return
+        device_id = urllib.parse.parse_qs(parsed.query).get("device_id", [""])[0]
+        if not device_id:
+            self._send(400, {"error": "invalid_input"})
+            return
+        audio = dequeue_speech(device_id)
+        if audio is None:
+            self._send_no_content()
+            return
+        self._send_audio(audio, take_pending_emotion(device_id),
+                         take_pending_command(device_id))
+
+    def _put_settings(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send(*process_settings_put(self._read_json(), dict(self.headers), os.environ))
+
+    def _post_chat(self, parsed: urllib.parse.SplitResult) -> None:
+        raw = self._read_bounded_body(MAX_INPUT_BYTES)
+        try:
+            payload = json.loads((raw or b"").decode("utf-8"))
+        except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            self._send(400, {"error": "invalid_input"})
+            return
+        if not isinstance(payload, dict):
+            # A bare list or string is valid JSON, so it got past the decode
+            # and then hit .get() inside process_chat: AttributeError, no
+            # response written, connection dropped. From the device that is
+            # indistinguishable from the gateway having died, which is the
+            # one failure it is worst at diagnosing.
+            self._send(400, {"error": "invalid_input"})
+            return
+        self._send(*process_chat(payload, dict(self.headers), os.environ))
+
+    def _post_people(self, parsed: urllib.parse.SplitResult) -> None:
+        self._send(*process_people_update(self._read_json(), dict(self.headers), os.environ))
+
+    def _post_vision(self, parsed: urllib.parse.SplitResult) -> None:
+        image_bytes = self._read_bounded_body(MAX_VISION_IMAGE_BYTES)
+        if image_bytes is None:
+            self._send(400, {"error": "invalid_input"})
+            return
+        self._send(*process_vision(image_bytes, dict(self.headers), os.environ))
+
+    def _post_speak(self, parsed: urllib.parse.SplitResult) -> None:
+        # Read before judging. Answering 401 while the upload is still in
+        # flight leaves the body unread, and the client sometimes sees the
+        # connection reset instead of the status -- observed once in twenty
+        # attempts, on the old code as well. The bytes are bounded and then
+        # discarded, so an unauthorised caller gains nothing by sending them.
+        device_id = self.headers.get("X-Device-Id", "")
+        audio = self._read_bounded_body(MAX_SPEECH_AUDIO_BYTES)
+        if not _authorized(dict(self.headers), os.environ):
+            self._send(401, {"error": "authentication_failed"})
+            return
+        if audio is None:
+            self._send(400, {"error": "invalid_input"})
+            return
+        self._send(*enqueue_speech(device_id, audio))
+
+    def _post_transcribe(self, parsed: urllib.parse.SplitResult) -> None:
+        debug = _debug_logging_enabled(os.environ)  # TEMPORARY, see DEBUG_AUDIO_DIR block
+        t_upload_start = time.monotonic() if debug else None
+        audio = self._read_bounded_body(MAX_TRANSCRIBE_AUDIO_BYTES)
+        try:
+            sample_rate: Optional[int] = int(self.headers.get("X-Sample-Rate", "16000"))
+        except ValueError:
+            sample_rate = None
+        if audio is None or sample_rate is None:
+            self._send(400, {"error": "invalid_input"})
+            return
+        if debug:
+            _log(f"gateway debug upload_ms={(time.monotonic() - t_upload_start) * 1000:.0f} "
+                 f"bytes={len(audio)} sample_rate={sample_rate}")
+        self._send(*process_transcribe(audio, dict(self.headers), os.environ,
+                                       sample_rate=sample_rate))
+
+    _GET_ROUTES = {
+        "/": _get_ui,
+        "/ui": _get_ui,
+        "/ui/": _get_ui,
+        "/ui/manifest.json": _get_ui_manifest,
+        "/ui/icon.png": _get_ui_icon,
+        "/v1/settings": _get_settings,
+        "/v1/people": _get_people,
+        "/health": _get_health,
+        "/v1/speak_queue": _get_speak_queue,
+    }
+    _PUT_ROUTES = {"/v1/settings": _put_settings}
+    _POST_ROUTES = {
+        "/v1/chat": _post_chat,
+        "/v1/people": _post_people,
+        "/v1/vision": _post_vision,
+        "/v1/speak": _post_speak,
+        "/v1/transcribe": _post_transcribe,
+    }
+
+    def _dispatch(self, routes: dict[str, Any], match: str) -> None:
+        route = routes.get(match)
+        if route is None:
             self._send(404, {"error": "not_found"})
+            return
+        route(self, urllib.parse.urlsplit(self.path))
+
+    def do_GET(self) -> None:  # noqa: N802
+        # GET is the only method that arrives with a query string, and
+        # matching POST and PUT on the raw path is what they already did.
+        self._dispatch(self._GET_ROUTES, urllib.parse.urlsplit(self.path).path)
 
     def do_PUT(self) -> None:  # noqa: N802
-        if self.path == "/v1/settings":
-            status, body = process_settings_put(self._read_json(), dict(self.headers), os.environ)
-            self._send(status, body)
-        else:
-            self._send(404, {"error": "not_found"})
+        self._dispatch(self._PUT_ROUTES, self.path)
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path == "/v1/chat":
-            try:
-                length = min(int(self.headers.get("Content-Length", "0")), MAX_INPUT_BYTES + 1024)
-                payload = json.loads(self.rfile.read(length).decode("utf-8"))
-            except (ValueError, json.JSONDecodeError, UnicodeDecodeError):
-                self._send(400, {"error": "invalid_input"})
-                return
-            status, body = process_chat(payload, dict(self.headers), os.environ)
-            self._send(status, body)
-        elif self.path == "/v1/people":
-            status, body = process_people_update(self._read_json(), dict(self.headers), os.environ)
-            self._send(status, body)
-        elif self.path == "/v1/vision":
-            try:
-                length = min(int(self.headers.get("Content-Length", "0")), MAX_VISION_IMAGE_BYTES + 1024)
-                if length <= 0:
-                    raise ValueError("missing body")
-                image_bytes = self.rfile.read(length)
-            except ValueError:
-                self._send(400, {"error": "invalid_input"})
-                return
-            status, body = process_vision(image_bytes, dict(self.headers), os.environ)
-            self._send(status, body)
-        elif self.path == "/v1/speak":
-            if not _authorized(dict(self.headers), os.environ):
-                self._send(401, {"error": "authentication_failed"})
-                return
-            device_id = self.headers.get("X-Device-Id", "")
-            try:
-                length = min(int(self.headers.get("Content-Length", "0")), MAX_SPEECH_AUDIO_BYTES + 1024)
-                if length <= 0:
-                    raise ValueError("missing body")
-                audio = self.rfile.read(length)
-            except ValueError:
-                self._send(400, {"error": "invalid_input"})
-                return
-            status, body = enqueue_speech(device_id, audio)
-            self._send(status, body)
-        elif self.path == "/v1/transcribe":
-            debug = _debug_logging_enabled(os.environ)  # TEMPORARY, see DEBUG_AUDIO_DIR block
-            t_upload_start = time.monotonic() if debug else None
-            try:
-                length = min(int(self.headers.get("Content-Length", "0")), MAX_TRANSCRIBE_AUDIO_BYTES + 1024)
-                if length <= 0:
-                    raise ValueError("missing body")
-                audio = self.rfile.read(length)
-                sample_rate = int(self.headers.get("X-Sample-Rate", "16000"))
-            except ValueError:
-                self._send(400, {"error": "invalid_input"})
-                return
-            if debug:
-                _log(f"gateway debug upload_ms={(time.monotonic() - t_upload_start) * 1000:.0f} "
-                     f"bytes={len(audio)} sample_rate={sample_rate}")
-            status, body = process_transcribe(audio, dict(self.headers), os.environ, sample_rate=sample_rate)
-            self._send(status, body)
-        else:
-            self._send(404, {"error": "not_found"})
+        self._dispatch(self._POST_ROUTES, self.path)
 
     def log_message(self, fmt: str, *args: Any) -> None:
         # Never print Authorization headers, provider keys, or full prompts.
