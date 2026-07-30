@@ -1079,14 +1079,19 @@ def _log_grounding(candidate: dict[str, Any]) -> None:
     _log(f"gateway web search queries={queries} sources={sources}")
 
 
-def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str]) -> tuple[int, dict[str, Any]]:
-    key = env.get("AI_PROVIDER_API_KEY", "")
-    if not key:
-        return _result(503, "server_error")
+def _gemini_chat_request(text: str, payload: dict[str, Any], env: dict[str, str],
+                         key: str, *, stream: bool) -> urllib.request.Request:
+    """The chat call to Gemini, streaming or not.
+
+    The two paths differ only in which endpoint they post to. Everything that
+    decides what the model is told -- the persona, the memory this particular
+    listener is allowed to hear, the tools -- is the same for both, and
+    deciding it in two places is how the two answers drift apart.
+    """
     model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
-    url = f"{GEMINI_API_BASE_URL}/models/{model}:generateContent"
-    listener_role = current_role(payload["device_id"])
-    suffix, prior = (_memory_prompt_parts(payload["device_id"], listener_role)
+    endpoint = "streamGenerateContent?alt=sse" if stream else "generateContent"
+    device_id = payload["device_id"]
+    suffix, prior = (_memory_prompt_parts(device_id, current_role(device_id))
                      if _memory_enabled(env) else ("", []))
     body: dict[str, Any] = {
         "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + _persona_suffix() + suffix}]},
@@ -1095,21 +1100,38 @@ def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str
     tools = _chat_tools(env)
     if tools:
         body["tools"] = tools
-    request_body = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(url, data=request_body, method="POST", headers={
-        "Content-Type": "application/json", "x-goog-api-key": key,
-    })
+    return urllib.request.Request(
+        f"{GEMINI_API_BASE_URL}/models/{model}:{endpoint}",
+        data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json", "x-goog-api-key": key})
+
+
+def _gemini_http_failure(exc: urllib.error.HTTPError) -> tuple[int, dict[str, Any]]:
+    """How an HTTP status from Gemini is reported to the device.
+
+    Both chat paths mapped these identically. One copy means a case added
+    here cannot be forgotten in the other one.
+    """
+    if exc.code in (401, 403):
+        return _result(502, "authentication_failed")
+    if exc.code == 429:
+        return _result(503, "rate_limited")
+    return _result(502, "server_error")
+
+
+def _gemini_chat_response(text: str, payload: dict[str, Any], env: dict[str, str]) -> tuple[int, dict[str, Any]]:
+    key = env.get("AI_PROVIDER_API_KEY", "")
+    if not key:
+        return _result(503, "server_error")
+    request = _gemini_chat_request(text, payload, env, key, stream=False)
     try:
         with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
                                     context=ssl.create_default_context()) as response:
             decoded = json.loads(response.read(MAX_OUTPUT_BYTES * 4 + 1).decode("utf-8"))
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            return _result(502, "authentication_failed")
-        if exc.code == 429:
-            return _result(503, "rate_limited")
-        return _result(502, "server_error")
-    except (urllib.error.URLError, TimeoutError, ValueError, json.JSONDecodeError):
+        return _gemini_http_failure(exc)
+    except (urllib.error.URLError, TimeoutError, ValueError):
+        # JSONDecodeError is a ValueError, so a truncated reply lands here too.
         return _result(504, "timeout")
 
     try:
@@ -1330,6 +1352,79 @@ def _iter_gemini_sse_text_deltas(response: Any):
             yield delta
 
 
+class _SentenceSpeaker:
+    """Synthesises and queues each sentence as soon as the reply yields one.
+
+    One sentence failing is not fatal: it is logged and skipped so the ones
+    behind it still get spoken. What the caller needs afterwards is only how
+    many were actually queued -- zero means nothing was heard at all, which is
+    the case that has to fall back to the confirmation tone.
+    """
+
+    def __init__(self, device_id: str, env: dict[str, str], started: float) -> None:
+        self._device_id = device_id
+        self._env = env
+        self._started = started
+        self.enqueued = 0
+        self._index = 0
+
+    def speak(self, sentence: str) -> None:
+        # Strip markup before synthesis, not after: TTS pronounces a stray
+        # "**" or a URL literally. See _speakable().
+        sentence = _speakable(sentence)
+        if not sentence:
+            return
+        self._index += 1
+        idx = self._index
+        t_ready = time.monotonic()
+        pcm = _tts_pcm(sentence, self._env)
+        t_tts = time.monotonic()
+        if pcm is None:
+            _log(f"gateway streaming sentence={idx} tts_failed text_len={len(sentence)} "
+                 f"sentence_ready_ms={(t_ready - self._started) * 1000:.0f} "
+                 f"tts_ms={(t_tts - t_ready) * 1000:.0f}")
+            return
+        # append only after the first: the first one replaces whatever the
+        # previous turn left pending, the rest queue behind it in speaking order.
+        status, body = enqueue_speech(self._device_id, pcm, append=self.enqueued > 0)
+        t_enqueue = time.monotonic()
+        if status != 200:
+            _log(f"gateway streaming sentence={idx} enqueue_failed status={status} "
+                 f"error={body.get('error')} pcm_bytes={len(pcm)}")
+            return
+        self.enqueued += 1
+        _log(f"gateway streaming sentence={idx} text_len={len(sentence)} pcm_bytes={len(pcm)} "
+             f"sentence_ready_ms={(t_ready - self._started) * 1000:.0f} "
+             f"tts_ms={(t_tts - t_ready) * 1000:.0f} "
+             f"enqueue_ms={(t_enqueue - t_tts) * 1000:.0f} "
+             f"total_ms={(t_enqueue - self._started) * 1000:.0f}")
+
+
+def _resolve_emotion_tag(device_id: str, pending: str,
+                         started: float) -> tuple[str, bool]:
+    """Take the emotion tag off the front of a reply, once it can be read.
+
+    The tag sits at the very start, so it resolves from the first chunk --
+    before any sentence has been synthesized. Waiting for a sentence boundary
+    would put the motion behind the voice.
+
+    Stripping happens whether or not emotions are enabled: the model is still
+    asked for the tag, and a disabled setting must not turn into the device
+    saying the word "happy" out loud. Only acting on it is optional.
+
+    Returns the text with the tag removed, and whether the question is settled.
+    A partial "[hap" is not settled, and must not be read as "no tag".
+    """
+    stripped, reaction = _split_emotion_tag(pending)
+    if reaction is not None and settings_store.get("emotion_enabled"):
+        set_pending_emotion(device_id, reaction)
+        _log(f"gateway emotion={reaction} "
+             f"resolved_ms={(time.monotonic() - started) * 1000:.0f}")
+    if reaction is None and _EMOTION_TAG_MAYBE_RE.match(pending):
+        return pending, False
+    return stripped, True
+
+
 def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
                                   env: dict[str, str]) -> tuple[int, dict[str, Any]]:
     """Streaming counterpart to _gemini_chat_response() + the TTS/enqueue
@@ -1349,57 +1444,11 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
     if not key:
         return _result(503, "server_error")
     device_id = payload["device_id"]
-    model = env.get("AI_PROVIDER_MODEL", GEMINI_DEFAULT_CHAT_MODEL)
-    url = f"{GEMINI_API_BASE_URL}/models/{model}:streamGenerateContent?alt=sse"
-    listener_role = current_role(device_id)
-    suffix, prior = (_memory_prompt_parts(device_id, listener_role)
-                     if _memory_enabled(env) else ("", []))
-    body: dict[str, Any] = {
-        "system_instruction": {"parts": [{"text": GEMINI_SYSTEM_PROMPT + _persona_suffix() + suffix}]},
-        "contents": prior + [{"role": "user", "parts": [{"text": text}]}],
-    }
-    tools = _chat_tools(env)
-    if tools:
-        body["tools"] = tools
-    request_body = json.dumps(body).encode("utf-8")
-    request = urllib.request.Request(url, data=request_body, method="POST", headers={
-        "Content-Type": "application/json", "x-goog-api-key": key,
-    })
+    request = _gemini_chat_request(text, payload, env, key, stream=True)
 
     t_start = time.monotonic()
     full_text_parts: list[str] = []
-    enqueued_count = 0
-    sentence_index = 0
-
-    def flush_sentence(sentence: str) -> None:
-        nonlocal enqueued_count, sentence_index
-        # Strip markup before synthesis, not after: TTS pronounces a stray
-        # "**" or a URL literally. See _speakable().
-        sentence = _speakable(sentence)
-        if not sentence:
-            return
-        sentence_index += 1
-        idx = sentence_index
-        t_ready = time.monotonic()
-        pcm = _tts_pcm(sentence, env)
-        t_tts = time.monotonic()
-        if pcm is None:
-            _log(f"gateway streaming sentence={idx} tts_failed text_len={len(sentence)} "
-                 f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
-                 f"tts_ms={(t_tts - t_ready) * 1000:.0f}")
-            return
-        enqueue_status, enqueue_body = enqueue_speech(device_id, pcm, append=enqueued_count > 0)
-        t_enqueue = time.monotonic()
-        if enqueue_status != 200:
-            _log(f"gateway streaming sentence={idx} enqueue_failed status={enqueue_status} "
-                 f"error={enqueue_body.get('error')} pcm_bytes={len(pcm)}")
-            return
-        enqueued_count += 1
-        _log(f"gateway streaming sentence={idx} text_len={len(sentence)} pcm_bytes={len(pcm)} "
-             f"sentence_ready_ms={(t_ready - t_start) * 1000:.0f} "
-             f"tts_ms={(t_tts - t_ready) * 1000:.0f} "
-             f"enqueue_ms={(t_enqueue - t_tts) * 1000:.0f} "
-             f"total_ms={(t_enqueue - t_start) * 1000:.0f}")
+    speaker = _SentenceSpeaker(device_id, env, t_start)
 
     pending = ""
     first_chunk_logged = False
@@ -1415,40 +1464,23 @@ def _gemini_stream_chat_and_speak(text: str, payload: dict[str, Any],
                 full_text_parts.append(delta)
                 pending += delta
                 if not emotion_resolved:
-                    # The tag sits at the very start of the reply, so it is
-                    # resolvable from the first chunk -- before any sentence
-                    # has been synthesized. Waiting for a sentence boundary
-                    # would put the motion behind the voice.
-                    #
-                    # Stripping happens whether or not emotions are enabled:
-                    # the model is still asked for the tag, and a disabled
-                    # setting must not turn into the device saying the word
-                    # "happy" out loud. Only acting on it is optional.
-                    stripped, reaction = _split_emotion_tag(pending)
-                    if reaction is not None and settings_store.get("emotion_enabled"):
-                        set_pending_emotion(device_id, reaction)
-                        _log(f"gateway emotion={reaction} "
-                             f"resolved_ms={(time.monotonic() - t_start) * 1000:.0f}")
-                    # Only commit once the tag is either found or ruled out;
-                    # a partial "[hap" must not be mistaken for no tag.
-                    if reaction is not None or not _EMOTION_TAG_MAYBE_RE.match(pending):
-                        emotion_resolved = True
-                        pending = stripped
-                        full_text_parts[:] = [stripped]
+                    pending, emotion_resolved = _resolve_emotion_tag(device_id, pending, t_start)
+                    if emotion_resolved:
+                        # The deltas gathered so far still carry the tag; the
+                        # stripped text replaces them so the reply the device
+                        # is sent matches what it was given to say.
+                        full_text_parts[:] = [pending]
                 ready, pending = _extract_ready_sentences(pending)
                 for sentence in ready:
-                    flush_sentence(sentence)
+                    speaker.speak(sentence)
     except urllib.error.HTTPError as exc:
-        if exc.code in (401, 403):
-            return _result(502, "authentication_failed")
-        if exc.code == 429:
-            return _result(503, "rate_limited")
-        return _result(502, "server_error")
+        return _gemini_http_failure(exc)
     except (urllib.error.URLError, TimeoutError, ValueError):
         return _result(504, "timeout")
 
     if pending.strip():
-        flush_sentence(pending)
+        speaker.speak(pending)
+    enqueued_count = speaker.enqueued
 
     # Same cleanup the spoken sentences got, so the text the device receives
     # matches what it just said instead of carrying leftover markup.
