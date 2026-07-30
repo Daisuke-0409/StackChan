@@ -424,12 +424,31 @@ RMS 7061〜23432 は再生中の実測で、しきい値 1400 の5〜16倍だっ
 **焼いて検証済み (Hash verified) だが、症状は解消しなかった。**
 この修正自体は実測に基づく本物のバグ潰しなので戻す必要はない。
 
-**次に疑うべき本命**: `Rejected UserSpeechEnded in Idle` が出ている。
-ハンズフリー経路が `UserSpeechStarted` を撃たずに `UserSpeechEnded` を撃っている、
-つまり**状態機械を `Listening` に入れないまま発話を終わらせている**可能性が高い。
-そうであれば自分の声とは無関係に**すべてのハンズフリー発話が失敗する**。
-`voice_input_controller.cpp` の follow-up 経路が state manager に何を通知しているかを、
-頭タッチ経路 (`OnButtonPressed` → `UserSpeechStarted`) と**並べて比較する**こと。
+**原因は特定済み (2026-07-30 23:00、コードで確認)**:
+
+| イベント | どこで発火するか |
+|---|---|
+| `UserSpeechStarted` | `voice_input_controller.cpp:340` — **頭タッチ経路だけ** |
+| `UserSpeechEnded` | 同 `:744` `StopRecordingAndUpload()` — **両方の経路が通る** |
+
+ハンズフリー経路は `FollowUpTick()` の中で `recording_ = true` を直接立てるだけで、
+**`UserSpeechStarted` を撃たない**。state machine は `Idle` のまま留まり、
+そこへ `UserSpeechEnded` が届いて拒否される。以降 `AiResponseReady` も
+`Idle`/`Speaking` で拒否され、会話全体が崩れる。**自分の声とは無関係に、
+すべてのハンズフリー発話がこの経路で失敗する。** 実機ログの
+`Rejected UserSpeechEnded in Idle` / `Rejected AiResponseReady in Idle` がこれ。
+
+**直し方**: follow-up が録音を開始する時点で、頭タッチ経路と同じく
+`UserSpeechStarted` を通知する。ただし `FollowUpTick()` は `mutex_` を保持したまま
+走るので、**state manager の Notify をロック内から呼ばないこと**
+(state manager は自前のロックを持つ。順序を保証していない2つのロックを
+重ねると deadlock になる)。ロックの外で撃つか、フラグを立てて呼び出し側で撃つ。
+
+**補足**: 自分の声のガード (`7a2b9a0`) は入れた後も、
+`Speaking -> Idle` の約1498ms後に `rms=8505` を拾っている。
+1500ms のクールダウンの境界ぎりぎり。上記を直した後で、
+**人の声の実測値**を見てから `kPostSpeechCooldownMs` と
+`kFollowUpSpeechRms` を調整すること。順序を逆にしないこと。
 
 **調査の障害**: 書き込み後、シリアルキャプチャが0バイトで取れていない
 (USB-Serial/JTAG がリセットで再列挙されるため)。**先にゲートウェイのログを
