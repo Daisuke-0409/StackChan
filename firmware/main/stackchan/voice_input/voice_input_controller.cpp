@@ -70,8 +70,24 @@ constexpr uint32_t kFollowUpWindowMs = 30000;
 // maximum analogue gain, so a quiet room still sits well above zero; this
 // was chosen to sit above room tone and below conversational speech at a
 // metre. Too low and the television holds the conversation open forever.
-constexpr int32_t kFollowUpSpeechRms = 1400;
-constexpr int32_t kFollowUpSilenceRms = 900;   // hysteresis, so one quiet
+// Measured on real hardware in this room, 2026-08-13, once the follow-up path
+// was working well enough to produce numbers at all:
+//
+//   room tone and small noises   1457 1759 1834 1868 2099 2257
+//   Daisuke speaking at a metre  6854 7034 7694 14146 16983 20288
+//
+// The old pair (1400 / 900) sat underneath the room rather than above it. 1400
+// meant a chair or a passing car read as somebody starting to talk, and 900 --
+// below anything this microphone ever reports -- meant the room never went
+// quiet, so an utterance never ended and every one of them ran to
+// kMaxRecordingMs. Thirty seconds of recording before a word could be sent is
+// what "unbearably laggy" was.
+//
+// There is a wide gap between the two measured groups, so put the pair in it
+// rather than at either edge: speech has to clear the loudest noise seen, and
+// silence has to sit above it too or the end of a sentence is never noticed.
+constexpr int32_t kFollowUpSpeechRms = 4000;
+constexpr int32_t kFollowUpSilenceRms = 2500;  // hysteresis, so one quiet
                                                // syllable does not end a
                                                // sentence
 // Silence that ends an utterance. Long enough to survive the gap between
@@ -476,7 +492,22 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
         follow_up_preroll_filled_ = false;
         return;
     }
-    if (!follow_up_open_ || recording_ || busy_) {
+    if (!follow_up_open_ || busy_) {
+        return;
+    }
+    // Deliberately not `|| recording_`. While a hands-free utterance is being
+    // recorded, this tick is the only thing that moves
+    // follow_up_quiet_since_ms_ forward, and CaptureTick reads that to decide
+    // both when the utterance ended and whether it lasted long enough to send.
+    // Returning early on recording_ froze that timestamp at the instant speech
+    // was detected, so every utterance measured as zero milliseconds long and
+    // was thrown away as "too short" exactly kFollowUpEndSilenceMs later --
+    // whatever was said, however loudly. Hands-free had never once worked, and
+    // could not have.
+    //
+    // A press-to-talk recording is a different matter: it is not this path's,
+    // and its end is the button release, so leave it alone.
+    if (recording_ && !follow_up_speech_) {
         return;
     }
     if (static_cast<int32_t>(now - follow_up_hold_until_ms_) < 0) {
@@ -651,14 +682,15 @@ bool VoiceInputController::CaptureTick(uint32_t now)
     if (is_recording) {
         bool ended = false;
         bool too_short = false;
+        int32_t spoken_ms = 0;
         {
             std::lock_guard<std::mutex> lock(mutex_);
             if (follow_up_open_ && follow_up_speech_ &&
                 static_cast<int32_t>(now - follow_up_quiet_since_ms_) >=
                     static_cast<int32_t>(kFollowUpEndSilenceMs)) {
                 ended     = true;
-                too_short = static_cast<int32_t>(follow_up_quiet_since_ms_ - follow_up_speech_start_ms_) <
-                            static_cast<int32_t>(kFollowUpMinSpeechMs);
+                spoken_ms = static_cast<int32_t>(follow_up_quiet_since_ms_ - follow_up_speech_start_ms_);
+                too_short = spoken_ms < static_cast<int32_t>(kFollowUpMinSpeechMs);
                 follow_up_speech_ = false;
             }
         }
@@ -669,7 +701,11 @@ bool VoiceInputController::CaptureTick(uint32_t now)
                 std::lock_guard<std::mutex> lock(mutex_);
                 recording_ = false;
                 buffer_.clear();
-                mclog::tagInfo(kTag, "follow-up sound too short, ignoring");
+                // The measured length, not just the verdict: this is the number
+                // that says whether kFollowUpMinSpeechMs and the RMS pair are
+                // set anywhere near right, and guessing at them instead of
+                // reading them is how they ended up below the room's own noise.
+                mclog::tagInfo(kTag, "follow-up sound too short ({}ms), ignoring", spoken_ms);
             }
             // Starting the recording announced UserSpeechStarted, which moved
             // the machine into Listening. Abandoning it has to move back out,
@@ -686,6 +722,12 @@ bool VoiceInputController::CaptureTick(uint32_t now)
             return true;
         }
         if (ended) {
+            // The counterpart to the "too short" line: how long the utterance
+            // that *did* get sent actually was. A hands-free turn that always
+            // reports kMaxRecordingMs means the room never went quiet enough
+            // for kFollowUpSilenceRms, which is what made every reply arrive
+            // thirty seconds late.
+            mclog::tagInfo(kTag, "follow-up utterance ended ({}ms), sending", spoken_ms);
             StopRecordingAndUpload(now);
             return false;
         }
