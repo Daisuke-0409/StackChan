@@ -510,6 +510,7 @@ C:\Users\mylit\エージェントAIプロトタイプver0.1\tachikoma_notifier\
 ## 8. 参照
 
 - **環境構築と運用手順のすべて: `README.md`** (これ1本で足りる)
+- **これから作るものの要件と受け入れ条件: `REQUIREMENTS.md`** (2026-08-13 作成。R1〜R8)
 - **会社セッションの記録: `firmware/docs/2026-07-28-office-session.md`**
   (自前サーバ構築・認証突破・上流コードの落とし穴・積み残し)
 - 直近の詳細な作業記録: `firmware/docs/2026-07-26-session-summary.md`
