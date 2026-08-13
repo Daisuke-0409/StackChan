@@ -134,7 +134,23 @@ $env:IDF_PYTHON_CHECK_CONSTRAINTS='no'
 
 インストールし直す必要はありません。壊れているのではなく、置き場所が違うだけです。
 
-### 1.9 PC側の notifier（使うなら）
+### 1.9 コーデックのクラッシュ修正を当てる（実機を焼くなら必須）
+
+`managed_components/` は ESP-IDF のコンポーネントマネージャが管理していて
+git には入りません。そこに**「エラーが起きたら意図的にクラッシュする」1行**があり、
+当たると**会話の直後に実機が再起動します**（1回目の会話は成功し、2回目以降が
+全部おかしくなる、という形で出ます）。
+
+ビルドの前に一度実行してください。**すでに当たっていれば何もしません。**
+
+```powershell
+python firmware\patches\apply_codec_dev_fix.py
+```
+
+コンポーネントを取り直した後（`dependencies.lock` が変わった、
+`managed_components/` を消した等）は、**もう一度実行してから焼くこと。**
+
+### 1.10 PC側の notifier（使うなら）
 
 追加の依存はありません。テストで動作確認できます。
 
@@ -145,7 +161,7 @@ python -m unittest discover -s notifier\tachikoma_notifier\tests -t notifier\tac
 
 268 件通れば OK です。
 
-### 1.10 別拠点の転送役（会社の PC だけ）
+### 1.11 別拠点の転送役（会社の PC だけ）
 
 会社の体を家の頭に繋ぐ中継です。**API キーもトークンも要りません**（運ぶだけで
 中を見ないため）。
@@ -297,6 +313,7 @@ python -m gateway.merge_memory people gateway\memory\people.json "$office\people
 
 | 症状 | まず疑うこと |
 |---|---|
+| **1回目は話せるが2回目以降が無反応・異様に遅い** | **実機がクラッシュして再起動している。** シリアルログに `Guru Meditation Error` と `rst:0xc` が出ていないか見る。1.9 の修正が当たっているか確認する。**ログを絞り込むとき `boot:` 行を捨てないこと** — 2週間これで見落とした |
 | 体が何も喋らない | **ゲートウェイが起動しているか。** デバイスログに `Connection reset by peer` / `speech queue poll failed` が出ていればこれ |
 | 401 が返る | `.env` の `DEVICE_TOKEN` と、実機に焼いた `TACHIKOMA_DEVICE_TOKEN` の不一致 |
 | 会社の体だけ喋らない | 会社 PC の転送役（`/healthz`）→ 家の PC → Tailscale のログイン、の順に確認 |
