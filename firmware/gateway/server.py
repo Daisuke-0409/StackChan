@@ -2115,12 +2115,37 @@ def _warm_biometrics() -> None:
     def load() -> None:
         t0 = time.monotonic()
         voice = biometrics.voice_available()
+        if voice:
+            # Loading the encoder is only half of it. voice_embedding() also
+            # goes through librosa, which leans on numba, which compiles on
+            # first use -- so warming the model left the path through it stone
+            # cold and the first person to speak after a restart paid for the
+            # compile inside the request they were waiting on. Measured here:
+            # voice_available() 7.8s, then the first real embedding another
+            # 14.9s, and 16ms for every one after it. On the device that showed
+            # up as 67 seconds between the transcription finishing and the
+            # reply being sent, long enough that it gave up and said nothing.
+            #
+            # So put a real clip through it. Silence is enough to make every
+            # layer run; what matters is that nothing is left to compile.
+            biometrics.voice_embedding(b"\x00\x00" * 16000 * 2, 16000)
         voice_ms = (time.monotonic() - t0) * 1000
         t1 = time.monotonic()
         face = biometrics.face_available()
         face_ms = (time.monotonic() - t1) * 1000
         _log(f"gateway biometrics warmed voice={voice} in {voice_ms:.0f}ms "
              f"face={face} in {face_ms:.0f}ms")
+        # Say what a False actually costs, at the volume it deserves. Without
+        # the voice encoder nobody is ever identified, so every listener is
+        # treated as a stranger and master-only facts -- a name, an address, a
+        # birthday -- are withheld from the model exactly as designed. From the
+        # outside that is indistinguishable from amnesia, and it went unnoticed
+        # for a day because the only trace was "voice=False" in one line.
+        if not voice and _speaker_id_enabled(dict(os.environ)):
+            _log("gateway WARNING speaker identification is OFF: the voice encoder "
+                 "could not be loaded, so nobody will be recognised and master-only "
+                 "memories stay hidden. Usually a python without torch/librosa -- "
+                 "check the 'python:' line from run_gateway.ps1.")
 
     threading.Thread(target=load, daemon=True).start()
 

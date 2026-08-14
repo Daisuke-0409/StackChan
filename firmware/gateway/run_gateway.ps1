@@ -57,4 +57,59 @@ Write-Host "LAN addresses: $addresses"
 Write-Host "The firmware's provisioned gateway URL must point at one of these."
 
 Set-Location $firmwareDir
-python -u gateway/server.py
+
+# Which python, decided here rather than left to PATH order. Speaker
+# identification needs torch, librosa and numpy; the gateway itself does not,
+# so a python without them starts perfectly well and simply stops recognising
+# anybody -- and then Tachikoma cannot reach the master-only memories and
+# appears to have forgotten who it is talking to. That is what happened on
+# 2026-08-14: a second interpreter (3.9) arrived ahead of the one the packages
+# are installed in (3.11), and the only sign was `voice=False` in one log line.
+#
+# Set TACHIKOMA_PYTHON in .env to override.
+$pythonCandidates = @()
+if ($env:TACHIKOMA_PYTHON) { $pythonCandidates += $env:TACHIKOMA_PYTHON }
+$pythonCandidates += (Get-Command python.exe -All -ErrorAction SilentlyContinue |
+                      Select-Object -ExpandProperty Source)
+
+# The probe catches its own ImportError and answers on stdout. Letting python
+# fail normally would write to stderr, and PowerShell turns a native command's
+# stderr into an ErrorRecord -- which, with $ErrorActionPreference = "Stop" at
+# the top of this file, aborts the launcher instead of trying the next
+# interpreter.
+$probe = @"
+try:
+    import numpy, torch, librosa
+    print('HAVE_DEPS')
+except Exception:
+    print('NO_DEPS')
+"@
+
+$python = $null
+foreach ($candidate in $pythonCandidates) {
+    if (-not (Test-Path $candidate)) { continue }
+    if ((& $candidate -c $probe) -contains 'HAVE_DEPS') { $python = $candidate; break }
+}
+
+if (-not $python) {
+    # Still start: a gateway that talks without recognising faces beats no
+    # gateway at all, and the alternative is silence with no explanation.
+    $python = if ($pythonCandidates.Count -gt 0) { $pythonCandidates[0] } else { "python" }
+    Write-Warning "No python with numpy/torch/librosa found. Speaker identification will be OFF,"
+    Write-Warning "which means master-only memories stay hidden and Tachikoma will not know who"
+    Write-Warning "it is speaking to. Checked: $($pythonCandidates -join ', ')"
+    Write-Warning "Install them there, or set TACHIKOMA_PYTHON in gateway\.env."
+}
+
+Write-Host "python: $python"
+
+# "Stop" is right for the configuration checks above -- a missing token should
+# not start a gateway that rejects everything. It is wrong for the server
+# itself. PowerShell turns a native command's stderr into an ErrorRecord, and
+# under "Stop" the first such line kills the launcher: OpenCV writes a harmless
+# setPreferableTarget notice to stderr while the face model loads, and that one
+# line was enough to take the whole gateway down a second or two after it had
+# started listening. It only appeared once the interpreter with OpenCV in it
+# was the one being chosen.
+$ErrorActionPreference = "Continue"
+& $python -u gateway/server.py
