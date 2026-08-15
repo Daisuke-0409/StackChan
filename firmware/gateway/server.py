@@ -1807,9 +1807,16 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
 
 
 class GatewayHandler(BaseHTTPRequestHandler):
+    # The G2 app runs in the Even App's WebView, served from a different
+    # origin (the Vite dev server, later the packaged app), so its calls to
+    # /v1/* are cross-origin and the browser demands CORS. "*" is safe here
+    # because nothing is cookie-authenticated: every consequential endpoint
+    # requires the bearer token, which a hostile page does not have, and the
+    # server is reachable only from the LAN and the tailnet.
     def _send(self, status: int, body: dict[str, Any]) -> None:
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
+        self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
@@ -1892,6 +1899,46 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
     def _get_ui(self, parsed: urllib.parse.SplitResult) -> None:
         self._send_html(webui.INDEX_HTML)
+
+    # The built G2 app, served by the same always-on process that answers it.
+    # A sideloaded Even Hub app is fetched from its URL at every launch, so
+    # whatever serves it decides when the glasses work; pointing the QR at the
+    # Vite dev window meant Tachikoma vanished from the lenses whenever that
+    # window closed. The gateway is already the thing that must be running for
+    # a conversation to exist at all, so it serves the shell too.
+    _G2_DIST = os.path.normpath(os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "..", "glasses", "dist"))
+    _G2_TYPES = {".html": "text/html; charset=utf-8",
+                 ".js": "text/javascript; charset=utf-8",
+                 ".css": "text/css; charset=utf-8",
+                 ".png": "image/png", ".svg": "image/svg+xml",
+                 ".json": "application/json; charset=utf-8"}
+
+    def _get_g2_config(self, parsed: urllib.parse.SplitResult) -> None:
+        # Hands the packaged G2 app its bearer token at launch, so the .ehpk
+        # uploaded to Even's portal carries no credentials. Unauthenticated by
+        # necessity (the caller is asking BECAUSE it has no token yet) and
+        # defended by the network perimeter instead: this server is reachable
+        # only from the LAN and the tailnet, the same boundary that already
+        # protects the served bundle. Per-entrance tokens with real pairing
+        # are R7's job.
+        self._send(200, {"token": os.environ.get("DEVICE_TOKEN", "")})
+
+    def _get_g2(self, parsed: urllib.parse.SplitResult) -> None:
+        if parsed.path == "/g2/config":
+            self._get_g2_config(parsed)
+            return
+        relative = parsed.path[len("/g2"):].lstrip("/") or "index.html"
+        target = os.path.normpath(os.path.join(self._G2_DIST, relative))
+        # normpath then prefix-check: the one defence that matters for a
+        # path taken from the request line.
+        if not target.startswith(self._G2_DIST) or not os.path.isfile(target):
+            self._send(404, {"error": "not_found"})
+            return
+        content_type = self._G2_TYPES.get(os.path.splitext(target)[1].lower(),
+                                          "application/octet-stream")
+        with open(target, "rb") as handle:
+            self._send_raw(200, content_type, handle.read())
 
     def _get_talk(self, parsed: urllib.parse.SplitResult) -> None:
         # The G2 entrance, one shell early: the same mic -> transcribe -> chat
@@ -2022,10 +2069,29 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         route(self, urllib.parse.urlsplit(self.path))
 
+    def do_OPTIONS(self) -> None:  # noqa: N802
+        # CORS preflight for the G2 app's cross-origin calls. Answered for
+        # any path: the preflight carries no credentials and grants nothing
+        # by itself -- the actual request still hits the bearer check.
+        self.send_response(204)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers",
+                         "Authorization, Content-Type, X-Device-Id, X-Sample-Rate")
+        self.send_header("Access-Control-Max-Age", "86400")
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         # GET is the only method that arrives with a query string, and
         # matching POST and PUT on the raw path is what they already did.
-        self._dispatch(self._GET_ROUTES, urllib.parse.urlsplit(self.path).path)
+        parsed = urllib.parse.urlsplit(self.path)
+        # /g2/* is the one prefix route: a static bundle with hashed asset
+        # names cannot be enumerated in an exact-match table.
+        if parsed.path == "/g2" or parsed.path.startswith("/g2/"):
+            self._get_g2(parsed)
+            return
+        self._dispatch(self._GET_ROUTES, parsed.path)
 
     def do_PUT(self) -> None:  # noqa: N802
         self._dispatch(self._PUT_ROUTES, self.path)
