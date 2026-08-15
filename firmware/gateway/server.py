@@ -882,6 +882,11 @@ def _identify_or_enrol(device_id: str, pcm: bytes, sample_rate: int, text: str) 
 
     if person is not None:
         _people_store.note_encounter(person["id"])
+        # Confident matches feed the enrolment. enrolment-branch adds are
+        # skipped here so an introduction does not store the same clip twice.
+        if enrolment is None and score >= people.VOICE_SAMPLE_REFRESH_THRESHOLD:
+            _people_store.add_embedding(person["id"], "voice", embedding)
+            _log(f"gateway voice sample refreshed from confident match score={score:.2f}")
         set_current_speaker(device_id, person, score, "voice")
         # Names are personal; the log records the decision, not the person.
         _log(f"gateway speaker identified role={person.get('role')} score={score:.2f}")

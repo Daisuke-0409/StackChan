@@ -73,6 +73,16 @@ DEFAULT_VISIBILITY = VISIBILITY_MASTER
 # there; guessing is how the wrong person hears something private.
 VOICE_MATCH_THRESHOLD = 0.62
 VOICE_MATCH_MARGIN = 0.06
+# A match this confident is allowed to refresh the enrolment itself: the new
+# clip is stored as another sample (add_embedding keeps the newest eight).
+# Without this the store only ever grows when somebody re-introduces
+# themselves by name -- Daisuke sat at one voice sample across 223 encounters,
+# and one sample against a 0.62 threshold is why identification kept dropping
+# to least privilege (measured best=0.53-0.58 on misses, 0.67-0.82 on hits).
+# Set well above VOICE_MATCH_THRESHOLD on purpose: anyone scoring this high is
+# already being identified as that person today, so learning from them adds
+# accuracy, not attack surface.
+VOICE_SAMPLE_REFRESH_THRESHOLD = 0.75
 # SFace's own documented cosine threshold for "same person".
 FACE_MATCH_THRESHOLD = 0.363
 FACE_MATCH_MARGIN = 0.05
