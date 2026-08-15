@@ -63,6 +63,15 @@ EXPLICIT_APPROVAL_PHRASES: FrozenSet[str] = frozenset(
         "はい承認します",
         "許可",
         "許可します",
+        # R4: the approval daemon announces a question ("...いいですか？"),
+        # so the natural spoken answers to it join the set. These are still
+        # exact matches after normalization -- "はいじゃない" or a negation
+        # can never match -- and every structural condition above (single
+        # pending, low risk, tool allowlist) still applies unchanged.
+        "はい",
+        "いいよ",
+        "オッケー",
+        "オーケー",
     }
 )
 

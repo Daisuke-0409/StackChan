@@ -509,3 +509,77 @@ recorded audio becomes STT text (that boundary stays at
 not add a CLI entrypoint tying microphone capture to a reply, and it does
 not modify `stackchan_speech_sink.py`, `windows_wave_synth.py`, or
 `notifier.py`.
+
+## R4: 承認リレーの配線 (approval_daemon + claude_hook_approval)
+
+Claude Code がツールの許可を求める → タチコマが読み上げる → 大輔が
+「はい/いいえ」で答える → 判定が Claude Code に返る。Step 2 で作った
+承認基盤 (`approval_store` / `voice_approval_gate` ほか) を実フローに
+繋いだのがこの2ファイル。
+
+- `approval_daemon.py` — PC 常駐。`http://127.0.0.1:8378/approval`
+  (ローカルホスト限定・変更不可) で PreToolUse hook JSON を受け、
+  ApprovalRequest 登録 → 既存 SpeechSink 経路で読み上げ →
+  デスクマイクで返事を聞く (pc_ear の区切り・キャリブレーション・
+  `/v1/transcribe` を再利用) → `{"decision": "allow"|"deny"|"ask"}` を返す
+- `claude_hook_approval.py` — hook クライアント。標準ライブラリのみで
+  自己完結 (PYTHONPATH 不要)。stdin の hook JSON をデーモンへ転送し、
+  allow/deny だけを stdout の hook 応答に変換する。ask と**あらゆる失敗**は
+  「何も出力せず exit 0」= Claude Code の通常の許可プロンプトに落ちる
+
+### 安全モデル (3文)
+
+音声で許可できるのは `SAFE_VOICE_TOOL_NAMES` (Read / Glob / Grep) の
+低リスク読み取り専用ツールだけで、それ以外は読み上げのみ・判定は必ず
+PC 側の通常プロンプトに残る (「はい」と言っても `VoiceApprovalGate` が
+拒否して "ask" になる)。何かが失敗したら — ゲートウェイ停止・マイク不在・
+時間切れ・聞き取り不能・例外 — 結果は必ず "ask" であり、"allow" に
+なる失敗経路は存在しない。"deny" は明確な「いいえ/だめ/やめて」、
+"allow" は明確な「はい/いいよ/オッケー」かつ既存ゲートの全条件
+(単一 pending・risk=low・ツール許可リスト・完全一致フレーズ) を
+通過したときだけ適用される。
+
+### 起動
+
+```powershell
+powershell -File notifier\run_approval_daemon.ps1
+```
+
+`run_pc_ear.ps1` と同じ流儀: `firmware\gateway\.env` を読み込み
+(`DEVICE_TOKEN` ほか)、sounddevice を import できる python を探して
+起動する。ゲートウェイと VOICEVOX が動いていること。読み上げ先は
+notifier と同じ選択則 (`TACHIKOMA_STACKCHAN_*` 3変数が揃えば実機、
+なければ Windows TTS)。`--log-only` で音声なしの動作確認ができる。
+
+### Claude Code への hook 登録
+
+`.claude\settings.json` (このリポジトリの設定は**手で**編集する。
+スクリプトはいじらない) に PreToolUse hook を足す:
+
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Read|Glob|Grep",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "C:\\Users\\mylit\\AppData\\Local\\Programs\\Python\\Python311\\python.exe C:\\Users\\mylit\\StackChanDev\\StackChan\\notifier\\tachikoma_notifier\\claude_hook_approval.py",
+            "timeout": 35
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+- `matcher` は声で承認したいツールに絞る。`Read|Glob|Grep` が音声承認の
+  全対象。リスクの高いツールも読み上げだけは欲しいなら matcher に足して
+  よい (デーモンが announce するが判定は常に "ask" → PC で通常確認)
+- `timeout` はクライアントの 30 秒より長くしておく (35 秒)
+- デーモンが起動していないときは即座に接続失敗 → 無出力 exit 0 なので、
+  hook を登録したまま日常作業をしても害はない (毎回ミリ秒の往復失敗のみ)
+- 許可プロンプトが出ないツール (すでに allow 済みのもの) には hook 判定が
+  適用されるため、matcher を広げすぎない
