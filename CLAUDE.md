@@ -289,6 +289,31 @@ ESP32 からゲートウェイへの通信の暗号化と、機体ごとの鍵�
   入力は R1 リング(回す・タップ)
 - iPhone は tailnet に在籍済み。**HTTPS化(人が使う面)が前提**(WebアプリはHTTPS配信が要る)
 - 逆解析による直接BLE制御も存在するが未完成。**公式SDKを使うこと**
+
+### Even G2 の追加調査 (2026-08-15 夜、登録完了後)
+
+**準備は全部済んだ**: Even Hub アカウント作成・Console 到達 /
+iPhone アプリの「ターミナルモード」ON (=Developer Mode の日本語名) /
+音声言語=日本語 / PC に Node v24 あり。
+
+**G2 関連は実は2系統ある。混同しないこと:**
+
+1. **Even Hub アプリ (R5 の本体)** — 自作アプリを QR サイドロードで
+   メガネに読ませる。`npm create vite` + `@evenrealities/even_hub_sdk` +
+   `evenhub` CLI。**シミュレータあり** (`evenhub-simulator http://localhost:5173`、
+   576×288 — 実機なしで開発可能)。タチコマとの会話はこちらで作る。
+   /talk ページ (実装済み) の中身を SDK の殻に移植する。
+2. **Even Terminal (公式機能・作らなくていい)** — Claude Code / Codex の
+   セッションをメガネに流す公式機能。PC で `@evenrealities/even-terminal`
+   (npm、既定ポート3456) を起動すると LAN URL とトークンが表示され、
+   iPhone アプリの「ホスト設定」に入れる (QRも可)。
+   **R4 と相性が良い**: メガネで Claude Code の様子を見ながら、
+   承認はタチコマに「はい」で返せる。
+
+**開発加速**: Even 公式の Claude Code プラグインがある。次セッションで
+`/plugin marketplace add even-realities/everything-evenhub` →
+`/plugin install everything-evenhub` (足場生成・シミュレータ・パッケージングの
+スキル12種)。R5 の見積は 1〜2 晩に短縮済み。
 `TACHIKOMA_MEMORY_DIR` をNASに向けることは可能だが、**ファイル共有に対して
 ゲートウェイを2台走らせてはいけない** (`os.replace` の原子性がSMBでは保証されず、
 互いの記憶を黙って消す)。複数ゲートウェイが要るならDB化が前提 =「Mac mini + NAS 移行」。
