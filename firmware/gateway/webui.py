@@ -316,3 +316,138 @@ MANIFEST_JSON = """{
   "theme_color": "#11161d",
   "icons": [{"src": "/ui/icon.png", "sizes": "512x512", "type": "image/png"}]
 }"""
+
+
+TALK_HTML = """<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Talk">
+<meta name="theme-color" content="#11161d">
+<title>タチコマと話す</title>
+<style>
+  :root {
+    --bg: #0f1419; --card: #1a2029; --line: #2b3441; --fg: #e7ecf3;
+    --muted: #93a1b3; --accent: #4da3ff; --danger: #ff6b6b; --ok: #4ade80;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f4f6f9; --card:#fff; --line:#dfe4ec; --fg:#141a22; --muted:#5c6b80; }
+  }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  body { margin:0; background:var(--bg); color:var(--fg);
+         font-family:-apple-system,"Hiragino Sans",sans-serif;
+         display:flex; flex-direction:column; height:100dvh; }
+  header { padding:12px 16px; border-bottom:1px solid var(--line);
+           display:flex; gap:10px; align-items:center; }
+  header h1 { font-size:16px; margin:0; flex:1; }
+  header label { font-size:12px; color:var(--muted); display:flex; gap:4px; align-items:center; }
+  #log { flex:1; overflow-y:auto; padding:16px; display:flex;
+         flex-direction:column; gap:10px; }
+  .line { max-width:85%; padding:10px 14px; border-radius:14px; line-height:1.5;
+          white-space:pre-wrap; word-break:break-word; }
+  .you { align-self:flex-end; background:var(--accent); color:#fff; }
+  .bot { align-self:flex-start; background:var(--card); border:1px solid var(--line);
+         font-size:18px; }
+  .sys { align-self:center; color:var(--muted); font-size:12px; }
+  footer { padding:12px 16px calc(12px + env(safe-area-inset-bottom));
+           border-top:1px solid var(--line); }
+  #ptt { width:100%; padding:18px; font-size:17px; font-weight:600;
+         border:none; border-radius:14px; background:var(--accent); color:#fff;
+         touch-action:none; user-select:none; -webkit-user-select:none; }
+  #ptt.rec { background:var(--danger); }
+  #token { width:100%; margin-top:8px; padding:8px; border-radius:8px;
+           border:1px solid var(--line); background:var(--card); color:var(--fg);
+           font-size:12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>タチコマと話す</h1>
+  <label><input type="checkbox" id="mouth" checked>実機の口から返す</label>
+</header>
+<div id="log"><div class="line sys">ボタンを押している間だけ録音します</div></div>
+<footer>
+  <button id="ptt">押しながら話す</button>
+  <input id="token" type="password" placeholder="DEVICE_TOKEN (最初の1回だけ)">
+</footer>
+<script>
+// G2 (Even Hub) アプリの中身の先行実装。BLE の殻を被せる前に、
+// マイク→/v1/transcribe→/v1/chat→文字表示、の本体をここで完成させておく。
+// 録音は ScriptProcessor で PCM を集め、16kHz int16 に落として送る --
+// MediaRecorder の webm/opus はゲートウェイが受けないため。
+const logEl = document.getElementById("log");
+const ptt = document.getElementById("ptt");
+const tokenEl = document.getElementById("token");
+tokenEl.value = localStorage.getItem("tachi_token") || "";
+tokenEl.addEventListener("change", () => localStorage.setItem("tachi_token", tokenEl.value));
+const say = (cls, text) => {
+  const d = document.createElement("div");
+  d.className = "line " + cls; d.textContent = text;
+  logEl.appendChild(d); logEl.scrollTop = logEl.scrollHeight;
+  return d;
+};
+const deviceId = () => document.getElementById("mouth").checked
+  ? "80456B4DE03C"   // 実機の ID: 返事はタチコマの口とモーションで出る
+  : "G2PREVIEW";     // 画面だけ: 実機は黙ったまま (外出先でうるさくしない)
+const session = "talk-" + Math.random().toString(36).slice(2, 10);
+
+let ctx = null, stream = null, node = null, chunks = [], capturing = false;
+async function start() {
+  if (!tokenEl.value) { say("sys", "先に DEVICE_TOKEN を入れてください"); return; }
+  stream = await navigator.mediaDevices.getUserMedia({audio: true});
+  ctx = new (window.AudioContext || window.webkitAudioContext)();
+  const src = ctx.createMediaStreamSource(stream);
+  node = ctx.createScriptProcessor(4096, 1, 1);
+  chunks = []; capturing = true;
+  node.onaudioprocess = (e) => { if (capturing) chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+  src.connect(node); node.connect(ctx.destination);
+  ptt.classList.add("rec"); ptt.textContent = "離すと送信";
+}
+function downsampleTo16k(buffers, fromRate) {
+  let total = 0; buffers.forEach(b => total += b.length);
+  const all = new Float32Array(total); let off = 0;
+  buffers.forEach(b => { all.set(b, off); off += b.length; });
+  const ratio = fromRate / 16000, outLen = Math.floor(all.length / ratio);
+  const out = new Int16Array(outLen);
+  for (let i = 0; i < outLen; i++) {
+    const v = all[Math.floor(i * ratio)];
+    out[i] = Math.max(-1, Math.min(1, v)) * 32767;
+  }
+  return out;
+}
+async function stop() {
+  if (!capturing) return;
+  capturing = false;
+  ptt.classList.remove("rec"); ptt.textContent = "押しながら話す";
+  const rate = ctx.sampleRate;
+  node.disconnect(); stream.getTracks().forEach(t => t.stop()); ctx.close();
+  const pcm = downsampleTo16k(chunks, rate);
+  if (pcm.length < 16000 * 0.4) { say("sys", "短すぎました"); return; }
+  const busy = say("sys", "認識中...");
+  const auth = {"Authorization": "Bearer " + tokenEl.value};
+  try {
+    const tr = await fetch("/v1/transcribe", {method:"POST", body:pcm.buffer,
+      headers:{...auth, "Content-Type":"application/octet-stream",
+               "X-Device-Id":deviceId(), "X-Sample-Rate":"16000"}});
+    const trBody = await tr.json();
+    if (!tr.ok || !trBody.text) { busy.textContent = "聞き取れませんでした"; return; }
+    busy.remove(); say("you", trBody.text);
+    const thinking = say("sys", "考え中...");
+    const ch = await fetch("/v1/chat", {method:"POST",
+      headers:{...auth, "Content-Type":"application/json"},
+      body:JSON.stringify({device_id:deviceId(), session_id:session,
+                           request_id:"r-"+Date.now(), text:trBody.text})});
+    const chBody = await ch.json();
+    thinking.remove();
+    say("bot", ch.ok && chBody.text ? chBody.text : "(返事に失敗しました)");
+  } catch (err) { busy.textContent = "通信エラー: " + err.message; }
+}
+ptt.addEventListener("pointerdown", (e) => { e.preventDefault(); start(); });
+ptt.addEventListener("pointerup",   (e) => { e.preventDefault(); stop(); });
+ptt.addEventListener("pointercancel", () => stop());
+</script>
+</body>
+</html>
+"""

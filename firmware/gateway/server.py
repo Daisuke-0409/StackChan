@@ -1893,6 +1893,14 @@ class GatewayHandler(BaseHTTPRequestHandler):
     def _get_ui(self, parsed: urllib.parse.SplitResult) -> None:
         self._send_html(webui.INDEX_HTML)
 
+    def _get_talk(self, parsed: urllib.parse.SplitResult) -> None:
+        # The G2 entrance, one shell early: the same mic -> transcribe -> chat
+        # -> text loop the Even Hub app will run, served as a phone page first
+        # so the pipeline is proven before the BLE shell goes around it. The
+        # page itself is public like /ui; every API call it makes carries the
+        # bearer token the user pastes in once.
+        self._send_html(webui.TALK_HTML)
+
     def _get_ui_manifest(self, parsed: urllib.parse.SplitResult) -> None:
         self._send_raw(200, "application/manifest+json", webui.MANIFEST_JSON.encode("utf-8"))
 
@@ -1990,6 +1998,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         "/": _get_ui,
         "/ui": _get_ui,
         "/ui/": _get_ui,
+        "/talk": _get_talk,
         "/ui/manifest.json": _get_ui_manifest,
         "/ui/icon.png": _get_ui_icon,
         "/v1/settings": _get_settings,
