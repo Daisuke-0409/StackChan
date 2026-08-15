@@ -139,6 +139,12 @@ private:
     // which may be below kMaxRecordingSamples if PSRAM was short at the time.
     // Capture is clamped to this, not to the constant.
     size_t recording_capacity_samples_ = 0;
+    // Who started the current recording. A Release may only stop a recording
+    // its own Press began: the touch sensor rides on the moving head, and the
+    // press-side guards (state, cooldown, motion settling) exist only on
+    // Press -- so a vibration-induced stray Release, with no guard of its
+    // own, was free to cut a hands-free utterance off mid-word.
+    bool recording_via_press_ = false;
     VoiceInputErrorCode last_error_ = VoiceInputErrorCode::None;
 
     // Post-speech cooldown (see kPostSpeechCooldownMs in the .cpp): a

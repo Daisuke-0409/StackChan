@@ -306,6 +306,7 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
             return;
         }
         recording_ = true;
+        recording_via_press_ = true;
         recording_started_ms_ = now;
         follow_up_speech_ = false;   // a deliberate press supersedes any
                                      // hands-free utterance in progress
@@ -358,6 +359,18 @@ void VoiceInputController::OnButtonPressed(uint32_t now)
 
 void VoiceInputController::OnButtonReleased(uint32_t now)
 {
+    {
+        std::lock_guard<std::mutex> lock(mutex_);
+        // See recording_via_press_'s declaration: every guard against a
+        // vibration-induced touch lives on the Press side, so the paired
+        // stray Release used to arrive here unchallenged and truncate a
+        // hands-free utterance mid-word. A hands-free recording ends on
+        // silence, not on a button.
+        if (recording_ && !recording_via_press_) {
+            mclog::tagInfo(kTag, "release ignored: recording is hands-free");
+            return;
+        }
+    }
     StopRecordingAndUpload(now);
 }
 
@@ -402,6 +415,12 @@ void VoiceInputController::OpenFollowUp(uint32_t now)
     const bool was_open = follow_up_open_;
     follow_up_open_     = true;
     follow_up_until_ms_ = now + kFollowUpWindowMs;
+    // Arm the self-voice hold here, not in FollowUpTick. The tick only runs
+    // while this window is open, and the window opens on the Speaking -> Idle
+    // edge -- so a hold armed from inside the tick is never armed during the
+    // speech it exists to ignore. Measured: the window opened and 7ms later the
+    // tail of the robot's own reply read rms 8153 and started a recording.
+    follow_up_hold_until_ms_ = now + kPostSpeechCooldownMs;
     follow_up_speech_   = false;
     follow_up_quiet_since_ms_ = now;
     follow_up_preroll_.assign(kFollowUpPrerollSamples, 0);
@@ -430,6 +449,9 @@ void VoiceInputController::CloseFollowUp(const char* why)
     }
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
+        // Guarded like every other Enable* call -- see the note in
+        // StopRecordingAndUpload above.
+        std::lock_guard<std::mutex> codec_lock(stackchan::hal::GetAudioCodecMutex());
         codec->EnableInput(false);
     }
     Application::GetInstance().GetAudioService().SetAudioInputPaused(false);
@@ -441,8 +463,8 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
     // Read the state before taking mutex_: the state manager holds its own, and
     // taking two locks in an order nothing else guarantees is how deadlocks get
     // built.
-    const bool speaking = tachikoma_state::GetTachikomaStateManager().GetCurrentState() ==
-                          tachikoma_state::TachikomaState::Speaking;
+    const auto state = tachikoma_state::GetTachikomaStateManager().GetCurrentState();
+    const bool speaking = state == tachikoma_state::TachikomaState::Speaking;
 
     // Level of this frame. Mean of squares in 64-bit: a 20ms frame of loud
     // audio overflows int32 well before the divide.
@@ -524,8 +546,17 @@ void VoiceInputController::FollowUpTick(uint32_t now, const std::vector<int16_t>
                 follow_up_preroll_filled_ = true;
             }
         }
-        if (rms >= kFollowUpSpeechRms) {
+        // Idle only. The window stays open through the whole exchange, so
+        // without this a noise during Thinking started a recording whose
+        // UserSpeechStarted the state machine rejected (no rule for it) but
+        // whose upload still ran -- a second transcription racing the reply
+        // that is already being generated. The gateway log shows the residue:
+        // transcriptions that were answered by nothing (21:52-21:54 on the
+        // 14th). Speaking is already handled above; this covers Thinking and
+        // Error as well.
+        if (rms >= kFollowUpSpeechRms && state == tachikoma_state::TachikomaState::Idle) {
             follow_up_speech_          = true;
+            recording_via_press_      = false;
             follow_up_speech_start_ms_ = now;
             follow_up_quiet_since_ms_  = now;
             // Hand the pre-roll over as the start of the recording, oldest
@@ -813,6 +844,10 @@ void VoiceInputController::StopRecordingAndUpload(uint32_t now)
 
     auto* codec = Board::GetInstance().GetAudioCodec();
     if (codec != nullptr) {
+        // Same guard as every other Enable* call site: the codec is shared
+        // with SpeechAnnouncer and AudioService, and this was one of two
+        // spots touching it bare while an announcement could be mid-write.
+        std::lock_guard<std::mutex> codec_lock(stackchan::hal::GetAudioCodecMutex());
         codec->EnableInput(false);
     }
     // Unconditional and unpaired with the pause call in OnButtonPressed()
