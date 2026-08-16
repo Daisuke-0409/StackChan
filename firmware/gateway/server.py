@@ -575,7 +575,10 @@ def _result(status: int, code: str, **extra: Any) -> tuple[int, dict[str, Any]]:
 
 def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
     expected = env.get("DEVICE_TOKEN", "")
-    supplied = headers.get("Authorization", "")
+    # Header names are case-insensitive on the wire (an iPhone Shortcut
+    # typed as "authorization" is just as valid), but these headers arrive
+    # as a plain dict whose lookup isn't. Fold the key, not the value.
+    supplied = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
     if not expected:
         return env.get("AI_PROVIDER", "mock") == "mock" and env.get("ALLOW_INSECURE_DEV") == "1"
     return supplied == f"Bearer {expected}"
