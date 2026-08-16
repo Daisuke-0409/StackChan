@@ -43,12 +43,20 @@ def _normalize(text: str) -> str:
     return unicodedata.normalize("NFKC", text)
 
 
+# Without a chain word the bar is higher: an imperative order phrase, not
+# just the word 注文 somewhere ("さっきの注文どうなった？" must stay chat).
+_IMPERATIVE_ORDER_RE = re.compile(
+    r"(モバイルオーダー|注文|オーダー)(し(て|よう|たい)|お願い|入れて)|頼んで|買って")
+DEFAULT_CHAIN = "mcd"  # the only chain with an adapter today
+
+
 def detect(text: str) -> Optional[OrderIntent]:
     """OrderIntent if this utterance asks for a mobile order, else None.
 
-    Requires BOTH a chain word and an order word: "マックってどこ？" or
-    "注文の仕方教えて" alone must not start a job that ends in a payment
-    gate.
+    A chain word plus any order word is enough ("マックでコーヒー、オーダー"),
+    and an imperative order phrase alone falls back to DEFAULT_CHAIN --
+    nobody says マック every time, and the approval readback names the
+    store before anything is confirmed anyway.
     """
     normalized = _normalize(text)
     chain = None
@@ -56,7 +64,11 @@ def detect(text: str) -> Optional[OrderIntent]:
         if any(w in normalized for w in words):
             chain = chain_id
             break
-    if chain is None or not any(w in normalized for w in ORDER_WORDS):
+    if chain is None:
+        if not _IMPERATIVE_ORDER_RE.search(normalized):
+            return None
+        chain = DEFAULT_CHAIN
+    elif not any(w in normalized for w in ORDER_WORDS):
         return None
 
     pickup = None

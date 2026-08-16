@@ -38,6 +38,18 @@ class DetectTest(unittest.TestCase):
         result = intent.detect("スタバでラテを注文して")
         self.assertEqual(result.chain, "starbucks")
 
+    def test_no_chain_imperative_defaults_to_mcd(self):
+        result = intent.detect("アイスコーヒーを注文して")
+        self.assertIsNotNone(result)
+        self.assertEqual(result.chain, "mcd")
+        self.assertIn("アイスコーヒー", result.item_text)
+
+    def test_no_chain_status_question_stays_chat(self):
+        self.assertIsNone(intent.detect("さっきの注文どうなった？"))
+
+    def test_no_chain_noun_only_stays_chat(self):
+        self.assertIsNone(intent.detect("モバイルオーダーって何？"))
+
 
 class MatchMenuTest(unittest.TestCase):
     MENU = [
