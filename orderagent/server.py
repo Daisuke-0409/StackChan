@@ -18,7 +18,7 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-from . import config, congestion, db, intent, stores
+from . import ai_match, config, congestion, db, intent, stores
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
@@ -140,12 +140,21 @@ def _build(job: dict[str, Any]) -> None:
         return
     parts = intent.split_items(job["item_text"])
     resolved = []
+    interpretations = []  # spoken -> resolved name, said aloud in the readback
     for part in parts:
         matches = intent.match_menu(part, menu_items)
         if not matches:
-            _fail(job, "needs_info",
-                  f"「{part}」がメニューに見つからなかったよ。正式な商品名でもう一度お願い。")
-            return
+            # 通称・略称 (ダブチ, シャカポテ...) は正式名の部分文字列ですら
+            # ないので、AIにメニューを読ませて推測させる。推測は読み上げで
+            # 必ず「〜と解釈したよ」と提示され、承認ゲートを通る。
+            matches = ai_match.suggest(part, menu_items)
+            if not matches:
+                _fail(job, "needs_info",
+                      f"「{part}」がメニューに見つからなかったよ。別の言い方でもう一度お願い。")
+                return
+            interpretations.append(f"「{part}」は{matches[0]['name']}のことだと解釈したよ。")
+            _log(job["job_id"], "ai_menu_guess",
+                 {"spoken": part, "guessed": matches[0]["name"]})
         resolved.append(matches[0])
     # A spoken quantity applies to a single-item order; multi-item orders
     # take one of each (per-item counts can come later -- guessing which
@@ -208,7 +217,8 @@ def _build(job: dict[str, Any]) -> None:
         key = (line["name"], line["price"])
         counted[key] = counted.get(key, 0) + line.get("quantity", 1)
     items_spoken = "、".join(f"{name} {qty}点" for (name, _), qty in counted.items())
-    summary = (f"{job['store_name']}、{items_spoken}、"
+    interpretation_note = "".join(interpretations)
+    summary = (f"{interpretation_note}{job['store_name']}、{items_spoken}、"
                f"{pickup_spoken}、合計{spoken_total}円。{advice}"
                f"注文は決済後キャンセルできないよ。注文していい？"
                f"「注文して」で確定、「キャンセル」で中止だよ。")

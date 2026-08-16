@@ -175,27 +175,28 @@ _NAV_JS = """
 (url) => { history.pushState({}, '', url); dispatchEvent(new PopStateEvent('popstate')); }
 """
 
-# Each cart line carries its own 変更 button, and the page renders the whole
-# cart list TWICE (two sibling ULs with identical rows -- reading both
-# double-counted every item and every yen until 2026-08-16). Rows are
-# grouped by their ancestor UL and only the first list is returned.
+# Cart rows are the LIs that show a yen price AND a bare quantity number.
+# Do NOT anchor on the 変更 button: customizable items have one, plain items
+# (fries...) don't, and a 変更-anchored scrape silently dropped every plain
+# item from the cart until 2026-08-16. The page also renders the cart list
+# more than once (sibling ULs), so rows are grouped per UL and the largest
+# single group is taken -- listing-page product cards never match because
+# they carry no bare quantity line.
 _ROWS_JS = """
 () => {
   const uls = new Map();
-  document.querySelectorAll('button').forEach((b) => {
-    if (b.innerText.trim() !== '変更') return;
-    let el = b.parentElement, row = null, ul = null;
-    for (let k = 0; k < 8 && el; k++, el = el.parentElement) {
-      if (!row && /[\\u00A5\\uFFE5]\\s*[0-9,]+/.test(el.innerText)) row = el;
-      if (el.tagName === 'UL') { ul = el; break; }
-    }
-    if (!row) return;
-    const key = ul || document.body;
-    if (!uls.has(key)) uls.set(key, []);
-    uls.get(key).push(row.innerText);
+  document.querySelectorAll('li').forEach(li => {
+    const t = li.innerText;
+    if (!/[\\u00A5\\uFFE5]\\s*[0-9,]+/.test(t)) return;
+    const lines = t.split('\\n').map(s => s.trim()).filter(Boolean);
+    if (!lines.some(ln => /^[0-9]+$/.test(ln))) return;
+    const ul = li.closest('ul') || document.body;
+    if (!uls.has(ul)) uls.set(ul, []);
+    uls.get(ul).push(t);
   });
   const lists = [...uls.values()];
-  return lists.length ? lists[0] : [];
+  lists.sort((a, b) => b.length - a.length);
+  return lists[0] || [];
 }
 """
 
