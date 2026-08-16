@@ -173,6 +173,25 @@ copy firmware\gateway\.env.forwarder.example firmware\gateway\.env.forwarder
 `.env.forwarder` の `FORWARDER_TARGET` に、**家の PC の Tailscale アドレス**を書きます。
 家の PC で `tailscale ip -4` を実行すると分かります。
 
+### 1.12 モバイルオーダー（使うなら）
+
+音声でマクドナルドのWeb版モバイルオーダーを組み立てる別プロセスです。
+ゲートウェイとは独立していて、動いていなくても通常会話には影響しません。
+
+```powershell
+python -m pip install playwright
+python -m playwright install chromium
+powershell -File orderagent\run_orderagent.ps1
+```
+
+- 設定は `firmware\gateway\.env` を共用（DEVICE_TOKEN を読むだけ）
+- **決済は既定でドライラン**。`ORDER_PAYMENT_ENABLED=1` を書かない限り
+  1円も動きません（書いても現状は決済クリック部が未実装のため拒否されます）
+- 現在地連動は [docs/iphone_gps_shortcut.md](docs/iphone_gps_shortcut.md)。
+  送らなければ既定店舗（`ORDER_DEFAULT_STORE_KEY`、初期値=高鍋店）です
+- 話しかけ方: 「マックでハンバーガーとアイスコーヒーSをテイクアウトで注文して」→
+  読み上げを聞いて「注文して」or「キャンセル」
+
 ---
 
 ## 2. 動かす

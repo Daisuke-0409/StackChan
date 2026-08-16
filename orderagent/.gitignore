@@ -1,0 +1,4 @@
+# Runtime state: store caches, sqlite audit/history, per-job screenshots,
+# and the browser profile. The profile is the one place payment methods
+# live (entered by hand) -- it must never reach git.
+data/

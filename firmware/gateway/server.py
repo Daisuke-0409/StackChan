@@ -39,9 +39,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
 try:  # package import when run as gateway.server, plain when run as a script
-    from . import biometrics, people, settings_store, webui
+    from . import biometrics, order_bridge, people, settings_store, webui
 except ImportError:  # pragma: no cover - depends on how the server is started
     import biometrics
+    import order_bridge
     import people
     import settings_store
     import webui
@@ -664,6 +665,31 @@ _MANNER_ON_RE = re.compile(r"(マナーモード|静かにして|動かないで
 _MANNER_OFF_RE = re.compile(r"(マナーモード|静か).*(解除|やめて|終わり|オフ|off)|(動いて(いい|ok|OK)|普通に戻)")
 _pending_command: dict[str, str] = {}
 _pending_command_lock = threading.Lock()
+
+
+# Last known phone location (R-mobile-order FR-2): posted by an iPhone
+# shortcut over the tailnet, read by the order bridge when a job starts.
+# One slot, newest wins; nothing here is persisted across restarts.
+_last_location: dict[str, float] = {}
+_last_location_lock = threading.Lock()
+
+
+def set_last_location(lat: float, lng: float) -> None:
+    with _last_location_lock:
+        _last_location.clear()
+        _last_location.update({"lat": lat, "lng": lng, "ts": time.time()})
+
+
+def get_last_location(max_age_seconds: float = 3600.0) -> Optional[dict[str, float]]:
+    """The last reported location, or None if stale/absent. Staleness
+    matters: ordering at the nearest store to where the phone was this
+    morning is worse than falling back to the default store."""
+    with _last_location_lock:
+        if not _last_location:
+            return None
+        if time.time() - _last_location["ts"] > max_age_seconds:
+            return None
+        return dict(_last_location)
 
 
 def detect_manner_command(text: str) -> Optional[str]:
@@ -1585,6 +1611,22 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
         set_pending_command(payload["device_id"], command)
         _log(f"gateway manner command={command}")
 
+    # Mobile order (FR-1/FR-5): checked before the LLM so an order utterance
+    # or an approval answer never becomes small talk. order_bridge fails
+    # soft -- agent down means None, and chat continues untouched.
+    order_reply = order_bridge.intercept(text, payload["device_id"], get_last_location())
+    if order_reply is not None:
+        _log(f"gateway order_bridge reply_len={len(order_reply)}")
+        if settings_store.get("speech_enabled"):
+            pcm = _tts_pcm(order_reply, env) or _generate_beep_pcm()
+            enqueue_status, enqueue_body = enqueue_speech(payload["device_id"], pcm)
+            if enqueue_status != 200:
+                _log(f"gateway order_bridge enqueue failed status={enqueue_status} "
+                     f"error={enqueue_body.get('error')}")
+        _remember_exchange(payload["device_id"], text, order_reply, env)
+        return 200, {"text": order_reply, "request_id": payload["request_id"],
+                     "session_id": payload["session_id"], "is_final": True}
+
     provider = env.get("AI_PROVIDER", "mock").lower()
     if provider == "gemini" and _gemini_streaming_enabled(env):
         # Owns TTS/enqueue itself (per completed sentence, as they arrive)
@@ -2024,6 +2066,69 @@ class GatewayHandler(BaseHTTPRequestHandler):
             return
         self._send(*enqueue_speech(device_id, audio))
 
+    def _post_location(self, parsed: urllib.parse.SplitResult) -> None:
+        # An iPhone shortcut posts {"lat": .., "lng": ..} here (FR-2). Same
+        # bearer token as every other endpoint; the tailnet is the transport.
+        body = self._read_bounded_body(4096)
+        if not _authorized(dict(self.headers), os.environ):
+            self._send(401, {"error": "authentication_failed"})
+            return
+        try:
+            payload = json.loads(body or b"{}")
+            lat = float(payload["lat"])
+            lng = float(payload["lng"])
+            if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+                raise ValueError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, {"error": "invalid_input"})
+            return
+        set_last_location(lat, lng)
+        _log(f"gateway location updated lat={lat:.4f} lng={lng:.4f}")
+        self._send(200, {"ok": True})
+
+    def _get_location(self, parsed: urllib.parse.SplitResult) -> None:
+        if not _authorized(dict(self.headers), os.environ):
+            self._send(401, {"error": "authentication_failed"})
+            return
+        self._send(200, {"location": get_last_location()})
+
+    def _post_announce(self, parsed: urllib.parse.SplitResult) -> None:
+        # Text-to-announcement: TTS + enqueue for the device, so local
+        # processes (order agent, approval daemon) can make the robot speak
+        # without carrying their own TTS credentials. /v1/speak stays the
+        # raw-PCM sibling for callers that already have audio.
+        body = self._read_bounded_body(8192)
+        if not _authorized(dict(self.headers), os.environ):
+            self._send(401, {"error": "authentication_failed"})
+            return
+        try:
+            payload = json.loads(body or b"{}")
+            device_id = payload["device_id"]
+            text = payload["text"]
+            if not isinstance(device_id, str) or not device_id \
+                    or not isinstance(text, str) or not text.strip():
+                raise ValueError
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            self._send(400, {"error": "invalid_input"})
+            return
+        # Sentence by sentence, like the streaming chat path: one PCM blob
+        # for a long announcement exceeds MAX_SPEECH_AUDIO_BYTES (observed
+        # 413 on the first real order readback), while per-sentence chunks
+        # queue behind each other via append and play in order.
+        sentences = [s for s in re.split(r"(?<=[。！？!?])", text[:1000]) if s.strip()]
+        enqueued = 0
+        for sentence in sentences:
+            pcm = _tts_pcm(sentence, os.environ)
+            if pcm is None:
+                continue
+            status, body = enqueue_speech(device_id, pcm, append=enqueued > 0)
+            if status == 200:
+                enqueued += 1
+        if enqueued == 0:
+            self._send(502, {"error": "tts_failed"})
+            return
+        self._send(200, {"ok": True, "sentences": enqueued})
+
     def _post_transcribe(self, parsed: urllib.parse.SplitResult) -> None:
         debug = _debug_logging_enabled(os.environ)  # TEMPORARY, see DEBUG_AUDIO_DIR block
         t_upload_start = time.monotonic() if debug else None
@@ -2052,6 +2157,7 @@ class GatewayHandler(BaseHTTPRequestHandler):
         "/v1/people": _get_people,
         "/health": _get_health,
         "/v1/speak_queue": _get_speak_queue,
+        "/v1/location": _get_location,
     }
     _PUT_ROUTES = {"/v1/settings": _put_settings}
     _POST_ROUTES = {
@@ -2060,6 +2166,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         "/v1/vision": _post_vision,
         "/v1/speak": _post_speak,
         "/v1/transcribe": _post_transcribe,
+        "/v1/location": _post_location,
+        "/v1/announce": _post_announce,
     }
 
     def _dispatch(self, routes: dict[str, Any], match: str) -> None:
