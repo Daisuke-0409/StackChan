@@ -40,11 +40,12 @@ def main() -> None:
             has_touch=True,
         )
         page = context.pages[0] if context.pages else context.new_page()
-        page.goto(f"https://www.mcdonalds.co.jp/order/{store_key}",
+        # Entry is the product deep link, not the store listing: since
+        # 2026-08-19 /order/<key> itself 302s to the marketing page (the
+        # entrance-hiding campaign advancing), while deeper SPA routes
+        # still load. Verified live the same evening.
+        page.goto(f"https://www.mcdonalds.co.jp/order/{store_key}/products/{product_id}",
                   wait_until="networkidle", timeout=60000)
-        page.wait_for_timeout(1500)
-        mcd_adapter._dismiss_notices(page)
-        page.evaluate(mcd_adapter._NAV_JS, f"/order/{store_key}/products/{product_id}")
         page.wait_for_timeout(1500)
         mcd_adapter._dismiss_notices(page)
         page.get_by_role("button", name="カートに追加").first.click(timeout=15000)

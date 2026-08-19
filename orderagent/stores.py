@@ -23,7 +23,11 @@ from typing import Any, Optional
 from . import config
 
 POI_URL = "https://map.mcdonalds.co.jp/api/poi"
-ORDER_PAGE = "https://www.mcdonalds.co.jp/order/{key}"
+# A DEEP route, deliberately: /order/<key> itself 302s to the marketing page
+# since 2026-08-19, but deeper SPA paths still serve the shard-bearing
+# bootstrap HTML. Routing is client-side, so the product id need not exist;
+# 1010 (ハンバーガー) is used because it happens to be real everywhere.
+ORDER_PAGE = "https://www.mcdonalds.co.jp/order/{key}/products/1010"
 DATA_HOST = "https://data.cat.group-{shard}.prod.mop.mcd.qorcommerce.com"
 _POI_CACHE_SECONDS = 24 * 3600
 _SHARD_RE = re.compile(r"group-([a-z0-9]+)")

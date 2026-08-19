@@ -18,7 +18,9 @@ from typing import Any, Callable
 
 from . import config
 
-ORDER_URL = "https://www.mcdonalds.co.jp/order/{key}"
+# The store listing /order/<key> is NOT a usable entry any more -- it 302s
+# to the marketing page since 2026-08-19. Product deep links still load the
+# SPA and are the only door left.
 PRODUCT_URL = "https://www.mcdonalds.co.jp/order/{key}/products/{pid}"
 
 _CAPTCHA_MARKERS = ["recaptcha", "hcaptcha", "captcha", "私はロボットではありません"]
@@ -61,26 +63,6 @@ def _dismiss_notices(page: Any) -> None:
             return
 
 
-_CLEAR_CONFIRM = re.compile(r"^(削除する|削除|はい|OK|ＯＫ)$")
-
-
-def _clear_cart(page: Any, job_dir: Path) -> None:
-    """Empties any leftover cart on the listing page. Idempotent."""
-    clear = page.get_by_role("button", name="全て削除")
-    if clear.count() == 0 or not clear.first.is_visible():
-        return
-    clear.first.click(timeout=5000)
-    _sleep()
-    confirm = page.get_by_role("button", name=_CLEAR_CONFIRM)
-    if confirm.count() and confirm.first.is_visible():
-        confirm.first.click(timeout=5000)
-        _sleep()
-    if page.get_by_role("button", name="全て削除").count() and \
-            page.get_by_role("button", name="全て削除").first.is_visible():
-        _shot(page, job_dir, "cart_clear_failed")
-        raise EscalationNeeded("既存カートを空にできませんでした")
-
-
 def _shot(page: Any, job_dir: Path, name: str) -> None:
     try:
         page.screenshot(path=str(job_dir / f"{name}.png"), full_page=False)
@@ -116,26 +98,28 @@ def build_cart(store_key: str, items: list[dict[str, Any]], job_id: str,
         try:
             page = context.pages[0] if context.pages else context.new_page()
 
-            # The cart survives across browser launches (server/cookie side,
-            # observed 2026-08-16: a hamburger from a previous session doubled
-            # the total). Every job therefore starts by emptying it -- cart
-            # verification is meaningless over leftovers.
-            page.goto(ORDER_URL.format(key=store_key),
-                      wait_until="networkidle", timeout=45000)
-            _check_for_captcha(page)
-            _sleep()
-            _dismiss_notices(page)
-            _clear_cart(page, job_dir)
-
+            # Entry is the FIRST PRODUCT's deep link. Two site facts force
+            # this shape (both verified live 2026-08-19):
+            # - /order/<key> itself now 302s to the marketing page (the
+            #   entrance-hiding campaign advancing), while deeper SPA routes
+            #   still load -- so the listing cannot be the way in.
+            # - The cart lives only in the SPA's memory, and a full reload
+            #   between products drops everything added so far (2026-08-16),
+            #   so every navigation AFTER the first must be pushState +
+            #   popstate, the way a tap on a product card walks the router.
+            # A fresh launch always starts with an empty cart (session-
+            # scoped, established 8/16 across repeated runs), which is what
+            # made dropping the listing-based cart clearing possible at all.
+            entered = False
             for index, item in enumerate(items):
                 for _ in range(int(item.get("quantity", 1))):
-                    # In-app navigation, NOT page.goto(): the cart lives only
-                    # in the SPA's memory, and a full reload between products
-                    # silently drops everything added so far (observed
-                    # 2026-08-16 -- the first item vanished from a two-item
-                    # order). pushState + popstate walks the router the way
-                    # a tap on a product card would.
-                    page.evaluate(_NAV_JS, f"/order/{store_key}/products/{item['id']}")
+                    product_path = f"/order/{store_key}/products/{item['id']}"
+                    if not entered:
+                        page.goto(PRODUCT_URL.format(key=store_key, pid=item["id"]),
+                                  wait_until="networkidle", timeout=45000)
+                        entered = True
+                    else:
+                        page.evaluate(_NAV_JS, product_path)
                     page.wait_for_timeout(1500)
                     _check_for_captcha(page)
                     _dismiss_notices(page)
