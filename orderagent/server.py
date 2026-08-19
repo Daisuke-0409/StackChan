@@ -89,52 +89,91 @@ def _fail(job: dict[str, Any], status: str, spoken: str) -> None:
         _announce_async(job["device_id"], spoken)
 
 
+def _adapter_for(chain: str):
+    """The adapter for a chain, or None when nothing can serve it.
+
+    Imports are deferred: the Starbucks adapter pulls in the browser layer,
+    and a McDonald's order should not pay for that.
+    """
+    if chain == "mcd":
+        from .mcd import McdAdapter
+        return McdAdapter()
+    if chain == "starbucks":
+        from .starbucks import StarbucksAdapter
+        return StarbucksAdapter()
+    return None
+
+
+CHAIN_NAMES = {"mcd": "マクドナルド", "starbucks": "スターバックス",
+               "mos": "モスバーガー", "kfc": "ケンタッキー"}
+
+
 def _run_job(job_id: str) -> None:
     job = _jobs[job_id]
-    if job["chain"] != "mcd":
-        _fail(job, "failed", "ごめん、今はマクドナルドだけ対応してるよ。")
+    adapter = _adapter_for(job["chain"])
+    if adapter is None:
+        spoken = CHAIN_NAMES.get(job["chain"], job["chain"])
+        _fail(job, "failed",
+              f"ごめん、{spoken}はまだ対応してないよ。今はマクドナルドとスタバだけ。")
         return
     with _worker_busy:
         try:
-            _build(job)
+            _build(job, adapter)
         except Exception as exc:  # noqa: BLE001 -- any surprise = stop + tell the human
             _log(job_id, "job_exception", {"error": repr(exc)})
-            _fail(job, "failed", "注文の準備中にエラーが起きたよ。詳しくはログを見てね。")
+            _fail(job, "failed", _explain(exc))
 
 
-def _build(job: dict[str, Any]) -> None:
+def _explain(exc: Exception) -> str:
+    """A sentence the robot can say for a failure it did not expect.
+
+    Chain-specific conditions carry their own wording -- an expired login
+    and a leftover basket need different actions from Daisuke, and
+    "エラーが起きたよ" tells him neither.
+    """
+    name = type(exc).__name__
+    if name in ("SessionExpired", "LeftoverCart", "EscalationNeeded"):
+        return str(exc)
+    return "注文の準備中にエラーが起きたよ。詳しくはログを見てね。"
+
+
+def _build(job: dict[str, Any], adapter: Any) -> None:
     import os
     job["status"] = "building"
     _log(job["job_id"], "building_started")
 
     # --- store ---------------------------------------------------------
-    if job.get("lat") is not None and job.get("lng") is not None:
-        candidates = stores.nearest(job["lat"], job["lng"], limit=3)
-    else:
-        default_key = os.environ.get("ORDER_DEFAULT_STORE_KEY", "45520")  # １０号高鍋店
-        candidates = [s for s in stores.all_stores() if s["key"] == default_key]
-        if not candidates:
-            _fail(job, "failed", "現在地がわからなくて、既定の店舗も見つからなかったよ。")
-            return
-    store = candidates[0]
-    detail = stores.store_detail(store["key"])
-    if not detail or not detail.get("mopEnabled"):
-        for fallback in candidates[1:]:
-            detail = stores.store_detail(fallback["key"])
-            if detail and detail.get("mopEnabled"):
-                store = fallback
-                break
-        else:
-            _fail(job, "failed", "近くにモバイルオーダー対応の店舗が見つからなかったよ。")
-            return
-    job["store_key"] = store["key"]
-    job["store_name"] = detail.get("name") or store["name"]
+    # No phone position means the house: ordering is still useful without a
+    # location, and a default is honest in a way that guessing is not.
+    lat = job.get("lat")
+    lng = job.get("lng")
+    if lat is None or lng is None:
+        lat = float(os.environ.get("ORDER_DEFAULT_LAT", "32.1337"))   # 高鍋町
+        lng = float(os.environ.get("ORDER_DEFAULT_LNG", "131.5033"))
+        _log(job["job_id"], "location_defaulted", {"lat": lat, "lng": lng})
+
+    candidates = adapter.find_stores(lat, lng, limit=4)
+    if not candidates:
+        _fail(job, "failed", "近くにお店が見つからなかったよ。")
+        return
+    store = next((s for s in candidates
+                  if adapter.capabilities(s["id"]).online_order), None)
+    if store is None:
+        # Every nearby branch is shut or cannot take a web order. Which one
+        # it is matters to the person waiting, so say the nearest by name.
+        nearest = candidates[0]
+        _fail(job, "failed",
+              f"近くのお店は今どこも注文を受け付けてないみたい。"
+              f"いちばん近いのは{nearest['name']}だよ。")
+        return
+    job["store_key"] = store["id"]
+    job["store_name"] = store["name"]
     _log(job["job_id"], "store_selected",
-         {"key": store["key"], "name": job["store_name"],
+         {"id": store["id"], "name": store["name"],
           "distance_km": store.get("distance_km")})
 
     # --- menu match ----------------------------------------------------
-    menu_items = stores.menu(store["key"])
+    menu_items = adapter.menu(store["id"])
     if not menu_items:
         _fail(job, "failed", "メニューが取得できなかったよ。")
         return
@@ -169,15 +208,31 @@ def _build(job: dict[str, Any]) -> None:
     _log(job["job_id"], "congestion_estimated", estimate)
 
     # --- cart ----------------------------------------------------------
-    from . import mcd_adapter
+    # The fulfillment travels with the items: Starbucks picks it before the
+    # menu is even shown, so it cannot wait until the cart is read back.
+    cart_items = [dict(item, fulfillment=job.get("pickup") or "takeout")
+                  for item in job["items"]]
     try:
-        cart = mcd_adapter.build_cart(store["key"], job["items"], job["job_id"],
-                                      lambda e, d: _log(job["job_id"], e, d))
-    except mcd_adapter.EscalationNeeded as exc:
-        _fail(job, "escalated", f"サイト側で人の対応が必要になったよ。{exc}")
-        return
+        cart = adapter.build_cart(store["id"], cart_items, job["job_id"],
+                                  lambda e, d: _log(job["job_id"], e, d))
+    except Exception as exc:  # noqa: BLE001 -- each chain names its own conditions
+        if type(exc).__name__ == "EscalationNeeded":
+            _fail(job, "escalated", f"サイト側で人の対応が必要になったよ。{exc}")
+            return
+        raise
     job["cart"] = cart
     job["total_yen"] = cart.get("cart_total_yen")
+
+    # Prepaid chains say up front whether the card covers the bill. Asking
+    # for approval on an order that cannot be paid for wastes the one thing
+    # the approval is for, so stop here and say what would fix it.
+    if cart.get("sufficient_balance") is False:
+        balance = cart.get("balance_yen")
+        _fail(job, "needs_info",
+              f"カードの残高が足りないよ。"
+              f"{f'今の残高は{balance}円で、' if balance is not None else ''}"
+              f"合計は{cart.get('cart_total_yen')}円。入金してからもう一度言ってね。")
+        return
 
     # --- approval request (FR-5) --------------------------------------
     site_total = job["total_yen"]
@@ -258,13 +313,31 @@ def approve_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
         _fail(job, "failed", f"決済前チェックで止めたよ。{exc}")
         return 200, {"status": job["status"]}
     job["payment_executed"] = result.get("payment_executed", False)
-    job["status"] = "dry_run_done" if result.get("dry_run") else "paid"
-    db.upsert_order(job)
+    job["order_number"] = result.get("order_number")
     _log(job_id, "payment_result", result)
+
     if result.get("dry_run"):
-        _announce_async(job["device_id"],
-                       f"検証は全部通ったよ。今は練習モードだから決済はしてないよ。"
-                       f"合計{result['verified_total_yen']}円、内容は全部確認済み。")
+        job["status"] = "dry_run_done"
+        spoken = (f"検証は全部通ったよ。今は練習モードだから決済はしてないよ。"
+                  f"合計{result['verified_total_yen']}円、内容は全部確認済み。")
+    else:
+        outcome = result.get("outcome")
+        if outcome == "PAID":
+            job["status"] = "paid"
+            spoken = (f"注文できたよ。注文番号は{result['order_number']}、"
+                      f"{job['store_name']}で受け取ってね。"
+                      f"合計{result['verified_total_yen']}円だったよ。")
+        elif outcome == "NOT_PLACED":
+            job["status"] = "failed"
+            spoken = "決済のボタンが効かなかったよ。注文は入っていないはず。もう一度言ってね。"
+        else:
+            # UNKNOWN: charged or not, nobody here can tell. It goes to a
+            # person, and it never gets retried automatically (§26).
+            job["status"] = "payment_uncertain"
+            spoken = (result.get("note")
+                      or "決済の結果が確認できなかったよ。注文履歴を見てね。")
+    db.upsert_order(job)
+    _announce_async(job["device_id"], spoken)
     return 200, {"status": job["status"], "result": result}
 
 

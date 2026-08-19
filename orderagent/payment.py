@@ -70,16 +70,17 @@ def verify_cart(approved: dict[str, Any], cart: dict[str, Any]) -> None:
 
 
 def execute(job: dict[str, Any], cart: dict[str, Any]) -> dict[str, Any]:
-    """The only function allowed to move money, and today it doesn't.
+    """The only function allowed to move money.
 
-    With ORDER_PAYMENT_ENABLED unset this verifies everything and returns a
-    dry-run result. The live path is intentionally NOT implemented until the
-    payment method exists in the browser profile (entered by hand) and the
-    checkout flow has been walked through together on a real 少額 order --
-    implementing it blind against an unseen payment page would be exactly
-    the kind of guesswork this file exists to forbid.
+    Every guard runs before anything is clicked, and they run in the same
+    order whether or not the flag is on -- a dry run that skipped checks
+    would prove nothing about the live path it is supposed to rehearse.
     """
     verify_cart(job["approved"], cart)
+
+    if cart.get("sufficient_balance") is False:
+        raise PaymentRefused(
+            f"カード残高 {cart.get('balance_yen')}円 では足りません")
 
     if not config.PAYMENT_ENABLED:
         return {
@@ -89,8 +90,12 @@ def execute(job: dict[str, Any], cart: dict[str, Any]) -> dict[str, Any]:
             "note": "ORDER_PAYMENT_ENABLED が無効のためドライラン。検証はすべて通過。",
         }
 
-    # Live payment: not yet implemented, deliberately. Refusing is the safe
-    # behavior -- a job reaching here with the flag on still must not click
-    # controls this code has never seen.
-    raise PaymentRefused(
-        "決済フローは実サイトでの共同ウォークスルー後に実装されます（現在は未実装）")
+    chain = job.get("chain")
+    if chain != "starbucks":
+        # Only the walked flow is implemented. McDonald's web checkout is
+        # closed to non-employees entirely (2026-08-19), and a chain whose
+        # pay screen this code has never seen must not be clicked at.
+        raise PaymentRefused(f"{chain} の決済フローは未実装です")
+
+    from .starbucks import confirm_payment
+    return confirm_payment(job, cart)

@@ -418,6 +418,13 @@ class StarbucksAdapter:
         log("cart_add_clicked", {"item": name})
         time.sleep(3)
 
+    def _scrape_confirmation_static(self, text: str) -> dict[str, Any]:
+        """_scrape_confirmation over text that is already in hand."""
+        class _Held:
+            def inner_text(self, _selector):
+                return text
+        return self._scrape_confirmation(_Held())
+
     def _scrape_confirmation(self, page: Any) -> dict[str, Any]:
         """What 注文内容を確認する says: lines, total, balance, shortfall."""
         text = page.inner_text("body")
@@ -457,3 +464,72 @@ class StarbucksAdapter:
             "sufficient_balance": (INSUFFICIENT_MARKER not in text),
             "pickup_options": [],
         }
+
+
+# --- payment (called only from payment.execute, behind every guard) --------
+
+_ORDER_NUMBER_RE = re.compile(r"(?:注文番号|受付番号|オーダー番号)[^0-9A-Za-z]*([0-9A-Za-z\-]{3,20})")
+
+
+def confirm_payment(job: dict[str, Any], cart: dict[str, Any]) -> dict[str, Any]:
+    """Press 「利用規約に同意の上、決済する」. Once. Never twice.
+
+    Called only from payment.execute(), which has already checked that the
+    approved order matches this cart, that the total is under the cap, and
+    that the card covers it. What is left here is the click and the reading
+    of whatever comes back.
+
+    The one thing this function must never do is retry. If the outcome
+    cannot be read -- a timeout, a page that goes somewhere unfamiliar --
+    it returns payment_executed with outcome UNKNOWN, and a person checks
+    the order history. Pressing again to find out would be how one coffee
+    becomes two.
+    """
+    adapter = StarbucksAdapter()
+    with browser_mod.attached_page() as page:
+        # The browser must still be looking at the confirmation screen that
+        # was scraped and approved. Anything else means the state moved
+        # underneath us, and this is the last moment it is free to stop.
+        if not page.url.rstrip("/").endswith("/order"):
+            raise RuntimeError("決済画面から離れてしまったよ。もう一度最初からお願い。")
+        before = page.inner_text("body")
+        if PAY_BUTTON not in before:
+            raise RuntimeError("決済ボタンが見つからないよ。画面が変わったのかも。")
+
+        # Re-read the screen one last time, right where the click happens.
+        # The cart passed in was read minutes ago, on the other side of a
+        # conversation; if the store changed a price since, this catches it.
+        final = adapter._scrape_confirmation_static(before)
+        if final["cart_total_yen"] != cart.get("cart_total_yen"):
+            raise RuntimeError(
+                f"直前で金額が変わったよ（{cart.get('cart_total_yen')}円 → "
+                f"{final['cart_total_yen']}円）。中止したよ。")
+
+        page.get_by_role("button", name=PAY_BUTTON).first.click(timeout=15000)
+        time.sleep(8)
+
+        after = page.inner_text("body")
+        number = _ORDER_NUMBER_RE.search(after)
+        job_dir = config.JOBS_DIR / job["job_id"]
+        job_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            page.screenshot(path=str(job_dir / "paid.png"), full_page=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+        if number:
+            return {"payment_executed": True, "dry_run": False,
+                    "outcome": "PAID",
+                    "order_number": number.group(1),
+                    "verified_total_yen": final["cart_total_yen"]}
+        if PAY_BUTTON in after:
+            # Still on the same screen with the same button: the click did
+            # not take. Nothing was charged, and nothing is retried here --
+            # the caller decides, with a person in the loop.
+            return {"payment_executed": False, "dry_run": False,
+                    "outcome": "NOT_PLACED",
+                    "note": "決済画面のままだったよ。注文は成立していないはず。"}
+        return {"payment_executed": True, "dry_run": False,
+                "outcome": "UNKNOWN",
+                "note": "決済したけど注文番号が読み取れなかったよ。"
+                        "アプリの注文履歴を確認してね。二重に押すことはしないよ。"}
