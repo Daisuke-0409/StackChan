@@ -37,6 +37,14 @@ MAX_QUANTITY = 10
 STATUS_DRAFT = "draft"
 STATUS_RESOLVED = "resolved"
 
+# A condition is `pending` until something that can actually check it says
+# yes or no. Nothing in this module ever decides one: the answer depends on
+# the time, the store and its current campaign, none of which a data model
+# can see. Holding the question unanswered is the point -- a guess here
+# picks a size, and a price, on the user's behalf and calls it their order.
+CONDITION_PENDING = "pending"
+CONDITION_RESOLVED = "resolved"
+
 
 class DraftError(ValueError):
     """The draft was asked for something that would make it incoherent."""
@@ -118,6 +126,41 @@ class DraftItem:
 
 
 @dataclass
+class Condition:
+    """"ランチならL、普通ならM" -- kept whole until someone can answer it.
+
+    `kind` and `parameter` name the question ("is the lunch promotion
+    running, at this store, now?"). `if_true` and `if_false` are the changes
+    to apply either way, in the shape MODIFY already takes, so resolving a
+    condition is an ordinary edit rather than a special case.
+    """
+
+    id: str
+    target_item_id: str
+    kind: str
+    parameter: Optional[str] = None
+    if_true: dict[str, Any] = field(default_factory=dict)
+    if_false: dict[str, Any] = field(default_factory=dict)
+    status: str = CONDITION_PENDING
+    outcome: Optional[bool] = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "target_item_id": self.target_item_id,
+                "kind": self.kind, "parameter": self.parameter,
+                "if_true": dict(self.if_true), "if_false": dict(self.if_false),
+                "status": self.status, "outcome": self.outcome}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "Condition":
+        return cls(id=data["id"], target_item_id=data["target_item_id"],
+                   kind=data["kind"], parameter=data.get("parameter"),
+                   if_true=dict(data.get("if_true") or {}),
+                   if_false=dict(data.get("if_false") or {}),
+                   status=data.get("status", CONDITION_PENDING),
+                   outcome=data.get("outcome"))
+
+
+@dataclass
 class OrderDraft:
     """The whole draft: where, how it is collected, and what is in it.
 
@@ -130,8 +173,10 @@ class OrderDraft:
     restaurant: Restaurant
     fulfillment: Optional[str] = None
     items: list[DraftItem] = field(default_factory=list)
+    conditions: list[Condition] = field(default_factory=list)
     active_item_id: Optional[str] = None
     _next_id: int = 1
+    _next_condition_id: int = 1
 
     # --- lookup ------------------------------------------------------------
 
@@ -161,9 +206,61 @@ class OrderDraft:
     # --- state -------------------------------------------------------------
 
     def is_resolved(self) -> bool:
-        """True when every line has been matched to a real product."""
-        return bool(self.items) and all(item.status == STATUS_RESOLVED
-                                        for item in self.items)
+        """True when every line is matched and no question is outstanding.
+
+        An unanswered condition blocks this even when every product has
+        resolved, because "L if lunch is on, otherwise M" is not yet an
+        order. Building a cart from it would silently take whichever branch
+        the code happened to leave in place.
+        """
+        return (bool(self.items)
+                and all(item.status == STATUS_RESOLVED for item in self.items)
+                and not self.pending_conditions())
+
+    # --- conditions (再設計 §17) -------------------------------------------
+
+    def next_condition_id(self) -> str:
+        condition_id = f"cond_{self._next_condition_id}"
+        self._next_condition_id += 1
+        return condition_id
+
+    def add_condition(self, target_item_id: Optional[str], kind: str,
+                      parameter: Optional[str] = None,
+                      if_true: Optional[dict[str, Any]] = None,
+                      if_false: Optional[dict[str, Any]] = None) -> "Condition":
+        target = self._target(target_item_id)
+        condition = Condition(id=self.next_condition_id(), target_item_id=target.id,
+                              kind=kind, parameter=parameter,
+                              if_true=dict(if_true or {}),
+                              if_false=dict(if_false or {}))
+        self.conditions.append(condition)
+        self.active_item_id = target.id
+        return condition
+
+    def pending_conditions(self) -> list["Condition"]:
+        return [c for c in self.conditions if c.status == CONDITION_PENDING]
+
+    def resolve_condition(self, condition_id: str, met: bool) -> Optional[DraftItem]:
+        """Apply the branch the answer selects.
+
+        `met` comes from whatever could actually check -- the adapter, with
+        the store, the clock and the live menu in hand. This carries out the
+        consequence and nothing else, so the deciding and the editing stay
+        separable, and separately testable.
+        """
+        condition = next((c for c in self.conditions if c.id == condition_id), None)
+        if condition is None:
+            raise DraftError(f"condition {condition_id} は draft にありません")
+        if condition.status != CONDITION_PENDING:
+            raise DraftError(f"condition {condition_id} は解決済みです")
+        condition.status = CONDITION_RESOLVED
+        condition.outcome = bool(met)
+        changes = condition.if_true if met else condition.if_false
+        if not changes:
+            # A branch that changes nothing is a legitimate answer: "L if it
+            # is lunch" leaves the size alone when it is not.
+            return self.get(condition.target_item_id)
+        return self.modify(condition.target_item_id, **changes)
 
     def total_quantity(self) -> int:
         return sum(item.quantity for item in self.items)
@@ -261,8 +358,10 @@ class OrderDraft:
             "restaurant": self.restaurant.to_dict(),
             "fulfillment": self.fulfillment,
             "items": [item.to_dict() for item in self.items],
+            "conditions": [c.to_dict() for c in self.conditions],
             "active_item_id": self.active_item_id,
             "next_id": self._next_id,
+            "next_condition_id": self._next_condition_id,
         }
 
     @classmethod
@@ -275,12 +374,22 @@ class OrderDraft:
             _, _, suffix = item.id.partition("_")
             if suffix.isdigit():
                 highest = max(highest, int(suffix))
+        conditions = [Condition.from_dict(entry)
+                      for entry in data.get("conditions") or []]
+        highest_condition = 0
+        for condition in conditions:
+            _, _, suffix = condition.id.partition("_")
+            if suffix.isdigit():
+                highest_condition = max(highest_condition, int(suffix))
         return cls(
             restaurant=Restaurant.from_dict(data["restaurant"]),
             fulfillment=data.get("fulfillment"),
             items=items,
+            conditions=conditions,
             active_item_id=data.get("active_item_id"),
             _next_id=max(int(data.get("next_id", 1)), highest + 1),
+            _next_condition_id=max(int(data.get("next_condition_id", 1)),
+                                   highest_condition + 1),
         )
 
 

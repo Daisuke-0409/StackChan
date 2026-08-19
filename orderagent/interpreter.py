@@ -28,15 +28,15 @@ from typing import Any, Optional
 
 from . import draft as draft_mod
 
-# The operations from §11 that this module can produce. CONDITIONAL
-# (STEP 6) and CONFIRM (already handled by the approval gate) are
-# deliberately absent -- an interpreter that returned them now would have
-# nothing downstream to receive them.
+# The operations from §11 that this module can produce. CONFIRM is absent
+# on purpose: approval is the payment gate's business, and giving this
+# module a way to say "yes, buy it" would put the decision in two places.
 ADD = "ADD"
 REPLACE = "REPLACE"
 MODIFY = "MODIFY"
 REMOVE = "REMOVE"
 QUERY = "QUERY"
+CONDITIONAL = "CONDITIONAL"
 
 # §12. Said before naming what was actually wanted, so they turn the next
 # product into a correction of the current line instead of a new one.
@@ -88,6 +88,78 @@ _QUERY_TOPICS = (
 )
 
 
+# §17. "ランチならL、普通ならM" -- two clauses, each a condition and what to
+# do about it. Split on the ordinary separators, then read each half.
+_CLAUSE_SPLIT_RE = re.compile(r"[、,。]|\s{2,}")
+_CONDITIONAL_RE = re.compile(r"^(.*?)(?:なら|だったら|であれば|ならば)(.*)$")
+
+# The conditions worth asking about are the ones the store can answer.
+# "promotion_available" is the only kind so far, because a campaign is the
+# only thing a person routinely makes their order depend on.
+_PROMOTION_WORDS = (
+    ("lunch", re.compile(r"ランチ|昼")),
+    ("coupon", re.compile(r"クーポン")),
+    ("campaign", re.compile(r"キャンペーン|セール|割引")),
+)
+# The other half of the sentence: "普通なら", "変わらないなら".
+_OTHERWISE_RE = re.compile(r"普通|通常|変わらな|同じ|そうじゃな|でなければ|違うなら")
+
+
+def _promotion_of(text: str) -> Optional[str]:
+    for name, pattern in _PROMOTION_WORDS:
+        if pattern.search(text):
+            return name
+    return None
+
+
+def _branch_changes(text: str) -> dict[str, Any]:
+    """What a clause asks for, in the shape MODIFY takes."""
+    changes: dict[str, Any] = {}
+    size = _extract_size(text)
+    if size:
+        changes["size"] = size
+    quantity = _extract_quantity(text)
+    if quantity:
+        changes["quantity"] = quantity
+    return changes
+
+
+def _read_conditional(text: str) -> Optional[dict[str, Any]]:
+    """The condition in an utterance, or None if there is not one.
+
+    Deliberately shallow. It finds which promotion is being asked about and
+    what to do either way; it never decides whether that promotion is
+    running. That answer needs the clock, the store and the live menu, and
+    a module that guessed it would be inventing a price.
+    """
+    promotion = None
+    if_true: dict[str, Any] = {}
+    if_false: dict[str, Any] = {}
+
+    for clause in _CLAUSE_SPLIT_RE.split(text):
+        clause = clause.strip()
+        if not clause:
+            continue
+        match = _CONDITIONAL_RE.match(clause)
+        if not match:
+            continue
+        condition_text, consequence = match.group(1), match.group(2)
+        changes = _branch_changes(consequence)
+        if not changes:
+            continue
+        if _OTHERWISE_RE.search(condition_text):
+            if_false = changes
+            continue
+        found = _promotion_of(condition_text)
+        if found:
+            promotion, if_true = found, changes
+
+    if promotion is None:
+        return None
+    return {"kind": "promotion_available", "parameter": promotion,
+            "if_true": if_true, "if_false": if_false}
+
+
 def _query_topic(text: str) -> str:
     for name, pattern in _QUERY_TOPICS:
         if pattern.search(text):
@@ -107,6 +179,7 @@ class Utterance:
     question: Optional[str] = None             # what to ask, if ambiguous
     needs_menu: bool = False                   # resolvable only with a menu
     query_topic: Optional[str] = None          # QUERY only
+    condition: Optional[dict[str, Any]] = None  # CONDITIONAL only
 
     def is_actionable(self) -> bool:
         """True when apply() would change the draft.
@@ -116,7 +189,7 @@ class Utterance:
         caller that loops over "actionable" utterances must not sweep it
         along, and one that means to answer it has to say so.
         """
-        return (self.action in (ADD, REPLACE, MODIFY, REMOVE)
+        return (self.action in (ADD, REPLACE, MODIFY, REMOVE, CONDITIONAL)
                 and not self.ambiguous)
 
     def is_query(self) -> bool:
@@ -219,6 +292,16 @@ def classify(text: str, order: draft_mod.OrderDraft) -> Utterance:
         return Utterance(action=QUERY, target_item_id=named_target,
                          query_topic=_query_topic(normalized))
 
+    # --- CONDITIONAL ----------------------------------------------------
+    # After QUERY, because "ランチならいくら？" is a question about a
+    # condition rather than an instruction containing one.
+    condition = _read_conditional(normalized)
+    if condition is not None:
+        if target is None and order.active_item is None:
+            return Utterance(ambiguous=True, question="どれのこと？")
+        return Utterance(action=CONDITIONAL, target_item_id=target,
+                         condition=condition)
+
     # --- REMOVE ---------------------------------------------------------
     if _REMOVE_RE.search(normalized):
         if not order.items:
@@ -319,4 +402,12 @@ def apply(utterance: Utterance, order: draft_mod.OrderDraft) -> draft_mod.DraftI
         return order.modify(utterance.target_item_id, **utterance.changes)
     if utterance.action == REMOVE:
         return order.remove(utterance.target_item_id)
+    if utterance.action == CONDITIONAL:
+        # Records the question against the draft. Nothing about the item
+        # changes until somebody answers it (draft.resolve_condition).
+        return order.add_condition(utterance.target_item_id,
+                                   utterance.condition["kind"],
+                                   utterance.condition.get("parameter"),
+                                   utterance.condition.get("if_true"),
+                                   utterance.condition.get("if_false"))
     raise draft_mod.DraftError(f"未知の操作: {utterance.action}")

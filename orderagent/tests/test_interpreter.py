@@ -225,5 +225,109 @@ class PurityTest(unittest.TestCase):
                              f"interpreter.py must not import {name}")
 
 
+
+class ConditionalTest(unittest.TestCase):
+    def test_spec_test_6_generates_a_condition(self):
+        d = _draft_with("ビッグマックセット")
+        u = interpreter.classify("ランチならL、普通ならM", d)
+        self.assertEqual(u.action, interpreter.CONDITIONAL)
+        self.assertEqual(u.condition["kind"], "promotion_available")
+        self.assertEqual(u.condition["parameter"], "lunch")
+        self.assertEqual(u.condition["if_true"], {"size": "L"})
+        self.assertEqual(u.condition["if_false"], {"size": "M"})
+
+    def test_classify_alone_changes_nothing(self):
+        d = _draft_with("ビッグマックセット")
+        before = d.to_dict()
+        interpreter.classify("ランチならL、普通ならM", d)
+        self.assertEqual(d.to_dict(), before)
+
+    def test_apply_records_the_question_without_answering_it(self):
+        d = _draft_with("ビッグマックセット")
+        u = interpreter.classify("ランチならL、普通ならM", d)
+        interpreter.apply(u, d)
+        self.assertEqual(len(d.pending_conditions()), 1)
+        # The size must NOT have been chosen: only the store and the clock
+        # can say which branch applies.
+        self.assertIsNone(d.items[0].size)
+
+    def test_a_pending_condition_blocks_resolution(self):
+        d = _draft_with("ビッグマックセット")
+        d.items[0].status = draft.STATUS_RESOLVED
+        d.items[0].product_id = "1"
+        self.assertTrue(d.is_resolved())
+        interpreter.apply(interpreter.classify("ランチならL、普通ならM", d), d)
+        self.assertFalse(d.is_resolved())
+
+    def test_only_the_true_branch_is_fine(self):
+        d = _draft_with("ポテト")
+        u = interpreter.classify("ランチならLにして", d)
+        self.assertEqual(u.condition["if_true"], {"size": "L"})
+        self.assertEqual(u.condition["if_false"], {})
+
+    def test_a_conditional_question_stays_a_question(self):
+        u = interpreter.classify("ランチならいくら？", _draft_with("ポテト"))
+        self.assertEqual(u.action, interpreter.QUERY)
+
+    def test_coupon_and_campaign_are_recognised(self):
+        for text, expected in (("クーポンあるならLにして", "coupon"),
+                               ("キャンペーンならLにして", "campaign")):
+            with self.subTest(text=text):
+                u = interpreter.classify(text, _draft_with("ポテト"))
+                self.assertEqual(u.condition["parameter"], expected)
+
+    def test_plain_talk_is_not_a_condition(self):
+        u = interpreter.classify("あとナゲット", _draft_with("ポテト"))
+        self.assertIsNone(u.condition)
+
+
+class ConditionResolutionTest(unittest.TestCase):
+    def _with_condition(self):
+        d = _draft_with("ビッグマックセット")
+        u = interpreter.classify("ランチならL、普通ならM", d)
+        condition = interpreter.apply(u, d)
+        return d, condition
+
+    def test_true_takes_the_first_branch(self):
+        d, condition = self._with_condition()
+        d.resolve_condition(condition.id, True)
+        self.assertEqual(d.items[0].size, "L")
+        self.assertEqual(d.pending_conditions(), [])
+
+    def test_false_takes_the_second(self):
+        d, condition = self._with_condition()
+        d.resolve_condition(condition.id, False)
+        self.assertEqual(d.items[0].size, "M")
+
+    def test_the_outcome_is_recorded(self):
+        d, condition = self._with_condition()
+        d.resolve_condition(condition.id, True)
+        self.assertIs(d.conditions[0].outcome, True)
+        self.assertEqual(d.conditions[0].status, draft.CONDITION_RESOLVED)
+
+    def test_resolving_twice_is_refused(self):
+        d, condition = self._with_condition()
+        d.resolve_condition(condition.id, True)
+        with self.assertRaises(draft.DraftError):
+            d.resolve_condition(condition.id, False)
+
+    def test_an_empty_branch_leaves_the_item_alone(self):
+        d = _draft_with("ポテト")
+        condition = interpreter.apply(interpreter.classify("ランチならLにして", d), d)
+        d.resolve_condition(condition.id, False)
+        self.assertIsNone(d.items[0].size)
+
+    def test_unknown_condition_is_named(self):
+        d, _ = self._with_condition()
+        with self.assertRaises(draft.DraftError):
+            d.resolve_condition("cond_99", True)
+
+    def test_conditions_survive_serialization(self):
+        d, _ = self._with_condition()
+        restored = draft.OrderDraft.from_dict(d.to_dict())
+        self.assertEqual(restored.to_dict(), d.to_dict())
+        self.assertEqual(len(restored.pending_conditions()), 1)
+        self.assertEqual(restored.next_condition_id(), "cond_2")
+
 if __name__ == "__main__":
     unittest.main()

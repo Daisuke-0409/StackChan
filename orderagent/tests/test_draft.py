@@ -137,7 +137,8 @@ class SerializationTest(unittest.TestCase):
     def test_shape_matches_the_spec(self):
         payload = self._sample().to_dict()
         self.assertEqual(set(payload), {"restaurant", "fulfillment", "items",
-                                        "active_item_id", "next_id"})
+                                        "conditions", "active_item_id",
+                                        "next_id", "next_condition_id"})
         self.assertEqual(payload["restaurant"], {"chain": "mcd", "store_id": "45520"})
         self.assertEqual(set(payload["items"][0]),
                          {"id", "product", "variant", "size", "quantity",
