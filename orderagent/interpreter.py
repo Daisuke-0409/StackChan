@@ -28,14 +28,15 @@ from typing import Any, Optional
 
 from . import draft as draft_mod
 
-# The operations from §11 that this module can produce. QUERY (STEP 5),
-# CONDITIONAL (STEP 6) and CONFIRM (already handled by the approval gate)
-# are deliberately absent -- an interpreter that returned them now would
-# have nothing downstream to receive them.
+# The operations from §11 that this module can produce. CONDITIONAL
+# (STEP 6) and CONFIRM (already handled by the approval gate) are
+# deliberately absent -- an interpreter that returned them now would have
+# nothing downstream to receive them.
 ADD = "ADD"
 REPLACE = "REPLACE"
 MODIFY = "MODIFY"
 REMOVE = "REMOVE"
+QUERY = "QUERY"
 
 # §12. Said before naming what was actually wanted, so they turn the next
 # product into a correction of the current line instead of a new one.
@@ -67,6 +68,32 @@ _QUANTITY_RE = re.compile(r"([0-9０-９]+)\s*(?:個|つ|杯|点|セット)")
 # there rather than a request for something new.
 _MODIFY_VERB_RE = re.compile(r"にして|に変えて|でお願い|にしといて")
 
+# §11 QUERY. A question mark, or the ways Japanese asks without one --
+# speech-to-text drops ？ more often than people think.
+_QUESTION_RE = re.compile(
+    r"[？?]\s*$|(?:の|か|かな|だっけ|ですか|ますか)\s*[？?]?\s*$|"
+    r"いくら|何円|どっち|どれが|何が入|やって(る|います)")
+
+# Coarse, and coarse on purpose: the caller needs to know which question to
+# go and answer, not a taxonomy.
+# Promotion is tested before price, and the order is load-bearing.
+# "ランチ安い？" matches both, but it is a price question with a condition
+# attached: answering it from the current total, without checking the time
+# and the store's campaign, gives a confidently wrong number.
+_QUERY_TOPICS = (
+    ("promotion", re.compile(r"ランチ|キャンペーン|クーポン|セール|割引|安く|対象")),
+    ("price", re.compile(r"いくら|値段|料金|安い|高い|合計|円")),
+    ("contents", re.compile(r"注文内容|今何|何が入|どうなって|中身")),
+    ("availability", re.compile(r"ある|できる|やって|選べ")),
+)
+
+
+def _query_topic(text: str) -> str:
+    for name, pattern in _QUERY_TOPICS:
+        if pattern.search(text):
+            return name
+    return "general"
+
 
 @dataclass
 class Utterance:
@@ -79,9 +106,21 @@ class Utterance:
     ambiguous: bool = False
     question: Optional[str] = None             # what to ask, if ambiguous
     needs_menu: bool = False                   # resolvable only with a menu
+    query_topic: Optional[str] = None          # QUERY only
 
     def is_actionable(self) -> bool:
-        return self.action is not None and not self.ambiguous
+        """True when apply() would change the draft.
+
+        QUERY is excluded deliberately. It is a real, recognised operation
+        with an answer owed to the user, but it edits nothing -- so a
+        caller that loops over "actionable" utterances must not sweep it
+        along, and one that means to answer it has to say so.
+        """
+        return (self.action in (ADD, REPLACE, MODIFY, REMOVE)
+                and not self.ambiguous)
+
+    def is_query(self) -> bool:
+        return self.action == QUERY
 
 
 def _normalize(text: str) -> str:
@@ -170,6 +209,16 @@ def classify(text: str, order: draft_mod.OrderDraft) -> Utterance:
     refers_to_active = bool(_REFERENCE_RE.search(normalized))
     target = named_target  # None means "the active item"
 
+    # --- QUERY ----------------------------------------------------------
+    # Checked before everything else, because the two ways of being wrong
+    # here are not equally bad. Reading an order as a question answers it
+    # and changes nothing, and the person says it again. Reading a question
+    # as a removal deletes something they still wanted. Asymmetric risk,
+    # asymmetric precedence.
+    if _QUESTION_RE.search(normalized):
+        return Utterance(action=QUERY, target_item_id=named_target,
+                         query_topic=_query_topic(normalized))
+
     # --- REMOVE ---------------------------------------------------------
     if _REMOVE_RE.search(normalized):
         if not order.items:
@@ -256,6 +305,8 @@ def apply(utterance: Utterance, order: draft_mod.OrderDraft) -> draft_mod.DraftI
     Kept separate from classify() so that the decision can be inspected,
     logged and tested without anything changing.
     """
+    if utterance.is_query():
+        raise draft_mod.DraftError("QUERY は注文内容を変えません")
     if not utterance.is_actionable():
         raise draft_mod.DraftError("実行できる操作ではありません")
     if utterance.action == ADD:

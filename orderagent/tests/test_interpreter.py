@@ -122,6 +122,62 @@ class AmbiguityTest(unittest.TestCase):
             interpreter.apply(u, _draft_with("ビッグマック"))
 
 
+class QueryTest(unittest.TestCase):
+    def test_spec_test_5_price_question_changes_nothing(self):
+        d = _draft_with("ビッグマックセット")
+        before = d.to_dict()
+        u = interpreter.classify("ランチ安い？", d)
+        self.assertEqual(u.action, interpreter.QUERY)
+        self.assertEqual(u.query_topic, "promotion")
+        self.assertEqual(d.to_dict(), before)
+
+    def test_query_is_not_actionable(self):
+        u = interpreter.classify("いくら？", _draft_with("ポテト"))
+        self.assertTrue(u.is_query())
+        self.assertFalse(u.is_actionable())
+
+    def test_apply_refuses_a_query(self):
+        d = _draft_with("ポテト")
+        u = interpreter.classify("いくら？", d)
+        with self.assertRaises(draft.DraftError):
+            interpreter.apply(u, d)
+        self.assertEqual(len(d.items), 1)
+
+    def test_question_without_a_mark_is_still_a_question(self):
+        # Speech-to-text drops ？ more often than people think.
+        u = interpreter.classify("今ランチやってる", _draft_with("ポテト"))
+        self.assertEqual(u.action, interpreter.QUERY)
+
+    def test_price_topic(self):
+        u = interpreter.classify("それいくら？", _draft_with("ナゲット"))
+        self.assertEqual(u.query_topic, "price")
+
+    def test_contents_topic(self):
+        u = interpreter.classify("今何が入ってる？", _draft_with("ナゲット"))
+        self.assertEqual(u.query_topic, "contents")
+
+    def test_query_can_name_the_line_it_asks_about(self):
+        d = _draft_with("ビッグマックセット", "ナゲット")
+        u = interpreter.classify("ビッグマックの方いくら？", d)
+        self.assertEqual(u.action, interpreter.QUERY)
+        self.assertEqual(u.target_item_id, "item_1")
+
+    def test_a_question_never_removes(self):
+        # The precedence that matters: asking about something must not
+        # delete it, even when the sentence contains a removal word.
+        d = _draft_with("ナゲット")
+        u = interpreter.classify("ナゲットいらないかな？", d)
+        self.assertNotEqual(u.action, interpreter.REMOVE)
+        self.assertEqual(len(d.items), 1)
+
+    def test_an_order_is_still_an_order(self):
+        # The safe precedence must not swallow ordinary ordering.
+        for text in ("ビッグマックセット", "あとナゲット", "Lにして"):
+            with self.subTest(text=text):
+                u = interpreter.classify(text, _draft_with("ポテト"))
+                self.assertNotEqual(u.action, interpreter.QUERY, text)
+
+
 class ApplyTest(unittest.TestCase):
     def _run(self, utterances):
         d = draft.new_draft("mcd")
