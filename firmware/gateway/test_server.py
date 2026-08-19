@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from . import server
+from . import crm_bridge, server
 from .server import (
     MAX_INPUT_BYTES,
     MAX_SPEECH_AUDIO_BYTES,
@@ -452,6 +452,111 @@ class WavHeaderTests(unittest.TestCase):
         wav = _pcm_to_wav(pcm, sample_rate=16000)
         declared_size = int.from_bytes(wav[40:44], "little")
         self.assertEqual(declared_size, len(pcm))
+
+
+class CrmBridgeTests(unittest.TestCase):
+    """R6: the conversation half of the grave lookup.
+
+    The network is faked through the injectable fetch; what is under test is
+    detection (a customer-data interceptor must not fire on small talk), the
+    contract's spoken forms, and the rule that a recognized question is
+    answered by the bridge in every case including failures.
+    """
+
+    ENV = {"CRM_RELAY_URL": "http://relay.test:8767", "CRM_RELAY_TOKEN": "t"}
+
+    def _fetch(self, count, results):
+        def fetch(url, token):
+            self.fetched_url = url
+            return 200, {"count": count, "results": results}
+        return fetch
+
+    # --- detection ------------------------------------------------------
+
+    def test_grave_question_with_name_detects(self):
+        self.assertEqual(crm_bridge.detect("田中さんの墓所どこ？"), "田中")
+
+    def test_full_name_and_polite_form_detects(self):
+        self.assertEqual(crm_bridge.detect("佐藤一郎様のお墓の場所を教えて"), "佐藤一郎")
+
+    def test_grave_smalltalk_without_name_stays_chat(self):
+        self.assertIsNone(crm_bridge.detect("お墓参りどこ行く？"))
+
+    def test_named_but_not_a_question_stays_chat(self):
+        self.assertIsNone(crm_bridge.detect("田中さんの墓所の掃除をした"))
+
+    def test_self_reference_stays_chat(self):
+        self.assertIsNone(crm_bridge.detect("俺の墓はどこになるんだろうね"))
+
+    # --- spoken forms (contract: CRM_LOOKUP_API_CONTRACT.md) ------------
+
+    def test_single_result_with_area_speaks_district(self):
+        reply = crm_bridge.intercept(
+            "田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+            fetch=self._fetch(1, [{"customer_name": "田中", "cemetery_name": "専唱寺",
+                                   "area": "郡司分"}]))
+        self.assertIn("郡司分地区の専唱寺", reply)
+
+    def test_single_result_without_area_never_says_missing(self):
+        reply = crm_bridge.intercept(
+            "田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+            fetch=self._fetch(1, [{"customer_name": "田中", "cemetery_name": "みたまA-12",
+                                   "area": ""}]))
+        self.assertIn("みたまA-12", reply)
+        self.assertNotIn("分かりません", reply)
+        self.assertNotIn("わからない", reply)
+
+    def test_zero_results_is_an_answer_not_an_error(self):
+        reply = crm_bridge.intercept("田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                                     fetch=self._fetch(0, []))
+        self.assertIn("見つからなかった", reply)
+
+    def test_many_results_reports_true_total_and_asks_to_narrow(self):
+        rows = [{"customer_name": f"田中{i}", "cemetery_name": f"みたまB-{i}", "area": ""}
+                for i in range(3)]
+        reply = crm_bridge.intercept("田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                                     fetch=self._fetch(6, rows))
+        self.assertIn("6件", reply)
+        self.assertIn("下の名前", reply)
+
+    def test_asked_by_is_passed_through(self):
+        crm_bridge.intercept("田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=self._fetch(0, []))
+        self.assertIn("asked_by=%E3%83%80%E3%82%A4%E3%82%B9%E3%82%B1", self.fetched_url)
+
+    # --- failure still answers here, never via the LLM ------------------
+
+    def test_unreachable_relay_answers_spoken_failure(self):
+        def fetch(url, token):
+            raise OSError("no route")
+        reply = crm_bridge.intercept("田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                                     fetch=fetch)
+        self.assertIsNotNone(reply)
+        self.assertIn("繋がらな", reply)
+
+    def test_unconfigured_bridge_is_invisible(self):
+        self.assertIsNone(crm_bridge.intercept("田中さんの墓所どこ？", "ダイスケ",
+                                               env={}))
+
+
+class CrmChatIntegrationTests(unittest.TestCase):
+    """The chat path must not remember or forward a recognized CRM question."""
+
+    def test_crm_reply_short_circuits_chat_without_memory(self):
+        payload = {"request_id": "r", "session_id": "s", "device_id": "d",
+                   "text": "田中さんの墓所どこ？"}
+        with mock.patch.object(server.crm_bridge, "intercept", return_value="答え") as icpt, \
+             mock.patch.object(server, "_remember_exchange") as remember, \
+             mock.patch.object(server, "_provider_response") as provider, \
+             mock.patch.object(server, "_tts_pcm", return_value=None), \
+             mock.patch.object(server, "_generate_beep_pcm", return_value=b"\x00\x00"):
+            status, body = server.process_chat(
+                payload, {"Authorization": "Bearer t"}, {"DEVICE_TOKEN": "t"})
+        self.assertEqual(status, 200)
+        self.assertEqual(body["text"], "答え")
+        icpt.assert_called_once()
+        remember.assert_not_called()   # the exchange is never memorized
+        provider.assert_not_called()   # and never reaches the LLM
 
 
 if __name__ == "__main__":

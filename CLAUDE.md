@@ -159,10 +159,14 @@ Happy/Confused は**状態ではなくリアクション**で、`Reacting` 状�
 
 **今回やること (家、この順)**:
 
-1. **CRM 連携のゲートウェイ側** — 「これは CRM への質問だ」の判定層 / 照会役クライアント /
-   **その質問と答えを記憶に残さない**扱い / CRM が落ちていても通常会話は無傷。
-   これで R6 の受け入れ条件「『◯◯さんの墓所どこ？』と声で聞くと霊園名を返す」が閉じる。
-   **`area` は区画ではなく地区**。区画番号は `cemetery_name` の中。`zenrin_map_no` は読み上げない
+1. ~~CRM 連携のゲートウェイ側~~ **済 (8/19 家)** — `gateway/crm_bridge.py`。
+   判定は「名前+さん/様+墓語+疑問語」の三点セット(雑談誤爆なし・ライブ確認済み)。
+   認識した質問は**失敗時も含めて全経路で Gemini に渡らない**・記憶にも残らない
+   (test_server.py で構造的に検証、64テスト)。読み上げは契約の形
+   (「{area}地区の{cemetery_name}」、区画番号はcemetery_name内、zenrin_mapは読まない)。
+   **残るはトークン運搬のみ**: 会社PCで `setup_crm_token.ps1` の値を、家の
+   `gateway\.env` の `CRM_RELAY_TOKEN=` に入れる (次回出社時。-Prompt で貼るだけ)。
+   URL は設定済み (100.76.60.88:8767、healthz生存・403経路までライブ確認済み)
 2. **R9 STEP 7 の残り** — `stores.py` + `mcd_adapter.py` を `adapter.RestaurantAdapter` に
    嵌める薄いラッパー。`promotions()` と `recent_orders()` は空実装で始めてよい
    (どちらも「分からない」が安全側に倒れる)

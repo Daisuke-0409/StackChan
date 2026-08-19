@@ -39,9 +39,10 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
 try:  # package import when run as gateway.server, plain when run as a script
-    from . import biometrics, order_bridge, people, settings_store, webui
+    from . import biometrics, crm_bridge, order_bridge, people, settings_store, webui
 except ImportError:  # pragma: no cover - depends on how the server is started
     import biometrics
+    import crm_bridge
     import order_bridge
     import people
     import settings_store
@@ -1613,6 +1614,21 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
     if command:
         set_pending_command(payload["device_id"], command)
         _log(f"gateway manner command={command}")
+
+    # Grave lookups (R6): a recognized CRM question never reaches Gemini and
+    # is never remembered -- the reply is spoken, returned, and forgotten.
+    # The CRM's own audit log is the record of who asked.
+    speaker = get_current_speaker(payload["device_id"])
+    crm_reply = crm_bridge.intercept(text, speaker["name"] if speaker else "unknown")
+    if crm_reply is not None:
+        if settings_store.get("speech_enabled"):
+            pcm = _tts_pcm(crm_reply, env) or _generate_beep_pcm()
+            enqueue_status, enqueue_body = enqueue_speech(payload["device_id"], pcm)
+            if enqueue_status != 200:
+                _log(f"gateway crm_bridge enqueue failed status={enqueue_status} "
+                     f"error={enqueue_body.get('error')}")
+        return 200, {"text": crm_reply, "request_id": payload["request_id"],
+                     "session_id": payload["session_id"], "is_final": True}
 
     # Mobile order (FR-1/FR-5): checked before the LLM so an order utterance
     # or an approval answer never becomes small talk. order_bridge fails
