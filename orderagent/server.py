@@ -101,6 +101,9 @@ def _adapter_for(chain: str):
     if chain == "starbucks":
         from .starbucks import StarbucksAdapter
         return StarbucksAdapter()
+    if chain == "mos":
+        from .mos import MosAdapter
+        return MosAdapter()
     return None
 
 
@@ -132,7 +135,7 @@ def _explain(exc: Exception) -> str:
     "エラーが起きたよ" tells him neither.
     """
     name = type(exc).__name__
-    if name in ("SessionExpired", "LeftoverCart", "EscalationNeeded"):
+    if name in ("SessionExpired", "LeftoverCart", "EscalationNeeded", "NotYetWalked"):
         return str(exc)
     return "注文の準備中にエラーが起きたよ。詳しくはログを見てね。"
 
