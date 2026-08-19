@@ -488,6 +488,140 @@ class CrmBridgeTests(unittest.TestCase):
     def test_self_reference_stays_chat(self):
         self.assertIsNone(crm_bridge.detect("俺の墓はどこになるんだろうね"))
 
+    # --- narrowing over two turns ---------------------------------------
+
+    def _many_then_one(self):
+        """A fetch that answers 6 for a surname and 1 once given a full name."""
+        calls = []
+
+        def fetch(url, token):
+            calls.append(url)
+            if "%20" in url or "+" in url.split("name=")[1].split("&")[0]:
+                return 200, {"count": 1, "results": [
+                    {"customer_name": "山田 太郎", "cemetery_name": "みたまA-12",
+                     "area": ""}]}
+            return 200, {"count": 6, "results": [
+                {"customer_name": "山田 一郎", "cemetery_name": "みたまB-1", "area": ""},
+                {"customer_name": "山田 二郎", "cemetery_name": "みたまB-2", "area": ""},
+                {"customer_name": "山田 三郎", "cemetery_name": "みたまB-3", "area": ""}]}
+        return fetch, calls
+
+    def setUp(self):
+        crm_bridge._pending.clear()
+
+    def test_a_crowded_surname_asks_for_the_given_name(self):
+        fetch, _ = self._many_then_one()
+        reply = crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                                     fetch=fetch, device_id="D1", now=100.0)
+        self.assertIn("6件", reply)
+        self.assertIn("下の名前", reply)
+
+    def test_the_next_short_utterance_is_read_as_the_answer(self):
+        fetch, calls = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        reply = crm_bridge.intercept("太郎", "ダイスケ", env=self.ENV, fetch=fetch,
+                                     device_id="D1", now=110.0)
+        self.assertIn("みたまA-12", reply)
+        self.assertIn("%E5%B1%B1%E7%94%B0+%E5%A4%AA%E9%83%8E", calls[-1])
+
+    def test_the_wrappers_people_put_around_an_answer_come_off(self):
+        for said in ("下の名前は太郎", "太郎です", "太郎の方", "太郎さん"):
+            with self.subTest(said=said):
+                crm_bridge._pending.clear()
+                fetch, calls = self._many_then_one()
+                crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                                     fetch=fetch, device_id="D1", now=100.0)
+                reply = crm_bridge.intercept(said, "ダイスケ", env=self.ENV,
+                                             fetch=fetch, device_id="D1", now=110.0)
+                self.assertIn("みたまA-12", reply, said)
+
+    def test_a_single_result_never_starts_a_wait(self):
+        reply = crm_bridge.intercept(
+            "田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+            fetch=self._fetch(1, [{"customer_name": "田中", "cemetery_name": "専唱寺",
+                                   "area": "郡司分"}]),
+            device_id="D1", now=100.0)
+        self.assertIn("専唱寺", reply)
+        self.assertIsNone(crm_bridge.intercept("太郎", "ダイスケ", env=self.ENV,
+                                               fetch=self._fetch(0, []),
+                                               device_id="D1", now=110.0))
+
+    def test_the_wait_expires(self):
+        fetch, _ = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        self.assertIsNone(crm_bridge.intercept("太郎", "ダイスケ", env=self.ENV,
+                                               fetch=fetch, device_id="D1",
+                                               now=100.0 + 121.0))
+
+    def test_another_body_is_not_answering_this_question(self):
+        fetch, _ = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        self.assertIsNone(crm_bridge.intercept("太郎", "ダイスケ", env=self.ENV,
+                                               fetch=fetch, device_id="D2", now=110.0))
+
+    def test_another_person_is_not_answering_this_question(self):
+        fetch, _ = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        self.assertIsNone(crm_bridge.intercept("太郎", "篠崎", env=self.ENV,
+                                               fetch=fetch, device_id="D1", now=110.0))
+
+    def test_a_long_sentence_is_a_person_moving_on(self):
+        fetch, _ = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        self.assertIsNone(crm_bridge.intercept(
+            "そういえば今日の天気ってどうだったっけ", "ダイスケ", env=self.ENV,
+            fetch=fetch, device_id="D1", now=110.0))
+
+    def test_giving_up_is_answered_not_looked_up(self):
+        fetch, calls = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        before = len(calls)
+        reply = crm_bridge.intercept("もういいや", "ダイスケ", env=self.ENV,
+                                     fetch=fetch, device_id="D1", now=110.0)
+        self.assertIn("やめておく", reply)
+        self.assertEqual(len(calls), before)
+
+    def test_a_wrong_given_name_costs_one_turn_not_the_lookup(self):
+        fetch, _ = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        reply = crm_bridge.intercept("四郎", "ダイスケ", env=self.ENV,
+                                     fetch=self._fetch(0, []), device_id="D1",
+                                     now=110.0)
+        self.assertIn("見つからなかった", reply)
+        # Still waiting: the next attempt is still read as an answer.
+        second = crm_bridge.intercept("太郎", "ダイスケ", env=self.ENV, fetch=fetch,
+                                      device_id="D1", now=120.0)
+        self.assertIn("みたまA-12", second)
+
+    def test_a_fresh_question_supersedes_the_wait(self):
+        fetch, _ = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        reply = crm_bridge.intercept(
+            "田中さんの墓所どこ？", "ダイスケ", env=self.ENV,
+            fetch=self._fetch(1, [{"customer_name": "田中", "cemetery_name": "専唱寺",
+                                   "area": "郡司分"}]),
+            device_id="D1", now=110.0)
+        self.assertIn("専唱寺", reply)
+        self.assertIsNone(crm_bridge.intercept("太郎", "ダイスケ", env=self.ENV,
+                                               fetch=fetch, device_id="D1", now=120.0))
+
+    def test_the_wait_holds_no_customer_records(self):
+        # Only a surname and a deadline. Rows are re-fetched rather than
+        # kept warm in case they are wanted again.
+        fetch, _ = self._many_then_one()
+        crm_bridge.intercept("山田さんの墓所どこ？", "ダイスケ", env=self.ENV,
+                             fetch=fetch, device_id="D1", now=100.0)
+        held = list(crm_bridge._pending.values())[0]
+        self.assertEqual(set(held), {"surname", "expires_at"})
+
     # --- spoken forms (contract: CRM_LOOKUP_API_CONTRACT.md) ------------
 
     def test_single_result_with_area_speaks_district(self):

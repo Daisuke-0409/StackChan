@@ -19,6 +19,12 @@ Configuration (gateway/.env):
     CRM_RELAY_URL=http://100.76.60.88:8767      # the office PC, over Tailscale
     CRM_RELAY_TOKEN=...                          # matches the relay's own token
 
+A lookup can take two turns. "6件あるよ" is not an answer, so the bridge
+remembers -- in this process only, for two minutes -- that it is waiting
+for a given name, and reads the next short utterance as that name rather
+than as conversation. Nothing about the wait is written to memory or to a
+log; it exists in RAM and expires.
+
 With no URL configured the bridge answers None to everything and chat
 behaves as if this module did not exist.
 """
@@ -27,12 +33,25 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import unicodedata
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
 
 _TIMEOUT_SECONDS = 15.0
+
+# How long "which 山田?" stays an open question. Long enough to think about,
+# short enough that an unrelated word an hour later is not mistaken for an
+# answer. The robot's own hands-free window is 30s, so this outlasts one
+# turn of conversation and not much more.
+_PENDING_TTL_SECONDS = 120.0
+
+# Keyed by (device_id, asked_by): the body is the conversation, and a
+# different person stepping in front of it has not been asked anything.
+# Holds a surname and a deadline -- no rows, because customer records are
+# not something to keep warm in case they are wanted again.
+_pending: dict[tuple[str, str], dict[str, Any]] = {}
 
 # A grave question is NAME + さん/様 + a grave word, with a question word
 # somewhere -- all three, because the payment-adjacent lesson generalizes:
@@ -58,6 +77,65 @@ def detect(text: str) -> Optional[str]:
     if not name or name in _NOT_A_CUSTOMER:
         return None
     return name
+
+
+# "下の名前は太郎" / "太郎です" / "太郎の方" -- the wrappers a person puts
+# around an answer, stripped to leave the answer.
+_REFINEMENT_STRIP_RE = re.compile(
+    r"^(?:下の)?名前は|^名は|です$|だよ$|の方$|って(人|方)$|さん$|様$|でお願い$")
+# Said instead of a name, when the question has stopped mattering.
+_CANCEL_RE = re.compile(r"もういい|大丈夫|やめ|キャンセル|なんでもない|いらない")
+# An answer to "which one?" is short. Anything longer is a person moving on
+# with their day, and moving on is allowed.
+_MAX_REFINEMENT_CHARS = 12
+
+
+def _pending_key(device_id: str, asked_by: str) -> tuple[str, str]:
+    return (device_id or "", asked_by or "unknown")
+
+
+def _remember_question(device_id: str, asked_by: str, surname: str,
+                       now: float) -> None:
+    _pending[_pending_key(device_id, asked_by)] = {
+        "surname": surname, "expires_at": now + _PENDING_TTL_SECONDS}
+
+
+def _open_question(device_id: str, asked_by: str,
+                   now: float) -> Optional[dict[str, Any]]:
+    key = _pending_key(device_id, asked_by)
+    waiting = _pending.get(key)
+    if waiting is None:
+        return None
+    if now > waiting["expires_at"]:
+        _pending.pop(key, None)
+        return None
+    return waiting
+
+
+def _forget_question(device_id: str, asked_by: str) -> None:
+    _pending.pop(_pending_key(device_id, asked_by), None)
+
+
+def _as_refinement(text: str) -> Optional[str]:
+    """The given name in a reply to "which one?", or None to let it pass.
+
+    While a question is open the bias is to treat a short utterance as its
+    answer, because the alternative is worse. Reading "太郎" as
+    conversation sends a customer's name to Gemini, which is the one thing
+    this module exists to prevent; reading an unrelated word as a name
+    costs a puzzled sentence inside a two-minute window that the robot
+    itself opened by asking.
+
+    Long utterances and questions are not answers, and fall through.
+    """
+    stripped = unicodedata.normalize("NFKC", text).strip(" 　。、,.!?！？")
+    if not stripped or len(stripped) > _MAX_REFINEMENT_CHARS:
+        return None
+    if _QUESTION_RE.search(stripped) or "？" in stripped or "?" in stripped:
+        return None
+    name = _REFINEMENT_STRIP_RE.sub("", stripped).strip()
+    name = _REFINEMENT_STRIP_RE.sub("", name).strip()
+    return name or None
 
 
 def _format_grave(row: dict[str, Any]) -> str:
@@ -92,49 +170,99 @@ def _compose_reply(name: str, total: int, rows: list[dict[str, Any]]) -> str:
         owner = (row.get("customer_name") or name).strip()
         parts.append(f"{owner}さんが{_format_grave(row)}。")
     if total > len(rows):
-        parts.append("多いから、下の名前も付けてもう一度聞いてね。")
+        parts.append("多いから、下の名前を教えて。")
+    else:
+        parts.append("下の名前を言ってくれたら絞り込むよ。")
     return "".join(parts)
 
 
-def intercept(text: str, asked_by: str,
-              fetch: Optional[Callable[[str, str], tuple[int, dict[str, Any]]]] = None,
-              env: Optional[dict[str, str]] = None) -> Optional[str]:
-    """A spoken reply if this is a grave question, else None.
+def _lookup(relay_url: str, search: str, asked_by: str, fetch, env
+            ) -> tuple[Optional[str], Optional[int], list[dict[str, Any]]]:
+    """(error reply, total, rows). The error reply is spoken as-is.
 
-    Once a question is recognized it is answered here in every case,
-    including every failure case: falling through to normal chat would hand
-    the customer's name to Gemini, so there is deliberately no path that
-    does. The caller must not remember the exchange.
+    Every failure produces a sentence rather than a fall-through, because
+    falling through hands the customer's name to Gemini. There is
+    deliberately no path out of here that does not answer.
     """
-    env = env if env is not None else os.environ
-    relay_url = (env.get("CRM_RELAY_URL") or "").rstrip("/")
-    if not relay_url:
-        return None
-    name = detect(text)
-    if name is None:
-        return None
-
     import urllib.parse
-    query = urllib.parse.urlencode({"name": name, "asked_by": asked_by or "unknown"})
-    fetch = fetch or _default_fetch
+    query = urllib.parse.urlencode({"name": search, "asked_by": asked_by or "unknown"})
     try:
         status, payload = fetch(f"{relay_url}/crm/lookup?{query}",
                                 env.get("CRM_RELAY_TOKEN", ""))
     except urllib.error.HTTPError as exc:
         _log_status(exc.code)
         if exc.code == 403:
-            return "台帳の鍵が合わなかったよ。設定を確認してもらってね。"
+            return "台帳の鍵が合わなかったよ。設定を確認してもらってね。", None, []
         if exc.code in (502, 503):
-            return "会社のシステムが台帳を引けない状態みたい。会社のパソコンとCRMを見てもらってね。"
-        return "台帳の照会でエラーが出たよ。"
+            return ("会社のシステムが台帳を引けない状態みたい。"
+                    "会社のパソコンとCRMを見てもらってね。"), None, []
+        return "台帳の照会でエラーが出たよ。", None, []
     except Exception:  # noqa: BLE001 -- unreachable office PC is an expected state
         _log_status(None)
-        return "会社のパソコンに繋がらなくて、台帳が引けないよ。会社が開いている時間なら、パソコンの電源を確認してね。"
+        return ("会社のパソコンに繋がらなくて、台帳が引けないよ。"
+                "会社が開いている時間なら、パソコンの電源を確認してね。"), None, []
 
     _log_status(status, payload.get("count"))
-    total = int(payload.get("count", 0))
-    rows = payload.get("results") or []
-    return _compose_reply(name, total, rows)
+    return None, int(payload.get("count", 0)), (payload.get("results") or [])
+
+
+def intercept(text: str, asked_by: str,
+              fetch: Optional[Callable[[str, str], tuple[int, dict[str, Any]]]] = None,
+              env: Optional[dict[str, str]] = None,
+              device_id: str = "", now: Optional[float] = None) -> Optional[str]:
+    """A spoken reply if this belongs to a grave lookup, else None.
+
+    Two ways in. A full question ("田中さんの墓所どこ？") starts one; a short
+    utterance while a "which one?" is outstanding continues it. Both answer
+    in every case, including every failure, and neither is remembered.
+    """
+    env = env if env is not None else os.environ
+    relay_url = (env.get("CRM_RELAY_URL") or "").rstrip("/")
+    if not relay_url:
+        return None
+    now = time.time() if now is None else now
+    fetch = fetch or _default_fetch
+
+    name = detect(text)
+    if name is not None:
+        # A fresh question supersedes whatever was being narrowed.
+        _forget_question(device_id, asked_by)
+        error, total, rows = _lookup(relay_url, name, asked_by, fetch, env)
+        if error:
+            return error
+        if total > 1:
+            _remember_question(device_id, asked_by, name, now)
+        return _compose_reply(name, total, rows)
+
+    waiting = _open_question(device_id, asked_by, now)
+    if waiting is None:
+        return None
+
+    if _CANCEL_RE.search(unicodedata.normalize("NFKC", text)):
+        _forget_question(device_id, asked_by)
+        return "わかった、台帳を見るのはやめておくね。"
+
+    given = _as_refinement(text)
+    if given is None:
+        return None  # not an answer; ordinary conversation carries on
+
+    surname = waiting["surname"]
+    if given == surname:
+        return "同じ名字だね。下の名前の方を教えて。"
+
+    full_name = f"{surname} {given}"
+    error, total, rows = _lookup(relay_url, full_name, asked_by, fetch, env)
+    if error:
+        return error
+    if total == 0:
+        # Keep waiting: a mis-heard given name should cost one more turn,
+        # not the whole lookup.
+        return f"{surname}さんで{given}という名前は見つからなかったよ。もう一度言ってみて。"
+    if total > 1:
+        _remember_question(device_id, asked_by, surname, now)
+        return _compose_reply(full_name, total, rows)
+    _forget_question(device_id, asked_by)
+    return _compose_reply(full_name, total, rows)
 
 
 def _log_status(status: Optional[int], count: Optional[int] = None) -> None:
