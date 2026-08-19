@@ -1,6 +1,6 @@
-# R9 再設計 — STEP 1 現状調査
+# R9 再設計 — 現状調査と進捗
 
-調査日: 2026-08-19。**コード変更なし。**再設計仕様書に対する現物の対応表。
+2026-08-19 作成。1〜4章は着手前の調査 (当時コード変更なし)、5章が進捗。再設計仕様書に対する現物の対応表。
 同じ調査を二度しないための記録 (§37-5)。根拠は行番号で示す。
 
 ---
@@ -125,14 +125,55 @@ None を返すか**の二択。会話の途中経過という概念が無い。
 
 ---
 
-## 5. 次の STEP
+## 5. 進捗 (2026-08-19 会社セッション)
 
-**STEP 2: Order Draft のデータモデル追加。Playwright には触らない。**
+STEP 1〜11 のうち、**実サイトを要さない部分をすべて実装・テスト済み**。
+`orderagent/tests/` は **242件通過**。既存の `payment.py` / `db.py` /
+`mcd_adapter.py` / `server.py` / `order_bridge.py` は**1行も変更していない**。
 
-- 触るファイル: **`orderagent/draft.py` (新規) と `orderagent/tests/test_draft.py` (新規) のみ**
-- 触らないファイル: `server.py` / `mcd_adapter.py` / `payment.py` / `order_bridge.py` / `intent.py`
-- 受け入れ条件:
-  - `OrderDraft` が §10 の形 (restaurant / fulfillment / items[] / 各 item の id・product・variant・size・quantity・options・status) を表現できる
-  - 純粋なデータ構造とその操作のみ。ネットワーク・Playwright・LLM を呼ばない
-  - 既存テスト (`orderagent/tests/`) が全て通ったまま
-  - 新規ユニットテストが通る
+| STEP | 成果物 | 状態 |
+|---|---|---|
+| 1 調査 | 本書 | 済 |
+| 2 Order Draft | `draft.py` | 済 |
+| 3 ADD/REPLACE/MODIFY/REMOVE | `draft.py` | 済 |
+| 4 active_item・訂正表現 | `interpreter.py` | 済 |
+| 5 QUERY | `interpreter.py` | 済 |
+| 6 CONDITIONAL | `draft.Condition` + `interpreter.py` | 済 |
+| 7 Adapter接続 | `adapter.py` (インターフェース・純ロジック) | **半分**。`mcd_adapter` への実接続は未 |
+| 8 Resolved / Quote | `quote.py` | 済 |
+| 9 Snapshot + Hash | `snapshot.py` | 済 |
+| 10 決済状態機械 | `states.py` | 済 |
+| 11 UNKNOWN + reconcile | `reconcile.py` | **半分**。証拠の取得 (`recent_orders`) は未実装 |
+| 12 2社目 | — | 未着手 |
+| 13 クーポン | — | 未着手 |
+
+### 実装中に見つかったこと (仕様書に無い、現物からの発見)
+
+- **解決の順序は「条件 → 商品」。**条件を解決するとサイズが変わり、サイズが変わると
+  行が未解決に戻る (STEP 3 の規則)。「Lの方」と「Mの方」は店にとって別商品なので、
+  これは正しい挙動。カウンターで人がやる順序と同じ
+- **`promotion` は `price` より先に判定する。**「ランチ安い？」は両方に当たるが、
+  条件付きの価格なので、現在の合計から答えると**自信を持って間違った金額**を言う
+- **QUERY は最優先でチェックする。**注文を質問と誤読しても答えが返るだけだが、
+  質問を削除と誤読すると商品が消える。破壊しない側を先に置く
+
+### 家で最初にやること
+
+**既存の `stores.py` + `mcd_adapter.py` を `adapter.RestaurantAdapter` に嵌める
+薄いラッパー** (`orderagent/mcd/__init__.py` など)。推測でセレクタや API を作る作業は
+ゼロで、既存関数を呼び直すだけ。必要なメソッドは:
+
+```
+find_stores(lat, lng, limit)   -> stores.nearest()
+capabilities(store_id)          -> stores.store_detail() の mopEnabled ほか
+menu(store_id)                  -> stores.menu()
+promotions(store_id)            -> 未調査。空集合を返せば条件は false 側に落ちる
+build_cart(...)                 -> mcd_adapter.build_cart()
+recent_orders(store_id)         -> 未調査。Evidence(history_available=False) でよい
+```
+
+`promotions()` と `recent_orders()` は**空を返す実装で始めてよい**。どちらも
+「分からない」が安全側 (通常価格を取る / 人に確認を求める) に倒れる設計になっている。
+
+**前提**: この PC (会社) には Playwright もブラウザプロファイルも無い。
+STEP 7 の残り・11 の残り・12・13 はすべて家の作業。
