@@ -35,6 +35,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol, runtime_checkable
 
 from . import draft as draft_mod
+from . import reconcile as reconcile_mod
 
 # §7. Not every chain, and not every branch of one chain, can do everything.
 # A store that cannot take an online order can still be suggested, quoted
@@ -128,6 +129,16 @@ class RestaurantAdapter(Protocol):
         {"cart_items": [...], "cart_total_yen": int}. The reply is scraped,
         never assumed: the readback and the payment gate are both built
         from it, so what gets approved is what the site will charge for.
+        """
+
+    def recent_orders(self, store_id: str) -> "reconcile_mod.Evidence":
+        """What the store thinks it has, for settling an unknown payment.
+
+        Optional in practice: an adapter that cannot read an order history
+        returns Evidence(history_available=False), and reconciliation
+        answers UNRESOLVED rather than guessing. Being unable to check is
+        itself the finding -- silence from a store is not proof that
+        nothing was ordered (§27).
         """
 
 

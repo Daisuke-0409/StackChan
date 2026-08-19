@@ -45,6 +45,11 @@ class FakeAdapter:
         total = sum(i["price"] * i["quantity"] for i in items)
         return {"cart_items": list(items), "cart_total_yen": total}
 
+    def recent_orders(self, store_id):
+        from orderagent import reconcile
+        return reconcile.Evidence(history_available=False,
+                                  note="テスト用の店は履歴を持たないよ。")
+
 
 def _draft(*products, store_id="S1"):
     d = draft.new_draft("fake", store_id=store_id)
