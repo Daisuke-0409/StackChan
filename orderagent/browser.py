@@ -125,7 +125,7 @@ def attached_page(url: str = "about:blank",
     """
     from playwright.sync_api import sync_playwright
 
-    started = launch_chrome(url, headless_window=headless_window)
+    launch_chrome(url, headless_window=headless_window)
     with sync_playwright() as p:
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
         context = browser.contexts[0] if browser.contexts else browser.new_context()
@@ -134,8 +134,11 @@ def attached_page(url: str = "about:blank",
         try:
             yield page
         finally:
+            # Detach, never kill. The browser outlives every call on
+            # purpose: Mos keeps its login in a session cookie with no
+            # "stay signed in" to tick, so a browser that closes between
+            # orders logs Daisuke out each time -- and closing one this
+            # process started would do exactly that. It is also simply
+            # faster, and it means he can watch, or take over, mid-flow.
             with contextlib.suppress(Exception):
-                browser.close()   # detaches; does not kill the browser
-            if started is not None:
-                with contextlib.suppress(Exception):
-                    started.terminate()
+                browser.close()   # detaches this connection only
