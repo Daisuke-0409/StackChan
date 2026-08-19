@@ -38,6 +38,13 @@ MOBILE_UA = ("Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 "
              "(KHTML, like Gecko) Chrome/148.0.0.0 Mobile Safari/537.36")
 VIEWPORT = {"width": 390, "height": 844}
 
+# Real Chrome, not Playwright's bundled Chromium: the bundled chrome.exe
+# dies with a side-by-side configuration error on this machine (2026-08-16,
+# survives --force reinstall), and the payment session must live in ONE
+# profile shared by the manual registration browser and the agent -- same
+# binary, same encryption keys.
+BROWSER_CHANNEL = os.environ.get("ORDER_BROWSER_CHANNEL", "chrome")
+
 
 def ensure_dirs() -> None:
     for d in (DATA_DIR, PROFILE_DIR, JOBS_DIR):

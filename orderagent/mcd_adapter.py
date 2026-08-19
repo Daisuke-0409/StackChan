@@ -105,6 +105,7 @@ def build_cart(store_key: str, items: list[dict[str, Any]], job_id: str,
     with sync_playwright() as p:
         context = p.chromium.launch_persistent_context(
             str(config.PROFILE_DIR),
+            channel=config.BROWSER_CHANNEL,
             headless=True,
             user_agent=config.MOBILE_UA,
             viewport=config.VIEWPORT,
