@@ -1,3 +1,4 @@
+import importlib.util
 import unittest
 
 from orderagent import reconcile
@@ -63,7 +64,13 @@ class CartScrapeTest(unittest.TestCase):
         self.assertEqual(self._scrape()["cart_total_yen"], 1290)
 
 
+@unittest.skipUnless(importlib.util.find_spec("playwright"),
+                     "needs a browser: drives the live Mos site")
 class ClosedStoreTest(unittest.TestCase):
+    # Reaches the real site through a real browser, so it cannot run on a
+    # machine without one -- the office PC has neither Playwright nor a
+    # profile. Skipped rather than left to fail: a suite that is always one
+    # red short teaches people to stop reading the colour.
     def test_ordering_from_a_closed_store_is_refused_by_name(self):
         # Live, at night: every branch is shut, and the refusal has to say
         # which shop it is talking about.
