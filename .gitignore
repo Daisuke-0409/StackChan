@@ -6,6 +6,8 @@ __pycache__/
 # Forwarder settings: no credentials, but it names the private Tailscale
 # address of the machine that holds every conversation. Ship the example.
 .env.forwarder
+# CRM relay: a tailnet-facing token that fronts the customer ledger.
+.env.crm_relay
 # Copies merge_memory.py leaves behind; same personal data as the store.
 *.before-merge
 phase3-*.log
