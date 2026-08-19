@@ -94,22 +94,10 @@ def _require_session(page: Any) -> None:
             "My Starbucks のログインが切れているよ。ブラウザで入り直してね。")
 
 
-def _set_position(page: Any, lat: float, lng: float) -> None:
-    """Move the browser's idea of where it is, over CDP.
-
-    The site measures every distance from the browser's own position and
-    refuses to work without one -- an unset position is what produced the
-    「通信エラー」 that cost an evening (2026-08-19). Setting it through the
-    devtools protocol is the same mechanism the browser's own device
-    emulation uses; failure is non-fatal, because a browser that already
-    knows where it is does not need telling.
-    """
-    try:
-        session = page.context.new_cdp_session(page)
-        session.send("Emulation.setGeolocationOverride",
-                     {"latitude": lat, "longitude": lng, "accuracy": 50})
-    except Exception:  # noqa: BLE001
-        pass
+# Position handling lives in browser.py now: every attached page is
+# granted geolocation for the ordering origins and given coordinates
+# before it loads anything. An unset position is what produced the
+# 「通信エラー」 that cost an evening (2026-08-19).
 
 
 # The nearby list as the app renders it. Read from the DOM rather than
@@ -201,8 +189,7 @@ class StarbucksAdapter:
         browser's own position, because the site measures from there --
         asking it about somewhere else is not a thing it offers.
         """
-        with browser_mod.attached_page() as page:
-            _set_position(page, lat, lng)
+        with browser_mod.attached_page(latitude=lat, longitude=lng) as page:
             return nearby_stores(page)[:limit]
 
     def capabilities(self, store_id: str) -> Capabilities:

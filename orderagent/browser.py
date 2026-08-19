@@ -70,10 +70,55 @@ def launch_chrome(url: str = "about:blank", headless_window: bool = True) -> Opt
     raise RuntimeError("Chrome did not open its debugging port in time")
 
 
+# Every ordering site measures from the browser's position, and a browser
+# that has never been asked sits at "not decided", which reads to the page
+# as a failure. Starbucks reports that as 「通信エラーが発生しました」 and
+# stops -- an evening was spent on it (2026-08-19) before Daisuke noticed
+# the location toggle. These are the origins the agent orders through;
+# permission is granted up front so no first visit can start in the dark.
+ORDERING_ORIGINS = (
+    "https://webapp.starbucks.co.jp",
+    "https://netorder.mos.jp",
+    "https://www.mcdonalds.co.jp",
+    "https://www.kfc.co.jp",
+)
+
+# Where the browser thinks it is when nothing better is known: the house.
+# Overridden per call by adapters that have the phone's real position.
+DEFAULT_LATITUDE = float(__import__("os").environ.get("ORDER_DEFAULT_LAT", "32.1337"))
+DEFAULT_LONGITUDE = float(__import__("os").environ.get("ORDER_DEFAULT_LNG", "131.5033"))
+
+
+def prepare_location(page: Any, latitude: Optional[float] = None,
+                     longitude: Optional[float] = None) -> None:
+    """Grant geolocation to the ordering sites and set a position.
+
+    Two separate things, both needed. The grant answers the permission
+    prompt that a headless-ish browser can never show anybody; the
+    override supplies coordinates, because a real fix on a desktop with no
+    GPS radio has nothing to report even once permitted.
+
+    Failures are swallowed: a browser that already knows where it is does
+    not need either, and neither is worth failing an order over.
+    """
+    latitude = DEFAULT_LATITUDE if latitude is None else latitude
+    longitude = DEFAULT_LONGITUDE if longitude is None else longitude
+    with contextlib.suppress(Exception):
+        session = page.context.new_cdp_session(page)
+        for origin in ORDERING_ORIGINS:
+            with contextlib.suppress(Exception):
+                session.send("Browser.grantPermissions",
+                             {"origin": origin, "permissions": ["geolocation"]})
+        session.send("Emulation.setGeolocationOverride",
+                     {"latitude": latitude, "longitude": longitude, "accuracy": 50})
+
+
 @contextlib.contextmanager
 def attached_page(url: str = "about:blank",
-                  headless_window: bool = True) -> Iterator[Any]:
-    """A page in an ordinary Chrome, driven over CDP.
+                  headless_window: bool = True,
+                  latitude: Optional[float] = None,
+                  longitude: Optional[float] = None) -> Iterator[Any]:
+    """A page in an ordinary Chrome, driven over CDP, that knows where it is.
 
     The browser is left running on exit when this call did not start it,
     so a session Daisuke opened by hand survives the agent using it.
@@ -85,6 +130,7 @@ def attached_page(url: str = "about:blank",
         browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{CDP_PORT}")
         context = browser.contexts[0] if browser.contexts else browser.new_context()
         page = context.pages[0] if context.pages else context.new_page()
+        prepare_location(page, latitude, longitude)
         try:
             yield page
         finally:
