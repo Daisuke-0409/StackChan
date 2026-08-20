@@ -1636,7 +1636,8 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
     # The CRM's own audit log is the record of who asked.
     speaker = get_current_speaker(payload["device_id"])
     crm_reply = crm_bridge.intercept(text, speaker["name"] if speaker else "unknown",
-                                     device_id=payload["device_id"])
+                                     device_id=payload["device_id"],
+                                     role=current_role(payload["device_id"]))
     if crm_reply is not None:
         if settings_store.get("speech_enabled"):
             pcm = _tts_pcm(crm_reply, env) or _generate_beep_pcm()

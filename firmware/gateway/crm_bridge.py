@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import json
 import os
+import datetime
 import re
 import time
 import unicodedata
@@ -100,6 +101,18 @@ def _remember_question(device_id: str, asked_by: str, surname: str,
         "surname": surname, "expires_at": now + _PENDING_TTL_SECONDS}
 
 
+def _remember_find(device_id: str, asked_by: str, conditions: dict[str, str],
+                   now: float) -> None:
+    """Hold the question, not the answers.
+
+    Same reasoning as the surname wait: a refinement re-queries rather than
+    reading from rows kept warm, so the CRM's audit log sees the narrower
+    question too, and no customer record lives here between turns.
+    """
+    _pending[_pending_key(device_id, asked_by)] = {
+        "conditions": dict(conditions), "expires_at": now + _PENDING_TTL_SECONDS}
+
+
 def _open_question(device_id: str, asked_by: str,
                    now: float) -> Optional[dict[str, Any]]:
     key = _pending_key(device_id, asked_by)
@@ -136,6 +149,169 @@ def _as_refinement(text: str) -> Optional[str]:
     name = _REFINEMENT_STRIP_RE.sub("", stripped).strip()
     name = _REFINEMENT_STRIP_RE.sub("", name).strip()
     return name or None
+
+
+# --- searching by circumstance (find) --------------------------------------
+#
+# "最近受けた案件で加江田のお客さんで俺の担当の人いなかったっけ" -- three
+# conditions and a question, none of which is a name. Recognised on the same
+# terms as a grave question: several signals together, because an
+# interceptor this close to customer data must not fire on small talk.
+
+_CUSTOMER_RE = re.compile(r"お客(さん|様)?|顧客|得意先")
+_PHONE_WANTED_RE = re.compile(r"電話|連絡先|番号")
+_FIND_QUESTION_RE = re.compile(r"いない|いなかった|いる|いた|誰|だれ|教えて|調べて|"
+                               r"どの|どんな|ある|あった")
+
+# "俺の担当" resolves to whoever is speaking; a named one to that name.
+_MINE_RE = re.compile(r"の?(?:俺|私|僕|わたし|おれ|ぼく|自分)の担当")
+_NAMED_STAFF_RE = re.compile(r"の?([^\s。、,，！？!?の]{1,8})(?:さん)?の担当")
+# The honorific is optional in the pattern, so a greedy name swallows it
+# and 篠崎さん arrives where 篠崎 was meant. Trim it after the fact rather
+# than making the pattern harder to read.
+_HONORIFIC_RE = re.compile(r"(?:さん|様|くん|ちゃん)$")
+
+# Periods a person actually says. "最近" has no business meaning -- the CRM
+# said so when asked -- so it is turned into a date here rather than left
+# for them to guess at.
+_RECENT_DAYS = 90
+_PERIOD_RE = (
+    ("recent", re.compile(r"最近|このごろ|この頃")),
+    ("this_month", re.compile(r"今月")),
+    ("last_month", re.compile(r"先月")),
+    ("this_year", re.compile(r"今年")),
+)
+
+# The district is whatever is left saying "◯◯のお客さん" once the staff and
+# period phrases are out of the way. Stripping them first matters: without
+# it, "俺の担当のお客さん" makes 担当 look like a place.
+_AREA_RE = re.compile(r"([^\s。、,，！？!?のでを]{2,10})(?:地区|の)(?:お客|顧客|得意先|方)")
+
+# Roles allowed to hear a phone number read out loud. Deliberately just the
+# one. A colleague standing at the office robot can look the number up in
+# the CRM, where the screen shows it to them and nobody else; the robot
+# says it to the whole room. Widening this is one line, and should be a
+# decision rather than a drift.
+_PHONE_ROLES = ("master",)
+
+# "田中さんの電話番号教えて" has no district, staff or period, so without
+# this it would fall through to ordinary chat and hand the name to Gemini.
+# Here the name is the condition.
+_NAMED_PHONE_RE = re.compile(
+    r"([^\s。、,，！？!?の]{1,12})(?:さん|様)の(?:電話|連絡先|番号)")
+
+# "お客さんの電話番号" is not a request about somebody called お客. Words
+# that are roles rather than names have to be excluded by hand, because
+# nothing in the shape of the sentence tells them apart -- found by asking
+# the live CRM and watching it search for a customer named 客.
+_NOT_A_PERSON = ("お客", "客", "顧客", "得意先", "担当", "うち", "自分",
+                 "俺", "私", "僕", "わたし", "おれ", "ぼく", "その人", "あの人")
+
+
+def _since_from(text: str, today: Optional[datetime.date] = None) -> Optional[str]:
+    """A date string the CRM understands, from the way people say time."""
+    today = today or datetime.date.today()
+    for kind, pattern in _PERIOD_RE:
+        if not pattern.search(text):
+            continue
+        if kind == "recent":
+            return (today - datetime.timedelta(days=_RECENT_DAYS)).isoformat()
+        if kind == "this_month":
+            return today.replace(day=1).isoformat()
+        if kind == "last_month":
+            first = today.replace(day=1)
+            return (first - datetime.timedelta(days=1)).replace(day=1).isoformat()
+        if kind == "this_year":
+            return today.replace(month=1, day=1).isoformat()
+    return None
+
+
+def detect_find(text: str, asked_by: str,
+                today: Optional[datetime.date] = None) -> Optional[dict[str, str]]:
+    """Conditions for a circumstance search, or None to leave it as chat.
+
+    Requires a customer word, a question, and at least one condition. Any
+    two of those show up in ordinary conversation; all three together do
+    not.
+    """
+    if not text:
+        return None
+    normalized = unicodedata.normalize("NFKC", text)
+    if not _CUSTOMER_RE.search(normalized) and not _PHONE_WANTED_RE.search(normalized):
+        return None
+    if not _FIND_QUESTION_RE.search(normalized) and not _PHONE_WANTED_RE.search(normalized):
+        return None
+
+    conditions: dict[str, str] = {}
+    remainder = normalized
+
+    if _MINE_RE.search(remainder):
+        conditions["staff"] = asked_by or ""
+        remainder = _MINE_RE.sub("", remainder)
+    else:
+        named = _NAMED_STAFF_RE.search(remainder)
+        if named:
+            staff = _HONORIFIC_RE.sub("", named.group(1)).strip()
+            if staff and staff not in _NOT_A_PERSON:
+                conditions["staff"] = staff
+                remainder = remainder.replace(named.group(0), "")
+
+    since = _since_from(remainder, today)
+    if since:
+        conditions["since"] = since
+        for _, pattern in _PERIOD_RE:
+            remainder = pattern.sub(" ", remainder)
+
+    area = _AREA_RE.search(remainder)
+    if area:
+        conditions["area"] = area.group(1)
+
+    named = _NAMED_PHONE_RE.search(normalized)
+    if named:
+        who = _HONORIFIC_RE.sub("", named.group(1)).strip()
+        if who and who not in _NOT_A_PERSON:
+            conditions["name"] = who
+
+    if not any(conditions.get(key) for key in ("area", "staff", "since", "name")):
+        return None
+    return {key: value for key, value in conditions.items() if value}
+
+
+def _spoken_conditions(conditions: dict[str, str]) -> str:
+    parts = []
+    if conditions.get("area"):
+        parts.append(f"{conditions['area']}の")
+    if conditions.get("staff"):
+        parts.append(f"{conditions['staff']}さん担当の")
+    if conditions.get("since"):
+        parts.append("最近の")
+    return "".join(parts) or "その条件の"
+
+
+def _compose_find_reply(conditions: dict[str, str], total: int,
+                        rows: list[dict[str, Any]], may_hear_phone: bool) -> str:
+    where = _spoken_conditions(conditions)
+    if total == 0:
+        return f"{where}お客さんは見つからなかったよ。"
+
+    if total == 1 and rows:
+        row = rows[0]
+        name = (row.get("customer_name") or "").strip()
+        if not may_hear_phone:
+            return (f"{where}お客さんは{name}さんだよ。"
+                    "電話番号は声では言わないから、CRMの画面で見てね。")
+        phone = (row.get("phone") or "").strip()
+        if not phone:
+            return f"{where}お客さんは{name}さんだよ。電話番号は台帳に入っていなかった。"
+        return f"{where}お客さんは{name}さんだよ。電話番号は{phone}。"
+
+    names = "、".join((row.get("customer_name") or "").strip() for row in rows)
+    parts = [f"{where}お客さんは{total}人いるよ。{names}。"]
+    if total > len(rows):
+        parts.append("多いから、名前で絞ってね。")
+    else:
+        parts.append("誰の電話番号？")
+    return "".join(parts)
 
 
 def _format_grave(row: dict[str, Any]) -> str:
@@ -206,15 +382,45 @@ def _lookup(relay_url: str, search: str, asked_by: str, fetch, env
     return None, int(payload.get("count", 0)), (payload.get("results") or [])
 
 
+def _find(relay_url: str, conditions: dict[str, str], asked_by: str, fetch, env
+          ) -> tuple[Optional[str], Optional[int], list[dict[str, Any]]]:
+    """(error reply, total, rows) for a circumstance search."""
+    import urllib.parse
+    query = urllib.parse.urlencode(dict(conditions, asked_by=asked_by or "unknown"))
+    try:
+        status, payload = fetch(f"{relay_url}/crm/find?{query}",
+                                env.get("CRM_RELAY_TOKEN", ""))
+    except urllib.error.HTTPError as exc:
+        _log_status(exc.code)
+        if exc.code == 403:
+            return "台帳の鍵が合わなかったよ。設定を確認してもらってね。", None, []
+        if exc.code == 400:
+            return "条件がうまく取れなかったよ。地区か担当か時期を教えて。", None, []
+        return ("会社のシステムが台帳を引けない状態みたい。"
+                "会社のパソコンとCRMを見てもらってね。"), None, []
+    except Exception:  # noqa: BLE001
+        _log_status(None)
+        return ("会社のパソコンに繋がらなくて、台帳が引けないよ。"
+                "会社が開いている時間なら、パソコンの電源を確認してね。"), None, []
+
+    _log_status(status, payload.get("count"))
+    return None, int(payload.get("count", 0)), (payload.get("results") or [])
+
+
 def intercept(text: str, asked_by: str,
               fetch: Optional[Callable[[str, str], tuple[int, dict[str, Any]]]] = None,
               env: Optional[dict[str, str]] = None,
-              device_id: str = "", now: Optional[float] = None) -> Optional[str]:
-    """A spoken reply if this belongs to a grave lookup, else None.
+              device_id: str = "", now: Optional[float] = None,
+              role: str = "unknown") -> Optional[str]:
+    """A spoken reply if this belongs to a CRM lookup, else None.
 
-    Two ways in. A full question ("田中さんの墓所どこ？") starts one; a short
-    utterance while a "which one?" is outstanding continues it. Both answer
-    in every case, including every failure, and neither is remembered.
+    Three ways in: a grave question, a search by circumstance, and a short
+    utterance while either has an outstanding "which one?". All of them
+    answer in every case, including every failure, and none is remembered.
+
+    `role` decides whether a phone number may be spoken. Everything else is
+    the same for everyone: where a grave is, is not a secret from a
+    colleague standing at the office robot.
     """
     env = env if env is not None else os.environ
     relay_url = (env.get("CRM_RELAY_URL") or "").rstrip("/")
@@ -222,6 +428,16 @@ def intercept(text: str, asked_by: str,
         return None
     now = time.time() if now is None else now
     fetch = fetch or _default_fetch
+
+    conditions = detect_find(text, asked_by)
+    if conditions is not None:
+        _forget_question(device_id, asked_by)
+        error, total, rows = _find(relay_url, conditions, asked_by, fetch, env)
+        if error:
+            return error
+        if total > 1:
+            _remember_find(device_id, asked_by, conditions, now)
+        return _compose_find_reply(conditions, total, rows, role in _PHONE_ROLES)
 
     name = detect(text)
     if name is not None:
@@ -245,6 +461,20 @@ def intercept(text: str, asked_by: str,
     given = _as_refinement(text)
     if given is None:
         return None  # not an answer; ordinary conversation carries on
+
+    if "conditions" in waiting:
+        # Narrowing a circumstance search: add the name to the same
+        # conditions and ask again, rather than reading from rows nobody
+        # kept.
+        narrowed = dict(waiting["conditions"], name=given)
+        error, total, rows = _find(relay_url, narrowed, asked_by, fetch, env)
+        if error:
+            return error
+        if total > 1:
+            _remember_find(device_id, asked_by, waiting["conditions"], now)
+        else:
+            _forget_question(device_id, asked_by)
+        return _compose_find_reply(narrowed, total, rows, role in _PHONE_ROLES)
 
     surname = waiting["surname"]
     if given == surname:

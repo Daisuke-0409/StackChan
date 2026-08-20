@@ -1,4 +1,5 @@
 import tempfile
+import datetime
 import unittest
 from unittest import mock
 
@@ -735,6 +736,178 @@ class DeviceTokenTests(unittest.TestCase):
     def test_the_header_name_is_case_insensitive(self):
         self.assertTrue(server._authorized({"authorization": "Bearer t"},
                                            {"DEVICE_TOKEN": "t"}))
+
+class CrmFindTests(unittest.TestCase):
+    """Searching by circumstance, and who may hear a phone number."""
+
+    ENV = {"CRM_RELAY_URL": "http://relay.test", "CRM_RELAY_TOKEN": "t"}
+    TODAY = datetime.date(2026, 8, 20)
+
+    def setUp(self):
+        crm_bridge._pending.clear()
+
+    def _fetch(self, count, results=()):
+        captured = {}
+
+        def fetch(url, token):
+            captured["url"] = url
+            return 200, {"count": count, "results": list(results)}
+        fetch.captured = captured
+        return fetch
+
+    # --- recognising the question --------------------------------------
+
+    def test_the_whole_sentence_becomes_three_conditions(self):
+        conditions = crm_bridge.detect_find(
+            "最近受けた案件で加江田のお客さんで俺の担当のお客さんいなかったっけ？電話番号教えて",
+            "ダイスケ", today=self.TODAY)
+        self.assertEqual(conditions["area"], "加江田")
+        self.assertEqual(conditions["staff"], "ダイスケ")
+        self.assertEqual(conditions["since"], "2026-05-22")
+
+    def test_mine_resolves_to_the_speaker(self):
+        self.assertEqual(
+            crm_bridge.detect_find("俺の担当のお客さん誰かいる？", "ダイスケ",
+                                   today=self.TODAY)["staff"], "ダイスケ")
+
+    def test_a_named_colleague_is_used_as_given(self):
+        self.assertEqual(
+            crm_bridge.detect_find("篠崎さんの担当のお客さん教えて", "ダイスケ",
+                                   today=self.TODAY)["staff"], "篠崎")
+
+    def test_periods_become_dates(self):
+        for said, expected in (("今月", "2026-08-01"), ("先月", "2026-07-01"),
+                               ("今年", "2026-01-01")):
+            with self.subTest(said=said):
+                conditions = crm_bridge.detect_find(
+                    f"{said}のお客さん誰かいた？", "ダイスケ", today=self.TODAY)
+                self.assertEqual(conditions["since"], expected)
+
+    def test_a_phone_question_about_a_name_is_a_condition(self):
+        # Otherwise it has no district, staff or period, falls through to
+        # ordinary chat, and takes the customer's name to Gemini with it.
+        conditions = crm_bridge.detect_find("田中さんの電話番号教えて", "ダイスケ",
+                                            today=self.TODAY)
+        self.assertEqual(conditions, {"name": "田中"})
+
+    def test_a_role_word_is_not_taken_for_a_name(self):
+        # "お客さんの電話番号" is not a request about somebody called お客.
+        # Found by asking the live CRM and watching it search for a
+        # customer named 客.
+        conditions = crm_bridge.detect_find("佐土原のお客さんの電話番号教えて",
+                                            "ダイスケ", today=self.TODAY)
+        self.assertEqual(conditions, {"area": "佐土原"})
+        self.assertNotIn("name", conditions)
+
+    def test_a_role_word_is_not_taken_for_a_staff_member(self):
+        self.assertIsNone(crm_bridge.detect_find("お客さんの担当誰？", "ダイスケ",
+                                                 today=self.TODAY))
+
+    def test_small_talk_is_left_alone(self):
+        for said in ("今日は暑いね", "お客さん来たよ", "電話が鳴ってる"):
+            with self.subTest(said=said):
+                self.assertIsNone(crm_bridge.detect_find(said, "ダイスケ",
+                                                         today=self.TODAY))
+
+    def test_a_grave_question_is_not_a_find(self):
+        self.assertIsNone(crm_bridge.detect_find("田中さんの墓所どこ？", "ダイスケ",
+                                                 today=self.TODAY))
+
+    # --- who may hear a number -----------------------------------------
+
+    ONE = [{"customer_id": 12, "customer_name": "田中 太郎",
+            "phone": "0985-00-0000", "cemetery_name": "みたまA-1"}]
+
+    def test_master_hears_the_number(self):
+        reply = crm_bridge.intercept("加江田のお客さんの電話番号教えて", "ダイスケ",
+                                     env=self.ENV, fetch=self._fetch(1, self.ONE),
+                                     device_id="D1", now=100.0, role="master")
+        self.assertIn("0985-00-0000", reply)
+
+    def test_a_colleague_is_pointed_at_the_screen_instead(self):
+        for role in ("colleague", "household", "guest", "unknown"):
+            with self.subTest(role=role):
+                reply = crm_bridge.intercept(
+                    "加江田のお客さんの電話番号教えて", "篠崎", env=self.ENV,
+                    fetch=self._fetch(1, self.ONE), device_id="D1", now=100.0,
+                    role=role)
+                self.assertNotIn("0985-00-0000", reply)
+                self.assertIn("CRMの画面", reply)
+
+    def test_the_name_is_still_answered_to_everyone(self):
+        # Where a grave is, and who the customer is, are not secrets from a
+        # colleague standing at the office robot. The number is.
+        reply = crm_bridge.intercept("加江田のお客さんの電話番号教えて", "篠崎",
+                                     env=self.ENV, fetch=self._fetch(1, self.ONE),
+                                     device_id="D1", now=100.0, role="colleague")
+        self.assertIn("田中 太郎", reply)
+
+    def test_a_missing_number_is_said_plainly(self):
+        rows = [dict(self.ONE[0], phone="")]
+        reply = crm_bridge.intercept("加江田のお客さんの電話番号教えて", "ダイスケ",
+                                     env=self.ENV, fetch=self._fetch(1, rows),
+                                     device_id="D1", now=100.0, role="master")
+        self.assertIn("入っていなかった", reply)
+
+    # --- the answer and the follow-up ----------------------------------
+
+    def test_nobody_matching_is_said_with_the_conditions(self):
+        reply = crm_bridge.intercept("加江田の俺の担当のお客さんいる？", "ダイスケ",
+                                     env=self.ENV, fetch=self._fetch(0), device_id="D1",
+                                     now=100.0, role="master")
+        self.assertIn("加江田", reply)
+        self.assertIn("見つからなかった", reply)
+
+    def test_several_are_listed_and_a_name_is_asked_for(self):
+        rows = [{"customer_id": 1, "customer_name": "田中", "phone": "1"},
+                {"customer_id": 2, "customer_name": "佐藤", "phone": "2"}]
+        reply = crm_bridge.intercept("加江田のお客さん誰かいる？", "ダイスケ",
+                                     env=self.ENV, fetch=self._fetch(2, rows),
+                                     device_id="D1", now=100.0, role="master")
+        self.assertIn("2人", reply)
+        self.assertIn("誰の電話番号", reply)
+        # No phone read out while it is still ambiguous who is meant.
+        self.assertNotIn("電話番号は1", reply)
+
+    def test_the_follow_up_name_narrows_the_same_conditions(self):
+        rows = [{"customer_id": 1, "customer_name": "田中", "phone": "1"},
+                {"customer_id": 2, "customer_name": "佐藤", "phone": "2"}]
+        crm_bridge.intercept("加江田のお客さん誰かいる？", "ダイスケ", env=self.ENV,
+                             fetch=self._fetch(2, rows), device_id="D1", now=100.0,
+                             role="master")
+        narrowed = self._fetch(1, self.ONE)
+        reply = crm_bridge.intercept("田中", "ダイスケ", env=self.ENV, fetch=narrowed,
+                                     device_id="D1", now=110.0, role="master")
+        self.assertIn("0985-00-0000", reply)
+        self.assertIn("area=", narrowed.captured["url"])
+        self.assertIn("name=", narrowed.captured["url"])
+
+    def test_the_wait_holds_conditions_and_not_customers(self):
+        rows = [{"customer_id": 1, "customer_name": "田中", "phone": "1"},
+                {"customer_id": 2, "customer_name": "佐藤", "phone": "2"}]
+        crm_bridge.intercept("加江田のお客さん誰かいる？", "ダイスケ", env=self.ENV,
+                             fetch=self._fetch(2, rows), device_id="D1", now=100.0,
+                             role="master")
+        held = list(crm_bridge._pending.values())[0]
+        self.assertEqual(set(held), {"conditions", "expires_at"})
+        self.assertNotIn("田中", str(held))
+
+    # --- failures still answer -----------------------------------------
+
+    def test_an_unreachable_office_is_answered_not_passed_on(self):
+        def boom(url, token):
+            raise OSError("office PC is off")
+        reply = crm_bridge.intercept("加江田のお客さんの電話番号教えて", "ダイスケ",
+                                     env=self.ENV, fetch=boom, device_id="D1",
+                                     now=100.0, role="master")
+        self.assertIsNotNone(reply)
+        self.assertIn("会社のパソコン", reply)
+
+    def test_no_relay_configured_stays_out_of_the_way(self):
+        self.assertIsNone(crm_bridge.intercept(
+            "加江田のお客さんの電話番号教えて", "ダイスケ", env={}, device_id="D1",
+            now=100.0, role="master"))
+
 
 if __name__ == "__main__":
     unittest.main()
