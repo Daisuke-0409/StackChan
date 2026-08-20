@@ -7,6 +7,11 @@ district. This process is the seam between those two facts.
 
     home gateway --(Tailscale)--> this, on the office PC --(localhost)--> CRM
 
+Three questions cross it: where is so-and-so's grave (lookup), who did I
+see in that district recently (find, which carries a phone number), and
+what link opens that customer's record (show, which carries no record at
+all -- an integer goes in and a URL comes out).
+
 It is deliberately thin, in the same way forwarder.py is thin. It decides
 nothing about what the robot says: no phrasing, no "is this a CRM question",
 no memory rules. Those live in the gateway, because *this process is the part
@@ -78,16 +83,28 @@ TIMEOUT_SECONDS = float(os.environ.get("CRM_RELAY_TIMEOUT_SECONDS", "10"))
 # the database can return. Past this the robot asks for a narrower name.
 MAX_RESULTS = int(os.environ.get("CRM_RELAY_MAX_RESULTS", "3"))
 
-# The whitelist is the security boundary, and it is deliberately redundant
-# with the CRM narrowing its own reply. Everything not named here is dropped,
-# including fields the CRM grows later: a new column must not start crossing
-# the tailnet because somebody added it at the other end.
+# The whitelists are the security boundary, and they are deliberately
+# redundant with the CRM narrowing its own replies. Everything not named
+# here is dropped, including fields the CRM grows later: a new column must
+# not start crossing the tailnet because somebody added it at the other end.
 ALLOWED_FIELDS = ("customer_name", "cemetery_name", "area")
 
+# A conditional search carries a phone number, which is a heavier
+# disclosure than where a grave is -- the robot says it out loud, so
+# everyone in the room hears it. It has its own list rather than being
+# folded into the one above, so that widening one can never widen the
+# other by accident.
+ALLOWED_FIND_FIELDS = ("customer_id", "customer_name", "phone", "cemetery_name")
 
-def _project(row):
+# The CRM builds the URL it returns from the Host it was called on, so
+# asking it over the tailnet yields a URL reachable from the other site.
+# Nothing else in the reply is carried.
+ALLOWED_SHOW_FIELDS = ("url",)
+
+
+def _project(row, allowed=ALLOWED_FIELDS):
     """Copy out the sayable fields and nothing else."""
-    return {key: row.get(key) for key in ALLOWED_FIELDS if row.get(key) not in (None, "")}
+    return {key: row.get(key) for key in allowed if row.get(key) not in (None, "")}
 
 
 def _get_json(url, headers, timeout):
@@ -122,6 +139,52 @@ def lookup(name, asked_by):
     return total, rows[:MAX_RESULTS]
 
 
+def find(params, asked_by):
+    """Search by circumstance -- district, staff, since -- not by name alone.
+
+    The CRM requires at least one condition and answers 400 otherwise; that
+    refusal is passed through rather than second-guessed here, because a
+    search with no conditions is a request for the whole ledger and the
+    place to say no to that is the place that holds it.
+    """
+    headers = {"Accept": "application/json"}
+    if CRM_TOKEN:
+        headers["X-Tachikoma-Token"] = CRM_TOKEN
+
+    query = urllib.parse.urlencode(
+        {key: value for key, value in params.items() if value})
+    _, payload = _get_json(f"{CRM_BASE_URL}/api/tachikoma/find?{query}",
+                           headers, TIMEOUT_SECONDS)
+    rows = [_project(row, ALLOWED_FIND_FIELDS)
+            for row in payload.get("results", [])]
+    total = int(payload.get("count", len(rows)))
+    return total, rows[:MAX_RESULTS]
+
+
+def show(customer_id, asked_by, host=None):
+    """The URL that opens one customer's record, for a screen to display.
+
+    The record itself never comes through here. That is the whole appeal of
+    showing over speaking: what crosses this process is an integer on the
+    way in and a link on the way out, and the customer's details go from
+    the CRM to a monitor without passing through anything of ours.
+
+    `host` overrides the Host header, so the CRM builds a URL reachable
+    from wherever the screen is rather than from its own loopback.
+    """
+    headers = {"Accept": "application/json"}
+    if CRM_TOKEN:
+        headers["X-Tachikoma-Token"] = CRM_TOKEN
+    if host:
+        headers["Host"] = host
+
+    query = urllib.parse.urlencode({"customer_id": customer_id,
+                                    "asked_by": asked_by or "unknown"})
+    _, payload = _get_json(f"{CRM_BASE_URL}/api/tachikoma/show?{query}",
+                           headers, TIMEOUT_SECONDS)
+    return _project(payload, ALLOWED_SHOW_FIELDS)
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -142,19 +205,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # person standing at the office PC needs to ask.
             return self._send(200, {"ok": True})
 
-        if parsed.path != "/crm/lookup":
+        if parsed.path not in ("/crm/lookup", "/crm/find", "/crm/show"):
             return self._send(404, {"error": "not found"})
 
         if self.headers.get("X-Tachikoma-Token", "") != RELAY_TOKEN:
             return self._send(403, {"error": "forbidden"})
 
         params = urllib.parse.parse_qs(parsed.query)
-        name = (params.get("name", [""])[0] or "").strip()
-        asked_by = (params.get("asked_by", [""])[0] or "unknown").strip()
-        if not name:
-            return self._send(400, {"error": "name is required"})
+        first = lambda key: (params.get(key, [""])[0] or "").strip()  # noqa: E731
+        asked_by = first("asked_by") or "unknown"
 
         try:
+            if parsed.path == "/crm/find":
+                conditions = {key: first(key)
+                              for key in ("area", "staff", "since", "name")}
+                conditions["asked_by"] = asked_by
+                if not any(conditions[key] for key in ("area", "staff", "since", "name")):
+                    return self._send(400, {"error": "at least one condition is required"})
+                total, results = find(conditions, asked_by)
+                return self._send(200, {"count": total, "results": results})
+
+            if parsed.path == "/crm/show":
+                customer_id = first("customer_id")
+                if not customer_id.isdigit():
+                    return self._send(400, {"error": "customer_id must be a number"})
+                return self._send(200, show(customer_id, asked_by,
+                                            host=first("host") or None))
+
+            name = first("name")
+            if not name:
+                return self._send(400, {"error": "name is required"})
             total, results = lookup(name, asked_by)
         except urllib.error.HTTPError as exc:
             self.log_message("crm lookup upstream HTTP %s", exc.code)
@@ -182,6 +262,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
         sys.stderr.write("[crm_relay] " + (fmt % args) + "\n")
 
 
+class _SingleInstanceServer(http.server.ThreadingHTTPServer):
+    """Refuses to start when the port is already taken.
+
+    Python turns SO_REUSEADDR on by default, and on Windows that does not
+    mean what it means elsewhere: a second process can bind a port another
+    one is already listening on, and requests are split between them at
+    random. The visible symptom is that a change does not take effect --
+    the old process is still answering half the time.
+
+    The CRM hit this and fixed it on 2026-08-19; this file hit it on
+    2026-08-20, an hour after reading their note about it. Failing to start
+    is the correct behaviour: a relay that is already running does not need
+    a second one, and a person who meant to restart it would rather be told.
+    """
+
+    allow_reuse_address = False
+
+
 def main():
     if not RELAY_TOKEN:
         sys.exit("CRM_RELAY_TOKEN is not set. This process listens on the tailnet "
@@ -190,7 +288,7 @@ def main():
 
     print(f"Tachikoma CRM relay listening on {HOST}:{PORT} -> {CRM_BASE_URL}")
     print("the gateway reaches this over Tailscale; the CRM is reached from this PC")
-    server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
+    server = _SingleInstanceServer((HOST, PORT), Handler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

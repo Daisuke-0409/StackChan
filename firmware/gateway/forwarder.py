@@ -196,11 +196,30 @@ class Handler(http.server.BaseHTTPRequestHandler):
             pass
 
 
+class _SingleInstanceServer(http.server.ThreadingHTTPServer):
+    """Refuses to start when the port is already taken.
+
+    Python turns SO_REUSEADDR on by default, and on Windows that does not
+    mean what it means elsewhere: a second process can bind a port another
+    one is already listening on, and requests are split between them at
+    random. The visible symptom is that a change does not take effect --
+    the old process is still answering half the time.
+
+    The CRM hit this and fixed it on 2026-08-19; the relay hit it on
+    2026-08-20, an hour after reading their note about it. Failing to start
+    is the correct behaviour: a process that is already running does not
+    need a second one, and a person who meant to restart it would rather
+    be told.
+    """
+
+    allow_reuse_address = False
+
+
 def main() -> int:
     if not TARGET:
         print("FORWARDER_TARGET is not set, e.g. http://100.x.y.z:8080", file=sys.stderr)
         return 2
-    server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
+    server = _SingleInstanceServer((HOST, PORT), Handler)
     _log(f"Tachikoma forwarder listening on {HOST}:{PORT} -> {TARGET}")
     _log("point the device's provisioned gateway URL at this PC's LAN address")
     try:
