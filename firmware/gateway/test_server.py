@@ -693,5 +693,48 @@ class CrmChatIntegrationTests(unittest.TestCase):
         provider.assert_not_called()   # and never reaches the LLM
 
 
+
+class DeviceTokenTests(unittest.TestCase):
+    """More than one body, and only the bodies we gave a token to."""
+
+    def _auth(self, supplied, configured):
+        return server._authorized({"Authorization": f"Bearer {supplied}"},
+                                  {"DEVICE_TOKEN": configured})
+
+    def test_a_single_token_still_works(self):
+        self.assertTrue(self._auth("abc", "abc"))
+        self.assertFalse(self._auth("abc", "xyz"))
+
+    def test_either_body_is_admitted(self):
+        # The office robot is flashed with its own token; the home gateway
+        # answered 401 to every poll it made until this existed.
+        both = "home-token,office-token"
+        self.assertTrue(self._auth("home-token", both))
+        self.assertTrue(self._auth("office-token", both))
+
+    def test_a_stranger_is_not(self):
+        self.assertFalse(self._auth("guessed", "home-token,office-token"))
+
+    def test_removing_an_entry_revokes_one_body(self):
+        # What a single shared string could never do.
+        self.assertFalse(self._auth("office-token", "home-token"))
+
+    def test_spacing_in_the_list_is_forgiven(self):
+        self.assertTrue(self._auth("office-token", " home-token , office-token "))
+
+    def test_an_empty_entry_admits_nobody(self):
+        self.assertFalse(self._auth("", "home-token,,"))
+        self.assertFalse(self._auth("Bearer ", "home-token,,"))
+
+    def test_no_token_configured_still_needs_the_dev_flag(self):
+        self.assertFalse(server._authorized({}, {"DEVICE_TOKEN": ""}))
+        self.assertTrue(server._authorized(
+            {}, {"DEVICE_TOKEN": "", "AI_PROVIDER": "mock",
+                 "ALLOW_INSECURE_DEV": "1"}))
+
+    def test_the_header_name_is_case_insensitive(self):
+        self.assertTrue(server._authorized({"authorization": "Bearer t"},
+                                           {"DEVICE_TOKEN": "t"}))
+
 if __name__ == "__main__":
     unittest.main()

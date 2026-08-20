@@ -25,6 +25,7 @@ import json
 import math
 import os
 import re
+import secrets
 import shutil
 import ssl
 import struct
@@ -575,14 +576,29 @@ def _result(status: int, code: str, **extra: Any) -> tuple[int, dict[str, Any]]:
 
 
 def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
-    expected = env.get("DEVICE_TOKEN", "")
+    """Whether this request carries a token one of our bodies was given.
+
+    DEVICE_TOKEN may list more than one, comma-separated. Two robots were
+    meant to share a single token and do not: the office body is flashed
+    with its own, so the home gateway answered 401 to every poll it made.
+    A list fixes that without reflashing anything, and it is the direction
+    R7 goes anyway -- removing one entry now revokes one body, which a
+    single shared string could never do.
+
+    It stops short of R7 proper: this says a known body is calling, not
+    which one. Telling them apart needs the device to be identified rather
+    than merely admitted.
+    """
+    expected = [t.strip() for t in env.get("DEVICE_TOKEN", "").split(",") if t.strip()]
     # Header names are case-insensitive on the wire (an iPhone Shortcut
     # typed as "authorization" is just as valid), but these headers arrive
     # as a plain dict whose lookup isn't. Fold the key, not the value.
     supplied = next((v for k, v in headers.items() if k.lower() == "authorization"), "")
     if not expected:
         return env.get("AI_PROVIDER", "mock") == "mock" and env.get("ALLOW_INSECURE_DEV") == "1"
-    return supplied == f"Bearer {expected}"
+    # compare_digest rather than ==: the comparison is against a secret, and
+    # a short-circuiting one leaks its length and prefix by timing.
+    return any(secrets.compare_digest(supplied, f"Bearer {token}") for token in expected)
 
 
 GEMINI_DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
