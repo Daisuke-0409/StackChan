@@ -36,6 +36,7 @@ import datetime
 import re
 import time
 import unicodedata
+import webbrowser
 import urllib.error
 import urllib.request
 from typing import Any, Callable, Optional
@@ -99,6 +100,21 @@ def _remember_question(device_id: str, asked_by: str, surname: str,
                        now: float) -> None:
     _pending[_pending_key(device_id, asked_by)] = {
         "surname": surname, "expires_at": now + _PENDING_TTL_SECONDS}
+
+
+def _remember_ids(device_id: str, asked_by: str, ids: list[int],
+                  now: float) -> None:
+    """Hold the customer ids the last search produced, and nothing else.
+
+    An id is an integer. The record it names never comes here, so this is
+    the one piece of a lookup worth keeping between turns -- it is what
+    makes "それモニターに出して" mean something without a second search.
+    """
+    key = _pending_key(device_id, asked_by)
+    waiting = _pending.get(key) or {}
+    waiting["ids"] = list(ids)
+    waiting["expires_at"] = now + _PENDING_TTL_SECONDS
+    _pending[key] = waiting
 
 
 def _remember_find(device_id: str, asked_by: str, conditions: dict[str, str],
@@ -314,6 +330,81 @@ def _compose_find_reply(conditions: dict[str, str], total: int,
     return "".join(parts)
 
 
+# --- putting a record on a screen (show) -----------------------------------
+
+_SHOW_RE = re.compile(r"(モニター|画面|ディスプレイ|そっち|そこ)に?\s*(出して|映して|表示)|"
+                      r"表示して|映して|出しといて")
+
+# Which bodies stand next to the office monitor. Anything not listed opens
+# on whichever machine the gateway is running on, because the body being
+# spoken to is where the person is, and an unlisted one is more likely to
+# be at home than in the office.
+def _office_devices(env: dict[str, str]) -> set[str]:
+    return {d.strip().upper() for d in (env.get("CRM_OFFICE_DEVICE_IDS") or "").split(",")
+            if d.strip()}
+
+
+def detect_show(text: str) -> bool:
+    """Whether this asks for the last customer to be put on a screen."""
+    if not text:
+        return False
+    return bool(_SHOW_RE.search(unicodedata.normalize("NFKC", text)))
+
+
+def _ids_of(rows: list[dict[str, Any]]) -> list[int]:
+    out = []
+    for row in rows:
+        value = row.get("customer_id")
+        if value is not None and str(value).isdigit():
+            out.append(int(value))
+    return out
+
+
+def _show_on_screen(relay_url: str, customer_id: int, device_id: str,
+                    asked_by: str, fetch, env: dict[str, str]) -> str:
+    """Put one record on the screen where the person is standing.
+
+    Which screen is decided by which body is being spoken to. That is the
+    only signal that does not need guessing: the robot someone is talking
+    to is in the room with them.
+
+    The office monitor is driven by the relay, which is the machine next to
+    it. Anywhere else opens on whichever machine the gateway runs on. In
+    both cases the browser fetches the record itself -- nothing about the
+    customer passes through the robot -- and in both cases the CRM still
+    asks for a login, which is the CRM's decision and the right one for a
+    page that shows an address, a phone number and every photo.
+    """
+    import urllib.parse
+
+    if device_id.upper() in _office_devices(env):
+        query = urllib.parse.urlencode({"customer_id": customer_id,
+                                        "asked_by": asked_by or "unknown"})
+        try:
+            fetch(f"{relay_url}/crm/open?{query}", env.get("CRM_RELAY_TOKEN", ""))
+        except Exception:  # noqa: BLE001
+            _log_status(None)
+            return "会社の画面に出せなかったよ。会社のパソコンを確認してね。"
+        return "会社のモニターに出したよ。"
+
+    # Somewhere else: ask for a link that works from here, and open it here.
+    office_host = urllib.parse.urlsplit(relay_url).hostname or ""
+    query = urllib.parse.urlencode({"customer_id": customer_id,
+                                    "asked_by": asked_by or "unknown",
+                                    "host": f"{office_host}:8765"})
+    try:
+        _, payload = fetch(f"{relay_url}/crm/show?{query}",
+                           env.get("CRM_RELAY_TOKEN", ""))
+    except Exception:  # noqa: BLE001
+        _log_status(None)
+        return "台帳の画面を開けなかったよ。会社のパソコンを確認してね。"
+    url = (payload or {}).get("url")
+    if not url:
+        return "台帳の画面のアドレスが分からなかったよ。"
+    webbrowser.open(url)
+    return "こっちの画面に出したよ。CRMのログインを聞かれたら入れてね。"
+
+
 def _format_grave(row: dict[str, Any]) -> str:
     """「郡司分地区の専唱寺」 / 「みたまA-12」 -- the contract's spoken form.
 
@@ -429,6 +520,15 @@ def intercept(text: str, asked_by: str,
     now = time.time() if now is None else now
     fetch = fetch or _default_fetch
 
+    if detect_show(text):
+        waiting = _open_question(device_id, asked_by, now) or {}
+        ids = waiting.get("ids") or []
+        if not ids:
+            return "先に誰のことか探させて。名前か地区を言ってくれれば台帳を見るよ。"
+        if len(ids) > 1:
+            return "誰を出す？名前で教えて。"
+        return _show_on_screen(relay_url, ids[0], device_id, asked_by, fetch, env)
+
     conditions = detect_find(text, asked_by)
     if conditions is not None:
         _forget_question(device_id, asked_by)
@@ -437,6 +537,7 @@ def intercept(text: str, asked_by: str,
             return error
         if total > 1:
             _remember_find(device_id, asked_by, conditions, now)
+        _remember_ids(device_id, asked_by, _ids_of(rows), now)
         return _compose_find_reply(conditions, total, rows, role in _PHONE_ROLES)
 
     name = detect(text)
@@ -474,6 +575,7 @@ def intercept(text: str, asked_by: str,
             _remember_find(device_id, asked_by, waiting["conditions"], now)
         else:
             _forget_question(device_id, asked_by)
+        _remember_ids(device_id, asked_by, _ids_of(rows), now)
         return _compose_find_reply(narrowed, total, rows, role in _PHONE_ROLES)
 
     surname = waiting["surname"]

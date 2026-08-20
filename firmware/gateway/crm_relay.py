@@ -51,6 +51,7 @@ import http.server
 import json
 import os
 import sys
+import webbrowser
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -185,6 +186,27 @@ def show(customer_id, asked_by, host=None):
     return _project(payload, ALLOWED_SHOW_FIELDS)
 
 
+def open_on_this_screen(customer_id, asked_by):
+    """Put one customer's record on the monitor attached to this machine.
+
+    The caller passes an id and nothing else. It cannot pass a URL, and
+    that is the whole design: an endpoint that opened whatever it was
+    handed would be a way to make the office PC visit anything, dressed up
+    as a feature. The link is asked for from the CRM here, and checked
+    against the CRM's own address before anything opens it.
+
+    Nothing about the customer passes through this process -- the browser
+    fetches the record itself, from a page that still requires a login.
+    """
+    result = show(customer_id, asked_by)
+    url = result.get("url") or ""
+    expected_host = urllib.parse.urlsplit(CRM_BASE_URL).netloc
+    if urllib.parse.urlsplit(url).netloc != expected_host:
+        raise ValueError("CRM 以外のアドレスは開きません")
+    webbrowser.open(url)
+    return {"opened": True, "url": url}
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -205,7 +227,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             # person standing at the office PC needs to ask.
             return self._send(200, {"ok": True})
 
-        if parsed.path not in ("/crm/lookup", "/crm/find", "/crm/show"):
+        if parsed.path not in ("/crm/lookup", "/crm/find", "/crm/show",
+                               "/crm/open"):
             return self._send(404, {"error": "not found"})
 
         if self.headers.get("X-Tachikoma-Token", "") != RELAY_TOKEN:
@@ -225,12 +248,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 total, results = find(conditions, asked_by)
                 return self._send(200, {"count": total, "results": results})
 
-            if parsed.path == "/crm/show":
+            if parsed.path in ("/crm/show", "/crm/open"):
                 customer_id = first("customer_id")
                 if not customer_id.isdigit():
                     return self._send(400, {"error": "customer_id must be a number"})
-                return self._send(200, show(customer_id, asked_by,
-                                            host=first("host") or None))
+                if parsed.path == "/crm/show":
+                    return self._send(200, show(customer_id, asked_by,
+                                                host=first("host") or None))
+                try:
+                    return self._send(200, open_on_this_screen(customer_id, asked_by))
+                except ValueError as exc:
+                    self.log_message("refused to open (%s)", exc)
+                    return self._send(502, {"error": str(exc)})
 
             name = first("name")
             if not name:

@@ -136,6 +136,33 @@ class LoggingTest(unittest.TestCase):
         self.assertNotIn("name=", said[0])
 
 
+class OpenTest(unittest.TestCase):
+    """The office monitor, driven by id and never by URL."""
+
+    def test_it_opens_the_link_the_crm_gave(self):
+        with mock.patch.object(crm_relay, "_get_json",
+                               return_value=(200, {"url": crm_relay.CRM_BASE_URL + "/?customer_id=12"})),              mock.patch.object(crm_relay.webbrowser, "open") as opened:
+            result = crm_relay.open_on_this_screen("12", "ダイスケ")
+        opened.assert_called_once()
+        self.assertTrue(result["opened"])
+
+    def test_a_link_pointing_anywhere_else_is_refused(self):
+        # The caller passes an id, never a URL -- but the CRM's reply is
+        # still checked, because an endpoint that opens whatever it is
+        # handed is a way to make the office PC visit anything.
+        with mock.patch.object(crm_relay, "_get_json",
+                               return_value=(200, {"url": "http://evil.example/"})),              mock.patch.object(crm_relay.webbrowser, "open") as opened:
+            with self.assertRaises(ValueError):
+                crm_relay.open_on_this_screen("12", "ダイスケ")
+        opened.assert_not_called()
+
+    def test_a_missing_link_opens_nothing(self):
+        with mock.patch.object(crm_relay, "_get_json", return_value=(200, {})),              mock.patch.object(crm_relay.webbrowser, "open") as opened:
+            with self.assertRaises(ValueError):
+                crm_relay.open_on_this_screen("12", "ダイスケ")
+        opened.assert_not_called()
+
+
 class StartupTest(unittest.TestCase):
     def test_it_refuses_to_run_twice(self):
         first = crm_relay._SingleInstanceServer(("127.0.0.1", 0),

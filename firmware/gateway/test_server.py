@@ -889,8 +889,96 @@ class CrmFindTests(unittest.TestCase):
                              fetch=self._fetch(2, rows), device_id="D1", now=100.0,
                              role="master")
         held = list(crm_bridge._pending.values())[0]
-        self.assertEqual(set(held), {"conditions", "expires_at"})
+        self.assertEqual(set(held), {"conditions", "expires_at", "ids"})
+        # ids are integers; the records they name stay in the CRM. That is
+        # what makes "それモニターに出して" possible without keeping a
+        # customer here between turns.
+        self.assertTrue(all(isinstance(i, int) for i in held["ids"]))
         self.assertNotIn("田中", str(held))
+        self.assertNotIn("phone", str(held))
+
+    # --- putting a record on a screen ----------------------------------
+
+    ONE_WITH_ID = [{"customer_id": 12, "customer_name": "田中 太郎",
+                    "phone": "0985-00-0000", "cemetery_name": "みたまA-1"}]
+
+    def _found_one(self, device_id="D1", env=None):
+        crm_bridge.intercept("加江田のお客さん誰かいる？", "ダイスケ",
+                             env=env or self.ENV, fetch=self._fetch(1, self.ONE_WITH_ID),
+                             device_id=device_id, now=100.0, role="master")
+
+    def test_the_phrases_people_use(self):
+        for said in ("それモニターに出して", "画面に出して", "表示して",
+                     "そっちに映して"):
+            with self.subTest(said=said):
+                self.assertTrue(crm_bridge.detect_show(said), said)
+
+    def test_ordinary_talk_is_not_a_display_request(self):
+        for said in ("お茶出して", "今日は暑いね", "加江田のお客さん誰かいる？"):
+            with self.subTest(said=said):
+                self.assertFalse(crm_bridge.detect_show(said), said)
+
+    def test_showing_before_searching_asks_who(self):
+        reply = crm_bridge.intercept("モニターに出して", "ダイスケ", env=self.ENV,
+                                     fetch=self._fetch(0), device_id="D1",
+                                     now=100.0, role="master")
+        self.assertIn("先に誰のことか", reply)
+
+    def test_the_office_body_drives_the_office_monitor(self):
+        env = dict(self.ENV, CRM_OFFICE_DEVICE_IDS="80456B4DE7AC")
+        self._found_one(device_id="80456B4DE7AC", env=env)
+        seen = {}
+
+        def fetch(url, token):
+            seen["url"] = url
+            return 200, {"opened": True, "url": "http://crm/?customer_id=12"}
+
+        reply = crm_bridge.intercept("それモニターに出して", "ダイスケ", env=env,
+                                     fetch=fetch, device_id="80456B4DE7AC",
+                                     now=110.0, role="master")
+        self.assertIn("/crm/open", seen["url"])
+        self.assertIn("customer_id=12", seen["url"])
+        self.assertIn("会社のモニター", reply)
+
+    def test_any_other_body_opens_where_the_gateway_is(self):
+        seen = {}
+
+        def fetch(url, token):
+            seen["url"] = url
+            return 200, {"url": "http://office:8765/?customer_id=12"}
+
+        self._found_one(device_id="HOME")
+        with mock.patch.object(crm_bridge.webbrowser, "open") as opened:
+            reply = crm_bridge.intercept("それモニターに出して", "ダイスケ",
+                                         env=self.ENV, fetch=fetch,
+                                         device_id="HOME", now=110.0, role="master")
+        self.assertIn("/crm/show", seen["url"])
+        self.assertIn("host=", seen["url"])
+        opened.assert_called_once_with("http://office:8765/?customer_id=12")
+        self.assertIn("ログイン", reply)
+
+    def test_showing_is_ambiguous_while_several_matched(self):
+        rows = [{"customer_id": 1, "customer_name": "田中"},
+                {"customer_id": 2, "customer_name": "佐藤"}]
+        crm_bridge.intercept("加江田のお客さん誰かいる？", "ダイスケ", env=self.ENV,
+                             fetch=self._fetch(2, rows), device_id="D1",
+                             now=100.0, role="master")
+        reply = crm_bridge.intercept("モニターに出して", "ダイスケ", env=self.ENV,
+                                     fetch=self._fetch(0), device_id="D1",
+                                     now=110.0, role="master")
+        self.assertIn("誰を出す", reply)
+
+    def test_an_unreachable_office_says_so_rather_than_pretending(self):
+        env = dict(self.ENV, CRM_OFFICE_DEVICE_IDS="80456B4DE7AC")
+        self._found_one(device_id="80456B4DE7AC", env=env)
+
+        def boom(url, token):
+            raise OSError("office PC is off")
+
+        reply = crm_bridge.intercept("それモニターに出して", "ダイスケ", env=env,
+                                     fetch=boom, device_id="80456B4DE7AC",
+                                     now=110.0, role="master")
+        self.assertIn("出せなかった", reply)
 
     # --- failures still answer -----------------------------------------
 
