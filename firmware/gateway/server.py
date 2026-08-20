@@ -1567,7 +1567,14 @@ def _provider_response(text: str, payload: dict[str, Any], env: dict[str, str]) 
     key = env.get("AI_PROVIDER_API_KEY", "")
     if not url or not key:
         return _result(503, "server_error")
-    if not url.startswith("https://") and env.get("ALLOW_INSECURE_DEV") != "1":
+    # Plain http is refused, except to this machine. A loopback address
+    # never leaves the box, so there is no transit to protect -- and the
+    # thing most worth pointing this at is a speech recogniser running
+    # locally, which is http://127.0.0.1 and always will be. Requiring a
+    # blanket ALLOW_INSECURE_DEV for that would trade a real improvement
+    # for a flag that also loosens authentication.
+    if not (url.startswith("https://") or _is_loopback(url)
+            or env.get("ALLOW_INSECURE_DEV") == "1"):
         return _result(503, "server_error")
     request_body = json.dumps({
         "model": env.get("AI_PROVIDER_MODEL", "default"),
@@ -1792,6 +1799,12 @@ def _gemini_stt_text(pcm: bytes, sample_rate: int, env: dict[str, str]) -> Optio
         except Exception:
             return None
     return None
+
+
+def _is_loopback(url: str) -> bool:
+    """Whether this address is on this machine and cannot leave it."""
+    host = (urllib.parse.urlsplit(url).hostname or "").lower()
+    return host in ("127.0.0.1", "::1", "localhost")
 
 
 def _stt_response(pcm: bytes, sample_rate: int, env: dict[str, str]) -> tuple[int, dict[str, Any]]:

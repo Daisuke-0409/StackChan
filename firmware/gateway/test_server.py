@@ -790,6 +790,28 @@ class SttRequestTests(unittest.TestCase):
             self.assertIsNone(server._gemini_stt_text(bytes(200), 16000, self.ENV))
         self.assertEqual(len(calls), 1)
 
+    def test_a_local_recogniser_may_be_plain_http(self):
+        # The thing most worth pointing STT at is a speech recogniser
+        # running on this machine, which is http://127.0.0.1 and always
+        # will be. A loopback address never leaves the box.
+        for url in ("http://127.0.0.1:9000/v1/audio/transcriptions",
+                    "http://localhost:9000/v1/audio/transcriptions"):
+            with self.subTest(url=url):
+                self.assertTrue(server._is_loopback(url))
+
+    def test_anything_off_the_box_still_needs_https(self):
+        for url in ("http://192.168.11.5:9000/", "http://example.com/",
+                    "http://127.0.0.1.evil.example/"):
+            with self.subTest(url=url):
+                self.assertFalse(server._is_loopback(url))
+
+    def test_a_plain_http_recogniser_elsewhere_is_refused(self):
+        status, _ = server._stt_response(
+            b"", 16000,
+            {"STT_PROVIDER": "openai", "STT_PROVIDER_URL": "http://192.168.11.5/x",
+             "STT_PROVIDER_API_KEY": "k"})
+        self.assertEqual(status, 503)
+
     def test_the_vocabulary_reaches_the_prompt(self):
         prompt = server._stt_prompt({"STT_VOCABULARY": "加江田, 佐土原 ,篠崎"})
         for word in ("加江田", "佐土原", "篠崎"):
