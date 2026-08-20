@@ -1,5 +1,6 @@
 import tempfile
 import datetime
+import json
 import unittest
 from unittest import mock
 
@@ -693,6 +694,55 @@ class CrmChatIntegrationTests(unittest.TestCase):
         remember.assert_not_called()   # the exchange is never memorized
         provider.assert_not_called()   # and never reaches the LLM
 
+
+
+class SttRequestTests(unittest.TestCase):
+    """Transcription is the one task here with a right answer."""
+
+    def _sent_body(self, env):
+        captured = {}
+
+        class _Response:
+            status = 200
+
+            def read(self, *a):
+                return json.dumps({"candidates": [{"content": {"parts": [
+                    {"text": "こんにちは"}]}}]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(request, *a, **kw):
+            captured["body"] = json.loads(request.data.decode())
+            return _Response()
+
+        with mock.patch.object(server.urllib.request, "urlopen", fake_urlopen):
+            server._gemini_stt_text(bytes(200), 16000, env)
+        return captured["body"]
+
+    ENV = {"AI_PROVIDER_API_KEY": "k"}
+
+    def test_it_is_not_sampled(self):
+        # The default temperature exists so a model can pick a different
+        # word for variety, which is the opposite of a verbatim transcript.
+        body = self._sent_body(self.ENV)
+        self.assertEqual(body["generationConfig"]["temperature"], 0)
+
+    def test_it_can_still_be_overridden_deliberately(self):
+        body = self._sent_body(dict(self.ENV, GEMINI_STT_TEMPERATURE="0.4"))
+        self.assertAlmostEqual(body["generationConfig"]["temperature"], 0.4)
+
+    def test_the_vocabulary_reaches_the_prompt(self):
+        prompt = server._stt_prompt({"STT_VOCABULARY": "加江田, 佐土原 ,篠崎"})
+        for word in ("加江田", "佐土原", "篠崎"):
+            self.assertIn(word, prompt)
+
+    def test_an_empty_vocabulary_leaves_the_prompt_alone(self):
+        self.assertEqual(server._stt_prompt({"STT_VOCABULARY": " , "}),
+                         server._GEMINI_STT_PROMPT)
 
 
 class DeviceTokenTests(unittest.TestCase):

@@ -1756,6 +1756,15 @@ def _gemini_stt_text(pcm: bytes, sample_rate: int, env: dict[str, str]) -> Optio
             {"text": _stt_prompt(env)},
             {"inlineData": {"mimeType": "audio/wav", "data": wav_b64}},
         ]}],
+        # Transcription is the one task here with a right answer, and until
+        # now it was being sampled at the API's default temperature -- the
+        # setting that exists so a model can choose a different word for
+        # variety. That is the opposite of what a verbatim transcript wants,
+        # and it gives paraphrase and invention room they should not have.
+        # Deterministic, unless somebody deliberately sets otherwise.
+        "generationConfig": {
+            "temperature": float(env.get("GEMINI_STT_TEMPERATURE", "0")),
+        },
     }).encode("utf-8")
     request = urllib.request.Request(url, data=request_body, method="POST", headers={
         "Content-Type": "application/json", "x-goog-api-key": key,
