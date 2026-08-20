@@ -1,5 +1,6 @@
 import tempfile
 import datetime
+import io
 import json
 import unittest
 from unittest import mock
@@ -734,6 +735,60 @@ class SttRequestTests(unittest.TestCase):
     def test_it_can_still_be_overridden_deliberately(self):
         body = self._sent_body(dict(self.ENV, GEMINI_STT_TEMPERATURE="0.4"))
         self.assertAlmostEqual(body["generationConfig"]["temperature"], 0.4)
+
+    def test_a_busy_model_is_asked_once_more(self):
+        # A dropped 503 costs the whole utterance, and the person repeats
+        # themselves for a reason that had nothing to do with them.
+        calls = []
+
+        class _Response:
+            status = 200
+
+            def read(self, *a):
+                return json.dumps({"candidates": [{"content": {"parts": [
+                    {"text": "こんにちは"}]}}]}).encode()
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def flaky(request, *a, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise server.urllib.error.HTTPError(
+                    "u", 503, "busy", {}, io.BytesIO(b"{}"))
+            return _Response()
+
+        with mock.patch.object(server.urllib.request, "urlopen", flaky),              mock.patch.object(server.time, "sleep"):
+            text = server._gemini_stt_text(bytes(200), 16000,
+                                           dict(self.ENV, GEMINI_STT_RETRY_DELAY_SECONDS="0"))
+        self.assertEqual(text, "こんにちは")
+        self.assertEqual(len(calls), 2)
+
+    def test_it_gives_up_after_one_retry(self):
+        calls = []
+
+        def always_busy(request, *a, **kw):
+            calls.append(1)
+            raise server.urllib.error.HTTPError("u", 503, "busy", {}, io.BytesIO(b"{}"))
+
+        with mock.patch.object(server.urllib.request, "urlopen", always_busy),              mock.patch.object(server.time, "sleep"):
+            self.assertIsNone(server._gemini_stt_text(bytes(200), 16000, self.ENV))
+        self.assertEqual(len(calls), 2)
+
+    def test_a_real_answer_is_not_retried(self):
+        # 400 means the request was wrong; asking again wastes the wait.
+        calls = []
+
+        def refused(request, *a, **kw):
+            calls.append(1)
+            raise server.urllib.error.HTTPError("u", 400, "bad", {}, io.BytesIO(b"{}"))
+
+        with mock.patch.object(server.urllib.request, "urlopen", refused):
+            self.assertIsNone(server._gemini_stt_text(bytes(200), 16000, self.ENV))
+        self.assertEqual(len(calls), 1)
 
     def test_the_vocabulary_reaches_the_prompt(self):
         prompt = server._stt_prompt({"STT_VOCABULARY": "加江田, 佐土原 ,篠崎"})

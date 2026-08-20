@@ -1769,15 +1769,29 @@ def _gemini_stt_text(pcm: bytes, sample_rate: int, env: dict[str, str]) -> Optio
     request = urllib.request.Request(url, data=request_body, method="POST", headers={
         "Content-Type": "application/json", "x-goog-api-key": key,
     })
-    try:
-        with urllib.request.urlopen(request, timeout=float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30")),
-                                    context=ssl.create_default_context()) as response:
-            decoded = json.loads(response.read(MAX_INPUT_BYTES * 4 + 1024).decode("utf-8"))
-        text = decoded["candidates"][0]["content"]["parts"][0]["text"]
-        text = text.strip() if isinstance(text, str) else ""
-        return text or None
-    except Exception:
-        return None
+    timeout = float(env.get("AI_PROVIDER_TIMEOUT_SECONDS", "30"))
+    # One retry, and only for the two answers that mean "ask again": a
+    # busy model and a rate limit. Measured against gemini-3.7-flash on
+    # 2026-08-20, which returned 503 "experiencing high demand" to four
+    # requests in six -- and a dropped 503 costs the whole utterance, so
+    # the person repeats themselves for a reason that had nothing to do
+    # with them. Anything else is a real answer and is not retried.
+    for attempt in (0, 1):
+        try:
+            with urllib.request.urlopen(request, timeout=timeout,
+                                        context=ssl.create_default_context()) as response:
+                decoded = json.loads(response.read(MAX_INPUT_BYTES * 4 + 1024).decode("utf-8"))
+            text = decoded["candidates"][0]["content"]["parts"][0]["text"]
+            text = text.strip() if isinstance(text, str) else ""
+            return text or None
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (429, 503) or attempt:
+                return None
+            _log(f"gateway stt retrying after HTTP {exc.code}")
+            time.sleep(float(env.get("GEMINI_STT_RETRY_DELAY_SECONDS", "0.4")))
+        except Exception:
+            return None
+    return None
 
 
 def _stt_response(pcm: bytes, sample_rate: int, env: dict[str, str]) -> tuple[int, dict[str, Any]]:
