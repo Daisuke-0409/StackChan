@@ -430,9 +430,41 @@ class Handler(BaseHTTPRequestHandler):
         pass  # request lines go through _log instead
 
 
+class _SingleInstanceServer(ThreadingHTTPServer):
+    """Refuses to start when the port is already taken.
+
+    Python turns SO_REUSEADDR on by default, and on Windows that does not
+    mean what it means elsewhere: a second process can bind a port another
+    is already listening on, and requests are split between them at random.
+    The visible symptom is that a change does not take effect, because the
+    old process is still answering half the time.
+
+    It matters more here than anywhere else in this repo. A stale agent
+    holds its own job table, its own approval state and its own reading of
+    ORDER_PAYMENT_ENABLED, so an approval spoken to one instance can arrive
+    at another that never read the order aloud. The one failure this whole
+    process is built to avoid is paying twice, and two of it is the
+    shortest path there.
+
+    The CRM hit this on 2026-08-19 and the CRM relay on 2026-08-20; this is
+    the same fix, applied before it bites.
+    """
+
+    allow_reuse_address = False
+
+
 def main() -> None:
     config.ensure_dirs()
-    server = ThreadingHTTPServer((config.HOST, config.PORT), Handler)
+    try:
+        server = _SingleInstanceServer((config.HOST, config.PORT), Handler)
+    except OSError as exc:
+        # Naming the likely cause beats an errno: the usual reason is that
+        # the logon task already started one.
+        raise SystemExit(
+            f"orderagent could not take {config.HOST}:{config.PORT} ({exc}). "
+            "Another one is probably already running -- check the "
+            "'Tachikoma Order Agent' task before starting a second."
+        ) from exc
     print(f"orderagent listening on {config.HOST}:{config.PORT} "
           f"payment_enabled={config.PAYMENT_ENABLED}", flush=True)
     server.serve_forever()
