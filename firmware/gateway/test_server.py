@@ -817,6 +817,21 @@ class SttRequestTests(unittest.TestCase):
         for word in ("加江田", "佐土原", "篠崎"):
             self.assertIn(word, prompt)
 
+    def test_the_prompt_forbids_inventing_words(self):
+        # Measured 2026-08-20: with a one-word vocabulary the model put
+        # 大輔 on the end of a sentence nobody said it in, when the audio
+        # was hard. A transcription prompt has to say this.
+        self.assertIn("音声に含まれていない語を絶対に追加しないでください",
+                      server._GEMINI_STT_PROMPT)
+
+    def test_spelling_guidance_is_conditional_on_hearing_the_word(self):
+        # "必ずこの表記を使ってください" reads as an instruction to produce
+        # the word rather than to spell it a certain way.
+        prompt = server._stt_prompt({"STT_VOCABULARY": "加江田,篠崎"})
+        self.assertIn("実際に聞こえたときだけ", prompt)
+        self.assertIn("聞こえなければ使わないでください", prompt)
+        self.assertNotIn("必ずこの表記を使ってください", prompt)
+
     def test_an_empty_vocabulary_leaves_the_prompt_alone(self):
         self.assertEqual(server._stt_prompt({"STT_VOCABULARY": " , "}),
                          server._GEMINI_STT_PROMPT)

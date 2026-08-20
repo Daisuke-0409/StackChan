@@ -619,6 +619,8 @@ GEMINI_API_BASE_URL = "https://generativelanguage.googleapis.com/v1beta"
 # phrases came back exactly right, and measurably faster (1859ms vs 2336ms).
 _GEMINI_STT_PROMPT = (
     "次の音声を一字一句そのまま日本語で書き起こしてください。"
+    "音声に含まれていない語を絶対に追加しないでください。"
+    "聞き取れない部分は書かないでください。"
     "話者は「タチコマ」という名前のロボットに話しかけています。"
     "書き起こしたテキストのみを返し、説明や前置きは付けないでください。"
 )
@@ -636,8 +638,14 @@ def _stt_prompt(env: dict[str, str]) -> str:
     vocabulary = [w.strip() for w in env.get("STT_VOCABULARY", "").split(",") if w.strip()]
     if not vocabulary:
         return _GEMINI_STT_PROMPT
+    # "必ずこの表記を使ってください" reads as an instruction to produce the
+    # word, and on audio the model cannot make out it does exactly that:
+    # measured 2026-08-20, a one-word vocabulary put 大輔 on the end of a
+    # sentence nobody said it in. Spelling guidance is conditional on
+    # having heard the word, and says so.
     return (_GEMINI_STT_PROMPT
-            + "次の固有名詞が出てきた場合は、必ずこの表記を使ってください: "
+            + "以下は表記の指定です。音声にその語が実際に聞こえたときだけ、"
+              "この表記を使ってください。聞こえなければ使わないでください: "
             + "、".join(vocabulary) + "。")
 # Every word of a reply is read aloud, so formatting is not cosmetic here:
 # with web search enabled Gemini answers in markdown by default ("**気温**:",
