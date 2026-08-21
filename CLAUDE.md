@@ -146,6 +146,15 @@ Happy/Confused は**状態ではなくリアクション**で、`Reacting` 状�
 
 ### 次セッションの開始点 (2026-08-21 朝・会社セッションで更新)
 
+**何をすればいいか忘れたら、これを実行する** (家でも会社でも):
+
+```powershell
+powershell -File NEXT.ps1
+```
+
+いまの機械の状態を見て、済んだことと次にやることだけを出す。手順書ではなく
+点検表なので、済んだ項目は勝手に消える。何度実行してもいい。
+
 **今夜、家で最初にやる3つ**:
 
 ```powershell
@@ -159,7 +168,8 @@ tailscale file get .
 # 2. ローカル音声認識器を入れる (聞き取りの弱さへの本命)
 pip install faster-whisper
 copy firmware\gateway\.env.local_stt.example firmware\gateway\.env.local_stt
-powershell -File firmware\gatewayun_local_stt.ps1
+powershell -File firmware\gateway
+un_local_stt.ps1
 #    初回はモデルのダウンロードがある
 
 # 3. ゲートウェイを繋ぎ替える (.env に3行)
