@@ -20,7 +20,10 @@ $firmwareDir = Split-Path -Parent $gatewayDir
 $envFile = Join-Path $gatewayDir ".env.local_stt"
 
 if (Test-Path $envFile) {
-    foreach ($line in Get-Content $envFile) {
+    # -Encoding UTF8, or PowerShell 5.1 reads the file as ANSI and the
+    # Japanese vocabulary arrives as mojibake -- which, fed to the decoder
+    # as its bias, silenced every transcription on 2026-08-21.
+    foreach ($line in Get-Content $envFile -Encoding UTF8) {
         $trimmed = $line.Trim()
         if ($trimmed -eq "" -or $trimmed.StartsWith("#")) { continue }
         $split = $trimmed.IndexOf("=")
@@ -34,10 +37,34 @@ if (Test-Path $envFile) {
     Write-Host "settings: none ($envFile not found; using defaults)"
 }
 
-python -c "import faster_whisper" 2>$null
-if ($LASTEXITCODE -ne 0) {
-    Write-Error "faster-whisper is not installed. Run: pip install faster-whisper"
+# The same interpreter rule as run_gateway.ps1, and for the same reason:
+# two pythons live on this machine, and the bare name resolves to the one
+# without the packages (relearned 2026-08-21, the launcher's first run at
+# home). The probe answers on stdout because stderr becomes an ErrorRecord
+# under Stop and kills the launcher before it can try the next candidate.
+$pythonCandidates = @()
+if ($env:TACHIKOMA_PYTHON) { $pythonCandidates += $env:TACHIKOMA_PYTHON }
+$pythonCandidates += (Get-Command python.exe -All -ErrorAction SilentlyContinue |
+                      Select-Object -ExpandProperty Source)
+
+$probe = @"
+try:
+    import faster_whisper
+    print('HAVE_DEPS')
+except Exception:
+    print('NO_DEPS')
+"@
+
+$python = $null
+foreach ($candidate in $pythonCandidates) {
+    if (-not (Test-Path $candidate)) { continue }
+    if ((& $candidate -c $probe) -contains 'HAVE_DEPS') { $python = $candidate; break }
 }
+if (-not $python) {
+    Write-Error "No python with faster-whisper found. Run: pip install faster-whisper (checked: $($pythonCandidates -join ', '))"
+}
+Write-Host "python: $python"
 
 Set-Location $firmwareDir
-python -u gateway/local_stt.py
+$ErrorActionPreference = "Continue"
+& $python -u gateway/local_stt.py
