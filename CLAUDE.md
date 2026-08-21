@@ -860,6 +860,41 @@ esptool.py -p COM3 -b 460800 read_flash 0 0x1000000 <backup>
 
 ## 5. 環境固有の落とし穴 (実際に踏んだもの)
 
+### 実機が無言になったら、まず**このPCのIPアドレス**を見る (2026-08-21)
+
+機体は焼き込まれた `TACHIKOMA_GATEWAY_URL=http://192.168.2.120:8080/...` を
+叩きに行く。**DHCP でこのPCのアドレスが変わると、機体は空き部屋をノックし
+続ける。**この日は .120 → .103 に変わっていて、実機が丸一日無言だった。
+
+- 症状: 実機が完全に沈黙。ゲートウェイのログに**その機体の行が1行も出ない**
+  (会社の機体は Tailscale 経由なので平常どおり出る。これに騙されないこと)
+- 確認: `Get-NetIPConfiguration`。ログの device_id を数えて、家の機体
+  (`80456B4DE03C`) が居るかを見る
+- 対処: **イーサネットを 192.168.2.120 に固定済み** (2026-08-21、要管理者権限)。
+  再発しないはずだが、ルーターを替えたら真っ先にここを疑う
+
+### 通信が長く切れた後、実機の音声再生が固まることがある (2026-08-21)
+
+上記の復旧後、**音声データは機体まで届いているのに再生されない**状態が残った。
+ログ上は `speak_queue ... 200` (機体が受け取った) が出るので、ゲートウェイ側は
+正常に見える。顔も普通に動く。**電源を入れ直すと直る。**
+
+- 切り分け: `/v1/announce` で喋らせて、ログが 200 になるか見る。
+  200 なのに音が出ないなら機体側。204 のままならキューまで届いていない
+- 過去のコーデッククラッシュ (`*(int*)0=0;`) とは別件。あれは録音側
+
+### 自動起動タスクが勝手に無効になっていることがある (2026-08-21 に3回)
+
+`Tachikoma Gateway` ほか全タスクが `Enabled=false` になっていた。**この状態で
+PCを再起動すると何も起動しない。**`schtasks /change /enable` は成功と出ても
+効かないことがあるので、`Enable-ScheduledTask` を使う。原因は未特定。
+
+```powershell
+foreach ($t in 'Tachikoma Gateway','VOICEVOX Engine (Tachikoma)',
+               'Even Terminal (Tachikoma)','Even Terminal Codex (Tachikoma)',
+               'Tachikoma Order Agent') { Enable-ScheduledTask -TaskName $t }
+```
+
 | 罠 | 内容 |
 |---|---|
 | `pdMS_TO_TICKS(N)` | `CONFIG_FREERTOS_HZ=100` (10ms tick) では `pdMS_TO_TICKS(5)` が整数除算で **0** になり、`vTaskDelay(0)` = yield のみになる。優先度8・core0固定でidleタスクを枯渇させ、10秒でウォッチドッグを踏んだ |
