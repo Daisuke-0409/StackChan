@@ -1830,7 +1830,12 @@ def _stt_response(pcm: bytes, sample_rate: int, env: dict[str, str]) -> tuple[in
     key = env.get("STT_PROVIDER_API_KEY", "")
     if not url or not key:
         return _result(503, "server_error")
-    if not url.startswith("https://") and env.get("ALLOW_INSECURE_DEV") != "1":
+    # Same rule the chat provider got: plain http only to this machine.
+    # The local recogniser IS http://127.0.0.1, so without this the
+    # whole point of running one is unreachable -- which is exactly what
+    # happened on the first attempt to switch (2026-08-21).
+    if not (url.startswith("https://") or _is_loopback(url)
+            or env.get("ALLOW_INSECURE_DEV") == "1"):
         return _result(503, "server_error")
 
     wav_bytes = _pcm_to_wav(pcm, sample_rate)
