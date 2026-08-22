@@ -1,0 +1,3 @@
+# モバイルオーダー (orderagent)。実Chromeを起動時にアタッチする方式なので
+# chromium本体は不要だが、初回のみ: python -m playwright install chromium
+playwright==1.62.0

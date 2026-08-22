@@ -1,0 +1,3 @@
+# ローカル音声認識 (local_stt.py)。モデルは初回起動時にDLされる:
+#   kotoba-tech/kotoba-whisper-v2.0-faster
+faster-whisper==1.2.1

@@ -1,0 +1,2 @@
+# 補助ツール (Even Terminal 等のQR生成)
+qrcode==8.2

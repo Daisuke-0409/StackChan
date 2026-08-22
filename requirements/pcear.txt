@@ -1,0 +1,2 @@
+# 机のUSBマイク入口 (notifier/pc_ear.py)
+sounddevice==0.5.5
