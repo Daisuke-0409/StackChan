@@ -18,11 +18,33 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Optional
 
-from . import ai_match, config, congestion, db, intent, stores
+from . import (ai_match, config, congestion, db, intent, reconcile,
+               states, stores)
+from . import snapshot as snapshot_mod
 
 _jobs: dict[str, dict[str, Any]] = {}
 _jobs_lock = threading.Lock()
 _worker_busy = threading.Lock()  # held while any job is being worked
+
+
+def _set_status(job: dict[str, Any], target: str, *, force: bool = False) -> None:
+    """Move a job through the state machine, or refuse (B1 wiring).
+
+    Every status change funnels through states.advance, so an edge the
+    machine does not have -- an approval heard twice, a payment retried --
+    raises instead of happening. `force` exists for one caller: _fail,
+    which is how a human gets told about a job that is already off the
+    rails, and must not itself die on the way. A forced move is logged as
+    the anomaly it is.
+    """
+    try:
+        job["status"] = states.advance(job["status"], target)
+    except states.IllegalTransition:
+        if not force:
+            raise
+        _log(job["job_id"], "illegal_transition_forced",
+             {"from": job["status"], "to": target})
+        job["status"] = target
 
 
 def _log(job_id: str, event: str, detail: Optional[dict] = None) -> None:
@@ -81,7 +103,7 @@ def submit_job(payload: dict[str, Any]) -> tuple[int, dict[str, Any]]:
 
 
 def _fail(job: dict[str, Any], status: str, spoken: str) -> None:
-    job["status"] = status
+    _set_status(job, status, force=True)
     job["message"] = spoken
     db.upsert_order(job)
     _log(job["job_id"], status, {"message": spoken})
@@ -142,7 +164,7 @@ def _explain(exc: Exception) -> str:
 
 def _build(job: dict[str, Any], adapter: Any) -> None:
     import os
-    job["status"] = "building"
+    _set_status(job, states.BUILDING)
     _log(job["job_id"], "building_started")
 
     # --- store ---------------------------------------------------------
@@ -264,7 +286,17 @@ def _build(job: dict[str, Any], adapter: Any) -> None:
     if job.get("pickup") == "drive_through" and estimate["level"] == "busy":
         advice += estimate["advice"]
     spoken_total = site_total
-    job["status"] = "awaiting_approval"
+    # Freeze what is about to be read aloud (再設計 §22): the approval that
+    # may follow consents to THIS -- this store, these lines, this total --
+    # and reconciliation later compares the store's history against it.
+    job["snapshot"] = snapshot_mod.Snapshot(
+        store_id=str(store["id"]), store_name=store["name"],
+        fulfillment=job.get("pickup"),
+        lines=[{"name": line["name"], "price": int(line["price"]),
+                "quantity": int(line.get("quantity", 1))}
+               for line in cart.get("cart_items") or []],
+        total_yen=site_total).to_dict()
+    _set_status(job, states.AWAITING_APPROVAL)
     job["approval_expires_at"] = time.time() + config.APPROVAL_TIMEOUT_SECONDS
     db.upsert_order(job)
     # The readback describes the CART as scraped, never the request: what
@@ -292,7 +324,15 @@ def _expire_watch(job_id: str) -> None:
         return
     while job["status"] == "awaiting_approval":
         if time.time() > job["approval_expires_at"]:
-            job["status"] = "expired"
+            # Claim under the lock, like approve_job does: between this
+            # thread noticing the deadline and acting on it, an approval
+            # may have claimed the job and be mid-payment. Overwriting
+            # "verifying" with "expired" would tell the user their order
+            # was cancelled while the pay button is being pressed.
+            with _jobs_lock:
+                if job["status"] != "awaiting_approval":
+                    return
+                _set_status(job, states.EXPIRED)
             db.upsert_order(job)
             _log(job_id, "approval_expired")
             _announce(job["device_id"], "注文の承認が5分なかったから、キャンセルしたよ。")
@@ -308,15 +348,16 @@ def approve_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
     # "double approve" the payment gate's own docstring forbids.
     with _jobs_lock:
         job = _jobs.get(job_id)
-        if not job or job["status"] != "awaiting_approval":
+        if not job or not states.accepts_approval(job["status"]):
             return 409, {"error": "not_awaiting_approval"}
-        job["status"] = "verifying"
+        _set_status(job, states.VERIFYING)
         job["approved"] = dict(job["approved_candidate"], phrase=phrase,
                                approved_at=time.time())
     _log(job_id, "approved_by_voice", {"phrase": phrase})
     db.upsert_order(job)
 
     from . import payment
+    job["payment_attempted_at"] = time.time()
     try:
         result = payment.execute(job, job["cart"])
     except payment.PaymentRefused as exc:
@@ -327,25 +368,29 @@ def approve_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
     _log(job_id, "payment_result", result)
 
     if result.get("dry_run"):
-        job["status"] = "dry_run_done"
+        _set_status(job, states.DRY_RUN_DONE)
         spoken = (f"検証は全部通ったよ。今は練習モードだから決済はしてないよ。"
                   f"合計{result['verified_total_yen']}円、内容は全部確認済み。")
     else:
         outcome = result.get("outcome")
         if outcome == "PAID":
-            job["status"] = "paid"
+            _set_status(job, states.PAID)
             spoken = (f"注文できたよ。注文番号は{result['order_number']}、"
                       f"{job['store_name']}で受け取ってね。"
                       f"合計{result['verified_total_yen']}円だったよ。")
         elif outcome == "NOT_PLACED":
-            job["status"] = "failed"
+            _set_status(job, states.FAILED)
             spoken = "決済のボタンが効かなかったよ。注文は入っていないはず。もう一度言ってね。"
         else:
-            # UNKNOWN: charged or not, nobody here can tell. It goes to a
-            # person, and it never gets retried automatically (§26).
-            job["status"] = "payment_uncertain"
-            spoken = (result.get("note")
-                      or "決済の結果が確認できなかったよ。注文履歴を見てね。")
+            # UNKNOWN: charged or not, nobody here can tell. Never retried
+            # (§26/§27) -- but before giving up on knowing, ask the store
+            # what it thinks happened. reconcile may settle it either way;
+            # what it cannot settle goes to a person.
+            _set_status(job, states.PAYMENT_UNCERTAIN)
+            db.upsert_order(job)
+            spoken = _reconcile_uncertain(job) or (
+                result.get("note")
+                or "決済の結果が確認できなかったよ。注文履歴を見てね。")
     db.upsert_order(job)
     _announce_async(job["device_id"], spoken)
     return 200, {"status": job["status"], "result": result}
@@ -354,13 +399,91 @@ def approve_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
 def deny_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
     with _jobs_lock:
         job = _jobs.get(job_id)
-        if not job or job["status"] != "awaiting_approval":
+        if not job or not states.accepts_approval(job["status"]):
             return 409, {"error": "not_awaiting_approval"}
-        job["status"] = "denied"
+        _set_status(job, states.DENIED)
     db.upsert_order(job)
     _log(job_id, "denied_by_voice", {"phrase": phrase})
     _announce_async(job["device_id"], "注文をキャンセルしたよ。")
     return 200, {"status": "denied"}
+
+
+def _reconcile_uncertain(job: dict[str, Any]) -> Optional[str]:
+    """A payment with no answer: look at the store, never retry (§27).
+
+    Returns what to say, or None when reconciliation had nothing to add.
+    Today every adapter answers recent_orders with history_available=False,
+    so this settles nothing yet -- but the path is wired, the verdict is
+    logged, and the day an adapter learns to read its history, uncertain
+    payments start resolving themselves with no further change here.
+    """
+    adapter = _adapter_for(job["chain"])
+    raw = job.get("snapshot")
+    if adapter is None or not raw:
+        return None
+    approved = snapshot_mod.Snapshot.from_dict(raw)
+    try:
+        evidence = adapter.recent_orders(job.get("store_key") or "")
+    except Exception as exc:  # noqa: BLE001 -- failing to look is UNRESOLVED, not a crash
+        evidence = reconcile.Evidence(
+            history_available=False,
+            note=f"注文履歴の読み取りにも失敗したよ。")
+        _log(job["job_id"], "reconcile_evidence_failed", {"error": repr(exc)})
+    verdict = reconcile.reconcile(
+        approved, evidence,
+        job.get("payment_attempted_at") or job.get("created_at") or time.time())
+    job["reconcile"] = verdict.to_dict()
+    _log(job["job_id"], "reconciled", verdict.to_dict())
+    if verdict.is_confirmed():
+        job["order_number"] = verdict.order_number
+        _set_status(job, states.PAID)
+    elif verdict.outcome == reconcile.FAILED:
+        _set_status(job, states.FAILED)
+    return reconcile.spoken(verdict)
+
+
+def _sweep_interrupted() -> None:
+    """What the last process left behind, settled before taking new work (B3).
+
+    Without this, a crash mid-job leaves the database saying "verifying"
+    forever while the restarted agent answers 404 -- a job that may have
+    charged money, findable by nobody. Three kinds of leftovers:
+
+    - verifying: the frightening one. The process died somewhere around the
+      pay click and nobody read the answer. It becomes payment_uncertain,
+      goes through reconciliation like any other uncertain payment, and is
+      announced so a person knows to look.
+    - payment_uncertain: already waiting for a person; reload it so
+      /jobs/<id> answers and the reminder stands.
+    - everything else active: conversations and carts died with the
+      browser. Marked failed, announced only if someone was mid-approval.
+    """
+    unfinished = db.load_unfinished(sorted(states.ACTIVE) + [states.PAYMENT_UNCERTAIN])
+    for job in unfinished:
+        with _jobs_lock:
+            _jobs[job["job_id"]] = job
+        job["restored"] = True
+        if job["status"] == states.VERIFYING:
+            _set_status(job, states.PAYMENT_UNCERTAIN)
+            _log(job["job_id"], "restored_verifying_as_uncertain")
+            spoken = _reconcile_uncertain(job) or states.describe(job["status"])
+            db.upsert_order(job)
+            if job.get("device_id"):
+                _announce_async(job["device_id"],
+                                f"再起動する前に決済していた注文があるよ。{spoken}")
+        elif job["status"] == states.PAYMENT_UNCERTAIN:
+            _log(job["job_id"], "restored_uncertain")
+        else:
+            was = job["status"]
+            announce = (was == states.AWAITING_APPROVAL) and job.get("device_id")
+            _set_status(job, states.FAILED, force=True)
+            job["message"] = "エージェントが再起動して、途中だった注文は取り消したよ。"
+            db.upsert_order(job)
+            _log(job["job_id"], "restored_as_failed", {"was": was})
+            if announce:
+                _announce_async(job["device_id"],
+                                "さっきの注文は、こっちの再起動で取り消しちゃったよ。"
+                                "もう一度言ってね。")
 
 
 def pending_approval() -> Optional[dict[str, Any]]:
@@ -463,6 +586,7 @@ class _SingleInstanceServer(ThreadingHTTPServer):
 
 def main() -> None:
     config.ensure_dirs()
+    _sweep_interrupted()
     try:
         server = _SingleInstanceServer((config.HOST, config.PORT), Handler)
     except OSError as exc:

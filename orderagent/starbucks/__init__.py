@@ -493,30 +493,80 @@ def confirm_payment(job: dict[str, Any], cart: dict[str, Any]) -> dict[str, Any]
                 f"{final['cart_total_yen']}円）。中止したよ。")
 
         page.get_by_role("button", name=PAY_BUTTON).first.click(timeout=15000)
-        time.sleep(8)
 
-        after = page.inner_text("body")
-        number = _ORDER_NUMBER_RE.search(after)
-        job_dir = config.JOBS_DIR / job["job_id"]
-        job_dir.mkdir(parents=True, exist_ok=True)
+        # From this line on, money may have moved. Nothing below is allowed
+        # to raise: an exception here would leave the job in "verifying"
+        # with no announcement and no verdict, which is the worst of all
+        # worlds -- charged, silent, and unrecorded. Whatever goes wrong
+        # reads as UNKNOWN and goes to a person.
         try:
+            outcome = _settle_after_click(page, before)
+        except Exception as exc:  # noqa: BLE001 -- deliberate: see above
+            outcome = {"payment_executed": True, "dry_run": False,
+                       "outcome": "UNKNOWN",
+                       "note": "決済ボタンは押したけど、そのあと画面が読めなくなったよ。"
+                               "アプリの注文履歴を確認してね。二重に押すことはしないよ。"}
+        try:
+            job_dir = config.JOBS_DIR / job["job_id"]
+            job_dir.mkdir(parents=True, exist_ok=True)
             page.screenshot(path=str(job_dir / "paid.png"), full_page=True)
         except Exception:  # noqa: BLE001
             pass
+        if outcome["outcome"] == "PAID":
+            outcome["verified_total_yen"] = final["cart_total_yen"]
+        return outcome
 
+
+# A payment is given this long to settle before the answer becomes "a person
+# looks". The old code slept 8 seconds and read once, which classified any
+# slower success as NOT_PLACED -- and NOT_PLACED is the one verdict that
+# invites the user to order again, so a slow success plus an obedient user
+# equals two coffees. Sixty seconds of polling makes that window as small
+# as patience allows; what is still unreadable after that was never going
+# to be settled by waiting.
+SETTLE_DEADLINE_SECONDS = 60.0
+SETTLE_POLL_SECONDS = 2.0
+
+
+def _settle_after_click(page: Any, before: str) -> dict[str, Any]:
+    """Watch the page until the payment admits what it did.
+
+    Polls rather than sleeping once: an order number can take its time
+    arriving, and the cost of looking again is nothing next to the cost of
+    the wrong verdict. Individual reads are allowed to fail (the page
+    navigates mid-read); a read that fails is just "not settled yet".
+    """
+    deadline = time.monotonic() + SETTLE_DEADLINE_SECONDS
+    last_seen = before
+    while time.monotonic() < deadline:
+        time.sleep(SETTLE_POLL_SECONDS)
+        try:
+            current = page.inner_text("body")
+        except Exception:  # noqa: BLE001 -- mid-navigation; look again
+            continue
+        last_seen = current
+        number = _ORDER_NUMBER_RE.search(current)
         if number:
             return {"payment_executed": True, "dry_run": False,
-                    "outcome": "PAID",
-                    "order_number": number.group(1),
-                    "verified_total_yen": final["cart_total_yen"]}
-        if PAY_BUTTON in after:
-            # Still on the same screen with the same button: the click did
-            # not take. Nothing was charged, and nothing is retried here --
-            # the caller decides, with a person in the loop.
-            return {"payment_executed": False, "dry_run": False,
-                    "outcome": "NOT_PLACED",
-                    "note": "決済画面のままだったよ。注文は成立していないはず。"}
-        return {"payment_executed": True, "dry_run": False,
-                "outcome": "UNKNOWN",
-                "note": "決済したけど注文番号が読み取れなかったよ。"
-                        "アプリの注文履歴を確認してね。二重に押すことはしないよ。"}
+                    "outcome": "PAID", "order_number": number.group(1)}
+    return _settlement_verdict(before, last_seen)
+
+
+def _settlement_verdict(before: str, last_seen: str) -> dict[str, Any]:
+    """The deadline verdict, from the last page anyone could read.
+
+    NOT_PLACED is only claimed when the page never changed at all: same
+    screen, same button, nothing moved for the whole deadline. That is what
+    an ignored click looks like. A page that changed in any way -- error
+    text, a spinner, a partial navigation -- might be a payment in flight,
+    and claiming "nothing happened" about it is exactly the misdiagnosis
+    that invites a double order. Everything that moved reads as UNKNOWN.
+    """
+    if last_seen == before:
+        return {"payment_executed": False, "dry_run": False,
+                "outcome": "NOT_PLACED",
+                "note": "決済画面のまま何も変わらなかったよ。注文は成立していないはず。"}
+    return {"payment_executed": True, "dry_run": False,
+            "outcome": "UNKNOWN",
+            "note": "決済したけど注文番号が読み取れなかったよ。"
+                    "アプリの注文履歴を確認してね。二重に押すことはしないよ。"}
