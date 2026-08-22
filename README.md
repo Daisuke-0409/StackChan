@@ -66,11 +66,31 @@ git config --global http.sslCAInfo $pem
 ### 1.4 PC 側の依存
 
 ```powershell
-python -m pip install torch librosa opencv-python numpy scipy
+python -m pip install -r requirements\speaker.txt
 ```
 
 声紋（話者識別）と顔認識に使います。ゲートウェイ本体は Python 標準ライブラリだけで
-動きますが、これらが無いと話者識別が使えません。
+動きますが、これらが無いと話者識別が使えません。機能ごとの依存は
+[requirements/](requirements/) に分けてあります（ローカル音声認識・注文・PCの耳など、
+使うものだけ入れれば足ります）。
+
+### 1.4b このPCのIPアドレスを固定する（必須）
+
+**実機は焼かれた時点のゲートウェイのアドレスを覚えている。**DHCPでPCのアドレスが
+変わると、全機体が一斉に無言になる（2026-08-21に実際に起きた。原因の特定に時間を
+使った事故なので、新しいPCでは最初にやること）。
+
+家では `192.168.2.120` に固定している。管理者権限のPowerShellで:
+
+```powershell
+Get-NetAdapter                      # 使っているアダプタ名を確認
+New-NetIPAddress -InterfaceAlias "Wi-Fi" -IPAddress 192.168.2.120 `
+    -PrefixLength 24 -DefaultGateway 192.168.2.1
+Set-DnsClientServerAddress -InterfaceAlias "Wi-Fi" -ServerAddresses 192.168.2.1
+```
+
+別のアドレスにするなら、実機のファームウェアも焼き直しが要る。
+`self_check.ps1` はこのアドレスが無いことを検知して教えてくれる。
 
 ### 1.5 ゲートウェイの設定を作る
 
@@ -291,7 +311,8 @@ idf.py -C firmware -p COM3 -b 460800 flash
 powershell -File firmware\gateway\run_forwarder.ps1
 ```
 
-ブラウザで `http://localhost:8080/healthz` を開き、`{"ok":true}` が出れば動いています。
+ブラウザで `http://localhost:8080/healthz` を開き、`{"ok":true}` が出れば動いています
+（これは転送役の `/healthz`。家のゲートウェイ本体は `/health` で、名前が違うので注意）。
 
 実機の向き先（焼いてある URL）は**変えなくて構いません**。今までどおり会社 PC を
 指していれば、転送役がその先を引き受けます。

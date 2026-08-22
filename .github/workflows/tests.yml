@@ -1,0 +1,33 @@
+# The suites run on every push, so a regression is found by the repository
+# rather than by a robot going quiet three days later.
+#
+# No pip install step, deliberately. All three suites pass with nothing but
+# the standard library -- every heavy import (torch, cv2, playwright,
+# sounddevice) sits inside the function that needs it, and the tests mock
+# what they touch. Verified 2026-08-22 by running them with those packages
+# blocked at the import hook. If a test ever needs a real dependency, that
+# is worth noticing here rather than quietly adding it: it means an import
+# moved to module scope, which also changes what a launcher needs.
+name: tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"   # the interpreter the launchers pick at home
+      - name: gateway
+        run: python -m unittest discover -s firmware/gateway -t .
+      - name: orderagent
+        run: python -m unittest discover -s orderagent/tests -t .
+      - name: notifier
+        run: python -m unittest discover -s notifier -t notifier
+      - name: repo discipline
+        run: python -m unittest tests_models

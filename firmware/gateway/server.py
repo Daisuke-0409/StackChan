@@ -576,6 +576,26 @@ def _result(status: int, code: str, **extra: Any) -> tuple[int, dict[str, Any]]:
     return status, body
 
 
+def _version() -> str:
+    """What is actually running, for /health and the startup line (D1).
+
+    Read from the repository's VERSION file rather than hardcoded here:
+    two places to change is one place to forget, and a version that lies
+    is worse than no version at all. An unreadable file answers "unknown",
+    which is honest and never blocks a start.
+    """
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                        "..", "..", "VERSION")
+    try:
+        with open(path, encoding="utf-8") as handle:
+            return handle.read().strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+VERSION = _version()
+
+
 def _client_is_local(client: str) -> bool:
     """Whether a request came from this machine, by peer address.
 
@@ -2267,7 +2287,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._send(*process_people_list(dict(self.headers), os.environ))
 
     def _get_health(self, parsed: urllib.parse.SplitResult) -> None:
-        self._send(200, {"ok": True, "provider": os.environ.get("AI_PROVIDER", "mock")})
+        self._send(200, {"ok": True, "version": VERSION,
+                         "provider": os.environ.get("AI_PROVIDER", "mock")})
 
     def _get_speak_queue(self, parsed: urllib.parse.SplitResult) -> None:
         if not _authorized(dict(self.headers), os.environ):
@@ -2687,7 +2708,8 @@ def main() -> None:
             "Get-NetTCPConnection -LocalPort 8080 -State Listen and stop that "
             "PID before starting another."
         ) from exc
-    _log(f"Tachikoma Gateway listening on {host}:{port} (provider={os.environ.get('AI_PROVIDER', 'mock')})")
+    _log(f"Tachikoma Gateway {VERSION} listening on {host}:{port} "
+         f"(provider={os.environ.get('AI_PROVIDER', 'mock')})")
     _announce_memory_store()
     _warm_biometrics()
     _warm_voicevox(dict(os.environ))

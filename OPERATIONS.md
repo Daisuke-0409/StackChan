@@ -99,6 +99,21 @@ foreach ($t in 'Tachikoma Gateway','VOICEVOX Engine (Tachikoma)',
 
 ---
 
+### コードを入れ替えたら、プロセスを名指しで殺してから上げ直す (2026-08-22)
+
+`self_check.ps1 -Repair` は**死んでいるサービスしか触らない**。健康に動いている
+古いコードのプロセスは、監視から見れば正常なので入れ替わらない。
+`Stop-ScheduledTask` もラッパーしか殺さないので、python は生き残る。
+
+    $p = (Get-NetTCPConnection -LocalPort 8080 -State Listen).OwningProcess | Select -First 1
+    Stop-Process -Id $p -Force
+    Start-ScheduledTask -TaskName "Tachikoma Gateway"
+
+入れ替わったかは版で確かめる（推測しない）:
+
+    curl http://127.0.0.1:8080/health    # {"ok":true,"version":"0.9.0",...}
+    curl http://127.0.0.1:8766/health
+
 ### ゲートウェイが「起動しているのに何も答えない」ときは、二重起動を疑う (2026-08-22)
 
 症状: `/health` すら応答なし（HTTPエラーではなく**接続が即切れる**）。

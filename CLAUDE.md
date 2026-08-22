@@ -16,7 +16,9 @@ M5Stack StackChan (CoreS3 / ESP32-S3) をフォークし、独自の音声対話
 | **OPERATIONS.md** | 作業ルール・環境の落とし穴（失敗台帳）・無言時の復旧 | 手を動かす前・障害時 |
 | **CLAUDE.md**（これ） | 現在地・次セッションの開始点・アーキテクチャ・未解決 | 毎セッション冒頭 |
 
-再建は RESURRECTION.md、依存は requirements/。実装の正はコード。
+再建は RESURRECTION.md、依存は requirements/、版と戻し方は CHANGELOG.md。
+テストは `powershell -File run_tests.ps1`（件数はここが数える。文書に書き写さない）。
+実装の正はコード。
 食い違えばコードを確認し、このファイルを更新すること。
 
 ---

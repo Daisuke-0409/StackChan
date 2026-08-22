@@ -517,7 +517,8 @@ class Handler(BaseHTTPRequestHandler):
         from urllib.parse import parse_qs, urlsplit
         parsed = urlsplit(self.path)
         if parsed.path == "/health":
-            self._send(200, {"ok": True, "payment_enabled": config.PAYMENT_ENABLED})
+            self._send(200, {"ok": True, "version": config.VERSION,
+                             "payment_enabled": config.PAYMENT_ENABLED})
         elif parsed.path == "/pending":
             self._send(200, {"pending": pending_approval()})
         elif parsed.path == "/stores":

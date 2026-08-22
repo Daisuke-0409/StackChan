@@ -282,14 +282,17 @@ powershell -File firmware\gateway\run_gateway.ps1
 powershell -File firmware\gateway\run_forwarder.ps1
 ```
 
-確認: `http://localhost:8080/healthz` が `{"ok":true}` を返すこと。
+確認: `http://localhost:8080/health` が `{"ok":true,...}` を返すこと
+（版も名乗る。`healthz` ではない）。
 
 ### テスト
 
+```powershell
+powershell -File run_tests.ps1
 ```
-python -m unittest gateway.test_server            # firmware/ から。51件
-PYTHONPATH=notifier python -m unittest discover   # 268件
-```
+
+ゲートウェイ・注文エージェント・notifier・リポジトリ規律の全スイートが走り、
+件数が出る。3スイートとも標準ライブラリだけで通るので CI でも同じものが走る。
 
 ### 記憶の場所
 

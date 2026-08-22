@@ -14,8 +14,8 @@
 
 M5Stack の StackChan（ESP32-S3 デスクトップロボット）をフォークし、頭脳を
 自前の Gemini ベース AI ゲートウェイに差し替えた**音声対話ロボット「タチコマ」**。
-2026年1月に土台を取り込み、7〜8月に独自実装が集中。**196コミット / テスト364件
-（ゲートウェイ51・PC側313）全通過**。
+2026年1月に土台を取り込み、7〜8月に独自実装が集中。**257コミット / テスト798件
+（ゲートウェイ177・注文305・PC側313・規律3）全通過**（2026-08-22 実測）。
 
 **核心思想は「人格は1つ、入口は複数」。** 記憶・声・感情・権限を持つ1つの人格に、
 実機・PCマイク・スマホ・スマートグラス（Even G2）・（開発中）会社CRM という
@@ -209,12 +209,11 @@ powershell -File firmware\gateway\run_gateway.ps1
 
 テストで健全性を確認:
 ```powershell
-# ゲートウェイ 51件
-cd firmware; python -m unittest gateway.test_server
-# PC側 313件
-cd ..; $env:PYTHONPATH="$PWD\notifier"
-python -m unittest discover -s notifier\tachikoma_notifier\tests -t notifier\tachikoma_notifier\tests -p "test_*.py"
+powershell -File run_tests.ps1
 ```
+全スイート（ゲートウェイ／注文エージェント／PC側／リポジトリ規律）が走り、件数と
+合否が出る。3スイートとも標準ライブラリだけで通るので、同じものが CI でも走る
+（`.github/workflows/tests.yml`）。
 
 git に入らないもの（別途用意）: `.env` / `memory/`（個人データ・声紋）/
 `models/` / `.env.local`（グラスのトークン）/ サーバの秘密鍵・config.yaml。
@@ -305,7 +304,7 @@ git に入らないもの（別途用意）: `.env` / `memory/`（個人デー�
 - 5層に積み重なった実機バグを、勘ではなく毎回実機ログの数値から特定して解決
 - vendoredライブラリの意図的クラッシュを発見し、消えても復元できる形で修正
 
-**プロジェクトの規模**: 196コミット / テスト364件全通過 / 実機・PC・スマホ・
+**プロジェクトの規模**: 257コミット / テスト798件全通過 / 実機・PC・スマホ・
 グラスの4系統で稼働確認済み。
 
 **設計の一貫性**: 全体を貫く原則（人格は1つ／秘密は渡さない／機械に順序を

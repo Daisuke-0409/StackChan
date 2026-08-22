@@ -10,6 +10,21 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
+def _version() -> str:
+    """The repository's VERSION, so /health says what is actually running.
+
+    Same file the gateway reads (D1). Unknown rather than a guess when it
+    cannot be read.
+    """
+    try:
+        return (Path(__file__).resolve().parent.parent / "VERSION").read_text(
+            encoding="utf-8").strip() or "unknown"
+    except OSError:
+        return "unknown"
+
+
+VERSION = _version()
+
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("ORDER_AGENT_PORT", "8766"))  # 8765 is CRM, 8378 is approval daemon
 
