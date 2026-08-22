@@ -68,13 +68,16 @@ VOICEVOX Engine を入れて 50021 で起動する状態にする（音声合成
 
 ## 7. 自動起動タスク（onlogon）
 
-以下5つを登録（Enable-ScheduledTask で有効化。schtasks /enable は効かない事例あり）:
+以下を登録（Enable-ScheduledTask で有効化。schtasks /enable は効かない事例あり）:
 
-- Tachikoma Gateway → firmware\gateway\run_gateway.ps1
+- Tachikoma Gateway → firmware\gatewayun_gateway.ps1
 - VOICEVOX Engine (Tachikoma)
-- Tachikoma Order Agent → orderagent\run_orderagent.ps1
+- Tachikoma Order Agent → orderagentun_orderagent.ps1
+- Tachikoma Local STT → firmware\gatewayun_local_stt.ps1
 - Even Terminal (Tachikoma) / Even Terminal Codex (Tachikoma)
-- ローカル音声認識 → firmware\gateway\run_local_stt.ps1
+- **Tachikoma Health Check** → self_check.ps1 -Repair を5分毎
+  （onlogonでなく繰り返しトリガ。他タスクの死活監視と自動再起動。
+  これだけは最初に登録すると、残りの起動忘れも拾ってくれる）
 - (会社PCのみ) Tachikoma Forwarder / Tachikoma CRM Relay
 
 ## 8. Tailscale serve（メガネ・スマホ・外出先アクセス）

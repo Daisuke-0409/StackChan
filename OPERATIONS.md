@@ -101,7 +101,18 @@ foreach ($t in 'Tachikoma Gateway','VOICEVOX Engine (Tachikoma)',
 
 ## 3. デバイスが無言のとき
 
-まず**ゲートウェイが起動しているか**を疑う。デバイス側は正常でも、返答生成側が
+**第一手は健康診断**。どのサービスが死んでいるか、原因込みで1画面に出る:
+
+```powershell
+powershell -File self_check.ps1          # 診断
+powershell -File self_check.ps1 -Repair  # 死んでいたら起こす
+```
+
+普段は scheduled task「Tachikoma Health Check」が5分毎にこれを -Repair 付きで
+回している（ログ: StackChanDev\logs\health.log）。つまり無言が5分以上続く時点で
+自動復旧も失敗している = 下の手動調査へ。
+
+次に**ゲートウェイが起動しているか**を疑う。デバイス側は正常でも、返答生成側が
 落ちていれば何も喋らない。デバイスログの症状:
 
 ```
