@@ -3,6 +3,7 @@ import datetime
 import io
 import json
 import unittest
+import urllib.parse
 from unittest import mock
 
 from . import crm_bridge, server
@@ -1087,7 +1088,12 @@ class CrmFindTests(unittest.TestCase):
 
         def fetch(url, token):
             seen["url"] = url
-            return 200, {"url": "http://office:8765/?customer_id=12"}
+            # The relay builds the record URL on the host the bridge named
+            # (the `host=` it just passed); the mock must mirror that, or it
+            # would return a link the real relay never would.
+            host = urllib.parse.parse_qs(
+                urllib.parse.urlsplit(url).query).get("host", ["relay.test:8765"])[0]
+            return 200, {"url": f"http://{host}/?customer_id=12"}
 
         self._found_one(device_id="HOME")
         with mock.patch.object(crm_bridge.webbrowser, "open") as opened:
@@ -1096,8 +1102,23 @@ class CrmFindTests(unittest.TestCase):
                                          device_id="HOME", now=110.0, role="master")
         self.assertIn("/crm/show", seen["url"])
         self.assertIn("host=", seen["url"])
-        opened.assert_called_once_with("http://office:8765/?customer_id=12")
+        opened.assert_called_once_with("http://relay.test:8765/?customer_id=12")
         self.assertIn("ログイン", reply)
+
+    def test_a_link_off_the_expected_host_is_refused(self):
+        # A relay handing back a link to somewhere other than the host the
+        # bridge named is a compromised or misconfigured relay; the home
+        # side must refuse to open it (the office side already does).
+        def fetch(url, token):
+            return 200, {"url": "http://evil.example/?customer_id=12"}
+
+        self._found_one(device_id="HOME")
+        with mock.patch.object(crm_bridge.webbrowser, "open") as opened:
+            reply = crm_bridge.intercept("それモニターに出して", "ダイスケ",
+                                         env=self.ENV, fetch=fetch,
+                                         device_id="HOME", now=110.0, role="master")
+        opened.assert_not_called()
+        self.assertIn("想定と違った", reply)
 
     def test_showing_is_ambiguous_while_several_matched(self):
         rows = [{"customer_id": 1, "customer_name": "田中"},

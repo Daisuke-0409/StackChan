@@ -301,11 +301,18 @@ def _expire_watch(job_id: str) -> None:
 
 
 def approve_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
-    job = _jobs.get(job_id)
-    if not job or job["status"] != "awaiting_approval":
-        return 409, {"error": "not_awaiting_approval"}
-    job["status"] = "verifying"
-    job["approved"] = dict(job["approved_candidate"], phrase=phrase, approved_at=time.time())
+    # Claim the job atomically: read the status and move it to "verifying"
+    # inside one critical section, so a retried approve that arrives while
+    # payment.execute() is still clicking (it blocks 15-20s) cannot pass the
+    # status check a second time and drive a second payment. This is the
+    # "double approve" the payment gate's own docstring forbids.
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or job["status"] != "awaiting_approval":
+            return 409, {"error": "not_awaiting_approval"}
+        job["status"] = "verifying"
+        job["approved"] = dict(job["approved_candidate"], phrase=phrase,
+                               approved_at=time.time())
     _log(job_id, "approved_by_voice", {"phrase": phrase})
     db.upsert_order(job)
 
@@ -345,10 +352,11 @@ def approve_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
 
 
 def deny_job(job_id: str, phrase: str) -> tuple[int, dict[str, Any]]:
-    job = _jobs.get(job_id)
-    if not job or job["status"] != "awaiting_approval":
-        return 409, {"error": "not_awaiting_approval"}
-    job["status"] = "denied"
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+        if not job or job["status"] != "awaiting_approval":
+            return 409, {"error": "not_awaiting_approval"}
+        job["status"] = "denied"
     db.upsert_order(job)
     _log(job_id, "denied_by_voice", {"phrase": phrase})
     _announce_async(job["device_id"], "注文をキャンセルしたよ。")

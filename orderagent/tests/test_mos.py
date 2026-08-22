@@ -64,16 +64,13 @@ class CartScrapeTest(unittest.TestCase):
         self.assertEqual(self._scrape()["cart_total_yen"], 1290)
 
 
-@unittest.skipUnless(importlib.util.find_spec("playwright"),
-                     "needs a browser: drives the live Mos site")
+@unittest.skip(
+    "live + time-of-day dependent: only refuses while the branch's order "
+    "window is closed, so it passes at night and fails at lunch. Kept as a "
+    "manual check, not a suite gate -- a test that flips with the clock "
+    "teaches people to stop reading the colour.")
 class ClosedStoreTest(unittest.TestCase):
-    # Reaches the real site through a real browser, so it cannot run on a
-    # machine without one -- the office PC has neither Playwright nor a
-    # profile. Skipped rather than left to fail: a suite that is always one
-    # red short teaches people to stop reading the colour.
     def test_ordering_from_a_closed_store_is_refused_by_name(self):
-        # Live, at night: every branch is shut, and the refusal has to say
-        # which shop it is talking about.
         with self.assertRaises(RuntimeError) as caught:
             MosAdapter().build_cart("宮崎大島バイパス店", [], "j", lambda e, d: None)
         self.assertIn("宮崎大島バイパス店", str(caught.exception))

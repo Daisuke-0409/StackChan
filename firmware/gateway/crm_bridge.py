@@ -34,6 +34,7 @@ import json
 import os
 import datetime
 import re
+import threading
 import time
 import unicodedata
 import webbrowser
@@ -54,6 +55,10 @@ _PENDING_TTL_SECONDS = 120.0
 # Holds a surname and a deadline -- no rows, because customer records are
 # not something to keep warm in case they are wanted again.
 _pending: dict[tuple[str, str], dict[str, Any]] = {}
+# Guards _pending. server.py locks every shared dict it owns; this module is
+# the one that did not, and two requests for the same (device_id, asked_by)
+# racing here could lose an update and put the wrong customer on screen.
+_pending_lock = threading.Lock()
 
 # A grave question is NAME + さん/様 + a grave word, with a question word
 # somewhere -- all three, because the payment-adjacent lesson generalizes:
@@ -98,8 +103,9 @@ def _pending_key(device_id: str, asked_by: str) -> tuple[str, str]:
 
 def _remember_question(device_id: str, asked_by: str, surname: str,
                        now: float) -> None:
-    _pending[_pending_key(device_id, asked_by)] = {
-        "surname": surname, "expires_at": now + _PENDING_TTL_SECONDS}
+    with _pending_lock:
+        _pending[_pending_key(device_id, asked_by)] = {
+            "surname": surname, "expires_at": now + _PENDING_TTL_SECONDS}
 
 
 def _remember_ids(device_id: str, asked_by: str, ids: list[int],
@@ -111,10 +117,11 @@ def _remember_ids(device_id: str, asked_by: str, ids: list[int],
     makes "それモニターに出して" mean something without a second search.
     """
     key = _pending_key(device_id, asked_by)
-    waiting = _pending.get(key) or {}
-    waiting["ids"] = list(ids)
-    waiting["expires_at"] = now + _PENDING_TTL_SECONDS
-    _pending[key] = waiting
+    with _pending_lock:
+        waiting = dict(_pending.get(key) or {})
+        waiting["ids"] = list(ids)
+        waiting["expires_at"] = now + _PENDING_TTL_SECONDS
+        _pending[key] = waiting
 
 
 def _remember_find(device_id: str, asked_by: str, conditions: dict[str, str],
@@ -125,24 +132,28 @@ def _remember_find(device_id: str, asked_by: str, conditions: dict[str, str],
     reading from rows kept warm, so the CRM's audit log sees the narrower
     question too, and no customer record lives here between turns.
     """
-    _pending[_pending_key(device_id, asked_by)] = {
-        "conditions": dict(conditions), "expires_at": now + _PENDING_TTL_SECONDS}
+    with _pending_lock:
+        _pending[_pending_key(device_id, asked_by)] = {
+            "conditions": dict(conditions),
+            "expires_at": now + _PENDING_TTL_SECONDS}
 
 
 def _open_question(device_id: str, asked_by: str,
                    now: float) -> Optional[dict[str, Any]]:
     key = _pending_key(device_id, asked_by)
-    waiting = _pending.get(key)
-    if waiting is None:
-        return None
-    if now > waiting["expires_at"]:
-        _pending.pop(key, None)
-        return None
-    return waiting
+    with _pending_lock:
+        waiting = _pending.get(key)
+        if waiting is None:
+            return None
+        if now > waiting["expires_at"]:
+            _pending.pop(key, None)
+            return None
+        return dict(waiting)
 
 
 def _forget_question(device_id: str, asked_by: str) -> None:
-    _pending.pop(_pending_key(device_id, asked_by), None)
+    with _pending_lock:
+        _pending.pop(_pending_key(device_id, asked_by), None)
 
 
 def _as_refinement(text: str) -> Optional[str]:
@@ -401,6 +412,16 @@ def _show_on_screen(relay_url: str, customer_id: int, device_id: str,
     url = (payload or {}).get("url")
     if not url:
         return "台帳の画面のアドレスが分からなかったよ。"
+    # Only open a URL that points at the CRM this request named. The office
+    # side (crm_relay.open_on_this_screen) validates host before opening;
+    # the home side must not be the softer of the two doors. The expected
+    # netloc is exactly the `host` this call handed the relay a moment ago
+    # ({office_host}:8765) -- a returned link to anywhere else means a
+    # compromised or misconfigured relay, and is not opened.
+    expected_netloc = f"{office_host}:8765"
+    if urllib.parse.urlsplit(url).netloc != expected_netloc:
+        _log_status(None)
+        return "台帳の画面のアドレスが想定と違ったから開かなかったよ。"
     webbrowser.open(url)
     return "こっちの画面に出したよ。CRMのログインを聞かれたら入れてね。"
 
