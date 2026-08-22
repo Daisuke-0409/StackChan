@@ -182,5 +182,50 @@ class StartupTest(unittest.TestCase):
                 crm_relay.main()
 
 
+class TokenComparisonTest(unittest.TestCase):
+    """The relay answers with the customer ledger, so the token is the
+    whole boundary (audit B5). It used to be compared with !=, which
+    returns on the first differing byte and leaks the prefix by timing."""
+
+    def test_the_right_token_passes(self):
+        with mock.patch.object(crm_relay, "RELAY_TOKEN", "s3cret-token-value"):
+            self.assertTrue(crm_relay.token_ok("s3cret-token-value"))
+
+    def test_a_wrong_token_fails(self):
+        with mock.patch.object(crm_relay, "RELAY_TOKEN", "s3cret-token-value"):
+            self.assertFalse(crm_relay.token_ok("s3cret-token-valuf"))
+            self.assertFalse(crm_relay.token_ok("s3cret"))
+            self.assertFalse(crm_relay.token_ok(""))
+
+    def test_no_configured_token_admits_nobody(self):
+        # Not even the empty string: an unconfigured relay must be shut,
+        # not open to whoever sends no header at all.
+        with mock.patch.object(crm_relay, "RELAY_TOKEN", ""):
+            self.assertFalse(crm_relay.token_ok(""))
+
+
+class RelayThrottleTest(unittest.TestCase):
+    """Guessing costs time here too (audit B5)."""
+
+    def setUp(self):
+        crm_relay._failures.clear()
+        self.addCleanup(crm_relay._failures.clear)
+
+    def test_a_few_misses_cost_nothing(self):
+        for _ in range(crm_relay._FAIL_LIMIT - 1):
+            crm_relay.record_failure("100.1.1.1", now=500.0)
+        self.assertEqual(crm_relay.block_remaining("100.1.1.1", now=500.0), 0.0)
+
+    def test_enough_misses_buy_silence(self):
+        for _ in range(crm_relay._FAIL_LIMIT):
+            crm_relay.record_failure("100.1.1.1", now=500.0)
+        self.assertGreater(crm_relay.block_remaining("100.1.1.1", now=500.0), 0)
+
+    def test_the_gateway_is_not_locked_out_by_someone_else(self):
+        for _ in range(crm_relay._FAIL_LIMIT):
+            crm_relay.record_failure("100.1.1.1", now=500.0)
+        self.assertEqual(crm_relay.block_remaining("100.76.60.88", now=500.0), 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

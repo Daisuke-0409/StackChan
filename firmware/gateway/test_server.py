@@ -2,6 +2,7 @@ import tempfile
 import datetime
 import io
 import json
+import os
 import unittest
 import urllib.parse
 from unittest import mock
@@ -1158,6 +1159,132 @@ class CrmFindTests(unittest.TestCase):
         self.assertIsNone(crm_bridge.intercept(
             "加江田のお客さんの電話番号教えて", "ダイスケ", env={}, device_id="D1",
             now=100.0, role="master"))
+
+
+class GlassesTokenTest(unittest.TestCase):
+    """The G2 entrance holds its own, weaker key (audit B4).
+
+    /g2/config used to answer with DEVICE_TOKEN -- the token that opens
+    /v1/speak, settings writes and people writes -- to anything that could
+    reach the port.
+    """
+
+    MASTER = "master-token-aaaaaaaaaaaa"
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.env = {"DEVICE_TOKEN": self.MASTER, "AI_PROVIDER": "mock",
+                    "TACHIKOMA_MEMORY_DIR": self._tmp.name}
+
+    def _headers(self, token):
+        return {"Authorization": f"Bearer {token}"}
+
+    def test_the_glasses_token_is_not_the_master_token(self):
+        self.assertNotEqual(server.g2_token(self.env), self.MASTER)
+        self.assertTrue(server.g2_token(self.env))
+
+    def test_the_same_token_comes_back_next_launch(self):
+        # The app fetches at every launch; a token that changed each time
+        # would authenticate once and then read as a bug.
+        self.assertEqual(server.g2_token(self.env), server.g2_token(self.env))
+
+    def test_it_opens_chat_and_transcribe(self):
+        headers = self._headers(server.g2_token(self.env))
+        self.assertTrue(server._authorized(headers, self.env, allow_g2=True))
+
+    def test_it_opens_nothing_else(self):
+        headers = self._headers(server.g2_token(self.env))
+        # settings, people, speak -- every route that does not pass
+        # allow_g2 sees this token as no credential at all.
+        self.assertFalse(server._authorized(headers, self.env))
+        status, _ = server.process_settings_put({"first_person": "私"},
+                                                headers, self.env)
+        self.assertEqual(status, 401)
+
+    def test_the_master_token_still_opens_everything(self):
+        headers = self._headers(self.MASTER)
+        self.assertTrue(server._authorized(headers, self.env))
+        self.assertTrue(server._authorized(headers, self.env, allow_g2=True))
+
+    def test_a_wrong_token_opens_nothing(self):
+        headers = self._headers("not-the-token")
+        self.assertFalse(server._authorized(headers, self.env, allow_g2=True))
+
+    def test_an_unwritable_memory_dir_yields_no_token_rather_than_a_new_one(self):
+        env = dict(self.env, TACHIKOMA_MEMORY_DIR=os.path.join(
+            self._tmp.name, "nope.txt", "deeper"))
+        with open(os.path.join(self._tmp.name, "nope.txt"), "w") as handle:
+            handle.write("a file, not a directory")
+        self.assertEqual(server.g2_token(env), "")
+        # And an empty token must never authenticate an empty header.
+        self.assertFalse(server._authorized({"Authorization": "Bearer "},
+                                            env, allow_g2=True))
+
+
+class LoopbackTest(unittest.TestCase):
+    """Which addresses count as "this machine" for /g2/config (B4)."""
+
+    def test_loopback_addresses(self):
+        for address in ("127.0.0.1", "127.0.0.5", "::1", "::ffff:127.0.0.1"):
+            self.assertTrue(server._client_is_local(address), address)
+
+    def test_the_house_lan_is_not_loopback(self):
+        for address in ("192.168.2.50", "192.168.2.120", "100.76.60.88", ""):
+            self.assertFalse(server._client_is_local(address), address)
+
+
+class AuthThrottleTest(unittest.TestCase):
+    """Guessing the token costs time (audit B5)."""
+
+    def setUp(self):
+        server._auth_failures.clear()
+        self.addCleanup(server._auth_failures.clear)
+
+    def test_a_few_misses_cost_nothing(self):
+        for _ in range(server._AUTH_FAIL_LIMIT - 1):
+            server.auth_record_failure("192.168.2.9", now=1000.0)
+        self.assertEqual(server.auth_block_remaining("192.168.2.9", now=1000.0), 0.0)
+
+    def test_enough_misses_buy_silence(self):
+        for _ in range(server._AUTH_FAIL_LIMIT):
+            server.auth_record_failure("192.168.2.9", now=1000.0)
+        self.assertGreater(server.auth_block_remaining("192.168.2.9", now=1000.0), 0)
+
+    def test_the_block_expires(self):
+        for _ in range(server._AUTH_FAIL_LIMIT):
+            server.auth_record_failure("192.168.2.9", now=1000.0)
+        later = 1000.0 + server._AUTH_BLOCK_SECONDS + 1
+        self.assertEqual(server.auth_block_remaining("192.168.2.9", now=later), 0.0)
+
+    def test_a_persistent_guesser_waits_longer_each_time(self):
+        first = self._block_after_a_round(at=1000.0)
+        second = self._block_after_a_round(at=1000.0 + server._AUTH_BLOCK_SECONDS + 1)
+        self.assertGreater(second, first)
+
+    def _block_after_a_round(self, at):
+        for _ in range(server._AUTH_FAIL_LIMIT):
+            server.auth_record_failure("192.168.2.9", now=at)
+        return server.auth_block_remaining("192.168.2.9", now=at)
+
+    def test_slow_misses_never_add_up(self):
+        # A body with a stale token retries occasionally for hours. That is
+        # a misconfiguration to fix, not an attack to block.
+        for i in range(server._AUTH_FAIL_LIMIT * 3):
+            server.auth_record_failure("192.168.2.9",
+                                       now=1000.0 + i * (server._AUTH_FAIL_WINDOW_SECONDS + 1))
+        self.assertEqual(server.auth_block_remaining("192.168.2.9", now=99999.0), 0.0)
+
+    def test_one_guesser_does_not_lock_out_the_house(self):
+        for _ in range(server._AUTH_FAIL_LIMIT):
+            server.auth_record_failure("192.168.2.9", now=1000.0)
+        self.assertEqual(server.auth_block_remaining("192.168.2.120", now=1000.0), 0.0)
+
+    def test_the_table_does_not_grow_without_limit(self):
+        for i in range(1100):
+            server.auth_record_failure(f"10.0.{i // 256}.{i % 256}", now=1000.0)
+        server.auth_record_failure("10.9.9.9", now=1000.0 + 10_000)
+        self.assertLessEqual(len(server._auth_failures), 1024)
 
 
 if __name__ == "__main__":

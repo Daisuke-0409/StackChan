@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import base64
 import datetime
+import ipaddress
 import json
 import math
 import os
@@ -575,8 +576,102 @@ def _result(status: int, code: str, **extra: Any) -> tuple[int, dict[str, Any]]:
     return status, body
 
 
-def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
+def _client_is_local(client: str) -> bool:
+    """Whether a request came from this machine, by peer address.
+
+    Named apart from _is_loopback below, which answers the same question
+    about a URL. They are one keystroke apart and mean different things:
+    handing a peer address to the URL one returns False for 127.0.0.1
+    (there is no scheme to parse), which is a refusal that looks like a
+    policy decision. Keeping both names in one module is only safe while
+    they cannot be confused, so they are not both called _is_loopback.
+
+    Tailscale serve terminates TLS here and proxies onward from 127.0.0.1,
+    so "loopback" covers the tailnet as well as the box itself -- and does
+    not cover the house LAN, which is the distinction being drawn.
+    """
+    try:
+        address = ipaddress.ip_address(client)
+    except ValueError:
+        return False
+    # ::ffff:127.0.0.1 is loopback wearing an IPv6 coat; unwrap it first.
+    if getattr(address, "ipv4_mapped", None) is not None:
+        address = address.ipv4_mapped
+    return address.is_loopback
+
+
+# --- brute-force throttle (B5) ---------------------------------------------
+#
+# compare_digest stops a token being guessed a character at a time, but says
+# nothing about guessing it whole, over and over. Nothing here counted the
+# attempts, so a tailnet or LAN neighbour could run at the token for as long
+# as it liked and the only trace would be a log nobody reads.
+#
+# Ten wrong answers in a minute buys a minute of silence, doubling to a
+# quarter of an hour if it keeps going. The limit is far above what a
+# misconfigured body does (it retries slowly and it is one token) and far
+# below what guessing needs.
+_AUTH_FAIL_LIMIT = 10
+_AUTH_FAIL_WINDOW_SECONDS = 60.0
+_AUTH_BLOCK_SECONDS = 60.0
+_AUTH_BLOCK_MAX_SECONDS = 900.0
+_auth_failures: dict[str, dict[str, float]] = {}
+_auth_lock = threading.Lock()
+
+
+def auth_block_remaining(client: str, now: Optional[float] = None) -> float:
+    """Seconds this client must wait, or 0 when it may try."""
+    now = time.time() if now is None else now
+    with _auth_lock:
+        record = _auth_failures.get(client)
+        if not record:
+            return 0.0
+        return max(0.0, record.get("blocked_until", 0.0) - now)
+
+
+def auth_record_failure(client: str, now: Optional[float] = None) -> None:
+    """Count one rejected request, and start blocking once there are enough."""
+    now = time.time() if now is None else now
+    with _auth_lock:
+        record = _auth_failures.get(client)
+        if record is None or now - record["window_start"] > _AUTH_FAIL_WINDOW_SECONDS:
+            # A new window forgets the count but NOT how long this client
+            # has been made to wait before. Otherwise waiting out one block
+            # resets the penalty, and patience becomes a way through.
+            # Only a long quiet spell -- longer than the maximum block --
+            # earns a clean slate.
+            previous = _AUTH_BLOCK_SECONDS
+            if record is not None and now - record["window_start"] <= _AUTH_BLOCK_MAX_SECONDS:
+                previous = record["block_seconds"]
+            record = {"window_start": now, "count": 0.0,
+                      "blocked_until": 0.0, "block_seconds": previous}
+            _auth_failures[client] = record
+        record["count"] += 1
+        if record["count"] >= _AUTH_FAIL_LIMIT:
+            record["blocked_until"] = now + record["block_seconds"]
+            record["block_seconds"] = min(record["block_seconds"] * 2,
+                                          _AUTH_BLOCK_MAX_SECONDS)
+            record["window_start"] = now
+            record["count"] = 0.0
+            _log(f"gateway auth_throttled client={client} "
+                 f"seconds={record['blocked_until'] - now:.0f}")
+        # Forgetting is bounded: an attacker walking a subnet must not be
+        # able to grow this dict without limit.
+        if len(_auth_failures) > 1024:
+            stale = [key for key, value in _auth_failures.items()
+                     if value["blocked_until"] < now
+                     and now - value["window_start"] > _AUTH_FAIL_WINDOW_SECONDS]
+            for key in stale:
+                del _auth_failures[key]
+
+
+def _authorized(headers: dict[str, str], env: dict[str, str],
+                allow_g2: bool = False) -> bool:
     """Whether this request carries a token one of our bodies was given.
+
+    `allow_g2` widens the check to the glasses' own token, and is set on
+    exactly the two routes the G2 app calls. Everywhere else that token is
+    simply not a credential -- which is the point of it being separate.
 
     DEVICE_TOKEN may list more than one, comma-separated. Two robots were
     meant to share a single token and do not: the office body is flashed
@@ -598,7 +693,66 @@ def _authorized(headers: dict[str, str], env: dict[str, str]) -> bool:
         return env.get("AI_PROVIDER", "mock") == "mock" and env.get("ALLOW_INSECURE_DEV") == "1"
     # compare_digest rather than ==: the comparison is against a secret, and
     # a short-circuiting one leaks its length and prefix by timing.
-    return any(secrets.compare_digest(supplied, f"Bearer {token}") for token in expected)
+    if any(secrets.compare_digest(supplied, f"Bearer {token}") for token in expected):
+        return True
+    # The glasses hold a weaker token than the bodies do, and it opens only
+    # the two routes they actually use. Checked last so a body's token never
+    # pays for the file read.
+    if not allow_g2:
+        return False
+    # An empty glasses token means "could not be stored", not "matches an
+    # empty header": without this, "Bearer " would authenticate.
+    glasses = g2_token(env)
+    return bool(glasses) and secrets.compare_digest(supplied, f"Bearer {glasses}")
+
+
+# --- the glasses' own token (B4) -------------------------------------------
+#
+# /g2/config used to hand out DEVICE_TOKEN itself: the master token, which
+# opens /v1/speak, settings writes and people writes, served to anything that
+# could reach the port. The glasses need none of that -- main.ts calls
+# exactly /v1/transcribe and /v1/chat -- so they get a token of their own,
+# accepted nowhere else.
+#
+# It is generated here rather than configured: a credential a person has to
+# create is a credential that ends up shared with something else, and this
+# one has no reason to exist outside this machine. Losing the file costs
+# nothing -- the app fetches its token at every launch, so the next one is
+# picked up on the next start.
+_G2_TOKEN_LOCK = threading.Lock()
+
+
+def _g2_token_path(env: dict[str, str]) -> str:
+    return os.path.join(
+        env.get("TACHIKOMA_MEMORY_DIR", MEMORY_DIR), "g2_token")
+
+
+def g2_token(env: dict[str, str] | None = None) -> str:
+    """The glasses-only bearer token, made on first use and kept.
+
+    Returns "" if it cannot be stored: an unwritable memory directory means
+    no token rather than a token that changes on every request, because the
+    latter would authenticate exactly once and then look like a bug.
+    """
+    env = env if env is not None else os.environ
+    path = _g2_token_path(env)
+    with _G2_TOKEN_LOCK:
+        try:
+            with open(path, encoding="utf-8") as handle:
+                existing = handle.read().strip()
+            if existing:
+                return existing
+        except OSError:
+            pass
+        token = secrets.token_urlsafe(32)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w", encoding="utf-8") as handle:
+                handle.write(token)
+            return token
+        except OSError as exc:
+            _log(f"gateway g2_token_unwritable error={exc!r}")
+            return ""
 
 
 GEMINI_DEFAULT_CHAT_MODEL = "gemini-3.5-flash-lite"
@@ -1633,7 +1787,7 @@ def process_chat(payload: dict[str, Any], headers: dict[str, str] | None = None,
                  env: dict[str, str] | None = None) -> tuple[int, dict[str, Any]]:
     headers = headers or {}
     env = env or os.environ
-    if not _authorized(headers, env):
+    if not _authorized(headers, env, allow_g2=True):
         return _result(401, "authentication_failed")
     if not all(isinstance(payload.get(key), str) and payload[key] for key in ("request_id", "session_id", "device_id")):
         return _result(400, "invalid_input")
@@ -1868,7 +2022,7 @@ def process_transcribe(audio: bytes, headers: dict[str, str] | None = None, env:
                        *, sample_rate: int = 16000) -> tuple[int, dict[str, Any]]:
     headers = headers or {}
     env = env or os.environ
-    if not _authorized(headers, env):
+    if not _authorized(headers, env, allow_g2=True):
         return _result(401, "authentication_failed")
     if not isinstance(audio, (bytes, bytearray)) or not audio or len(audio) % 2 != 0:
         return _result(400, "invalid_input")
@@ -1941,7 +2095,15 @@ class GatewayHandler(BaseHTTPRequestHandler):
     # because nothing is cookie-authenticated: every consequential endpoint
     # requires the bearer token, which a hostile page does not have, and the
     # server is reachable only from the LAN and the tailnet.
+    def _client_ip(self) -> str:
+        return (self.client_address or ("",))[0]
+
     def _send(self, status: int, body: dict[str, Any]) -> None:
+        # Every refusal in this server leaves through here, which makes it
+        # the one place that can count them without each route remembering
+        # to (B5).
+        if status in (401, 403):
+            auth_record_failure(self._client_ip())
         raw = json.dumps(body, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Access-Control-Allow-Origin", "*")
@@ -2043,14 +2205,30 @@ class GatewayHandler(BaseHTTPRequestHandler):
                  ".json": "application/json; charset=utf-8"}
 
     def _get_g2_config(self, parsed: urllib.parse.SplitResult) -> None:
-        # Hands the packaged G2 app its bearer token at launch, so the .ehpk
-        # uploaded to Even's portal carries no credentials. Unauthenticated by
-        # necessity (the caller is asking BECAUSE it has no token yet) and
-        # defended by the network perimeter instead: this server is reachable
-        # only from the LAN and the tailnet, the same boundary that already
-        # protects the served bundle. Per-entrance tokens with real pairing
-        # are R7's job.
-        self._send(200, {"token": os.environ.get("DEVICE_TOKEN", "")})
+        """Hands the G2 app its own token at launch (B4).
+
+        Still unauthenticated by necessity -- the caller is asking BECAUSE
+        it has no token yet -- so what it hands over must be worth little.
+        It is the glasses-only token now, never DEVICE_TOKEN, and it opens
+        /v1/transcribe and /v1/chat and nothing else.
+
+        Narrowed further by where the request came from. Tailscale serve
+        terminates TLS and proxies to 127.0.0.1, so the glasses -- which
+        reach the gateway at its ts.net name -- arrive as loopback, while a
+        guest phone or some appliance on the house Wi-Fi arrives as
+        192.168.x.y and is refused. That is the whole LAN removed from the
+        set of things that can ask for a credential, at no cost to the
+        glasses. Real per-entrance pairing is still R7's job.
+        """
+        client = (self.client_address or ("",))[0]
+        if not _client_is_local(client):
+            _log(f"gateway g2_config_refused client={client}")
+            self._send(403, {"error": "forbidden",
+                             "detail": "g2/config is served to the tailnet only"})
+            return
+        token = g2_token(os.environ)
+        _log("gateway g2_config_served" + ("" if token else " token=unavailable"))
+        self._send(200, {"token": token})
 
     def _get_g2(self, parsed: urllib.parse.SplitResult) -> None:
         if parsed.path == "/g2/config":
@@ -2276,9 +2454,35 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", "0")
         self.end_headers()
 
+    def _refuse_while_throttled(self) -> bool:
+        """Answers 429 to a client that has been guessing (B5).
+
+        /health is exempt: the watchdog polls it every five minutes and a
+        gateway that looks dead gets restarted, which is not the response
+        anyone wants to a neighbour's password guessing.
+        """
+        if urllib.parse.urlsplit(self.path).path == "/health":
+            return False
+        remaining = auth_block_remaining(self._client_ip())
+        if remaining <= 0:
+            return False
+        seconds = int(remaining) + 1
+        raw = json.dumps({"error": "too_many_attempts",
+                          "retry_after_seconds": seconds}).encode("utf-8")
+        self.send_response(429)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Retry-After", str(seconds))
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+        return True
+
     def do_GET(self) -> None:  # noqa: N802
         # GET is the only method that arrives with a query string, and
         # matching POST and PUT on the raw path is what they already did.
+        if self._refuse_while_throttled():
+            return
         parsed = urllib.parse.urlsplit(self.path)
         # /g2/* is the one prefix route: a static bundle with hashed asset
         # names cannot be enumerated in an exact-match table.
@@ -2288,9 +2492,13 @@ class GatewayHandler(BaseHTTPRequestHandler):
         self._dispatch(self._GET_ROUTES, parsed.path)
 
     def do_PUT(self) -> None:  # noqa: N802
+        if self._refuse_while_throttled():
+            return
         self._dispatch(self._PUT_ROUTES, self.path)
 
     def do_POST(self) -> None:  # noqa: N802
+        if self._refuse_while_throttled():
+            return
         self._dispatch(self._POST_ROUTES, self.path)
 
     def log_message(self, fmt: str, *args: Any) -> None:
@@ -2445,9 +2653,40 @@ def _announce_memory_store() -> None:
         _log(f"gateway memory store: {os.path.basename(path)} (new, nothing remembered yet)")
 
 
+class _SingleInstanceServer(ThreadingHTTPServer):
+    """Refuses to start when something is already listening on the port.
+
+    Python turns SO_REUSEADDR on by default and on Windows that does not
+    mean what it means elsewhere: a second process binds a port the first
+    is still listening on, and the OS hands connections to one of them.
+    The order agent has refused this since 2026-08-19; the gateway did not,
+    and on 2026-08-22 that cost an evening.
+
+    What it looks like from outside is worth writing down, because nothing
+    about it says "two servers": Stop-ScheduledTask kills the PowerShell
+    wrapper but not the python underneath it, so a restart leaves the old
+    process alive and holding the port -- with its stdout pipe now broken,
+    so every request it serves dies on the first log line and the client
+    sees the connection close. The gateway "was listening" and answered
+    nothing at all. A robot in that state is simply mute.
+    """
+
+    allow_reuse_address = False
+
+
 def main() -> None:
     host = os.environ.get("GATEWAY_HOST", "127.0.0.1")
     port = int(os.environ.get("GATEWAY_PORT", "8080"))
+    try:
+        server = _SingleInstanceServer((host, port), GatewayHandler)
+    except OSError as exc:
+        raise SystemExit(
+            f"Tachikoma Gateway could not take {host}:{port} ({exc}). "
+            "Another gateway is probably still running -- Stop-ScheduledTask "
+            "does not kill the python it started. Find it with "
+            "Get-NetTCPConnection -LocalPort 8080 -State Listen and stop that "
+            "PID before starting another."
+        ) from exc
     _log(f"Tachikoma Gateway listening on {host}:{port} (provider={os.environ.get('AI_PROVIDER', 'mock')})")
     _announce_memory_store()
     _warm_biometrics()
@@ -2455,7 +2694,7 @@ def main() -> None:
     if _debug_logging_enabled(os.environ):
         _log(f"TACHIKOMA_DEBUG_LOGGING=1: recognized speech text will be logged and uploaded audio "
              f"saved to {DEBUG_AUDIO_DIR} -- investigation-only, disable when done")
-    ThreadingHTTPServer((host, port), GatewayHandler).serve_forever()
+    server.serve_forever()
 
 
 if __name__ == "__main__":

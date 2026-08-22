@@ -50,7 +50,10 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import secrets
 import sys
+import threading
+import time
 import webbrowser
 import urllib.error
 import urllib.parse
@@ -207,6 +210,62 @@ def open_on_this_screen(customer_id, asked_by):
     return {"opened": True, "url": url}
 
 
+# --- who may ask, and how often (audit B5) ----------------------------------
+#
+# This listens on the tailnet and answers with the customer ledger, so the
+# token is the only thing between a device on the tailnet and every grave in
+# the database. Two holes, both here:
+#
+#   1. The comparison was `!=`, which returns as soon as two bytes differ.
+#      That leaks the token's prefix by timing, one byte at a time.
+#   2. Nothing counted wrong answers, so it could be guessed all night.
+#
+# Same policy as the gateway: ten misses in a minute buys a minute of
+# silence, doubling to a quarter hour.
+_FAIL_LIMIT = 10
+_FAIL_WINDOW_SECONDS = 60.0
+_BLOCK_SECONDS = 60.0
+_BLOCK_MAX_SECONDS = 900.0
+_failures: dict[str, dict[str, float]] = {}
+_failures_lock = threading.Lock()
+
+
+def token_ok(supplied: str) -> bool:
+    """Constant-time, and false when no token is configured at all."""
+    if not RELAY_TOKEN:
+        return False
+    return secrets.compare_digest(supplied, RELAY_TOKEN)
+
+
+def block_remaining(client: str, now: float | None = None) -> float:
+    now = time.time() if now is None else now
+    with _failures_lock:
+        record = _failures.get(client)
+        return 0.0 if not record else max(0.0, record.get("blocked_until", 0.0) - now)
+
+
+def record_failure(client: str, now: float | None = None) -> None:
+    now = time.time() if now is None else now
+    with _failures_lock:
+        record = _failures.get(client)
+        if record is None or now - record["window_start"] > _FAIL_WINDOW_SECONDS:
+            record = {"window_start": now, "count": 0.0, "blocked_until": 0.0,
+                      "block_seconds": _BLOCK_SECONDS}
+            _failures[client] = record
+        record["count"] += 1
+        if record["count"] >= _FAIL_LIMIT:
+            record["blocked_until"] = now + record["block_seconds"]
+            record["block_seconds"] = min(record["block_seconds"] * 2, _BLOCK_MAX_SECONDS)
+            record["window_start"] = now
+            record["count"] = 0.0
+            print(f"crm_relay throttled client={client}", flush=True)
+        if len(_failures) > 1024:
+            for key in [k for k, v in _failures.items()
+                        if v["blocked_until"] < now
+                        and now - v["window_start"] > _FAIL_WINDOW_SECONDS]:
+                del _failures[key]
+
+
 class Handler(http.server.BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -231,7 +290,13 @@ class Handler(http.server.BaseHTTPRequestHandler):
                                "/crm/open"):
             return self._send(404, {"error": "not found"})
 
-        if self.headers.get("X-Tachikoma-Token", "") != RELAY_TOKEN:
+        client = (self.client_address or ("",))[0]
+        blocked = block_remaining(client)
+        if blocked > 0:
+            return self._send(429, {"error": "too_many_attempts",
+                                    "retry_after_seconds": int(blocked) + 1})
+        if not token_ok(self.headers.get("X-Tachikoma-Token", "")):
+            record_failure(client)
             return self._send(403, {"error": "forbidden"})
 
         params = urllib.parse.parse_qs(parsed.query)

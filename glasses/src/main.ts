@@ -25,8 +25,13 @@ const DEVICE_ID = import.meta.env.VITE_DEVICE_ID ?? '80456B4DE03C'
 // The packaged .ehpk is uploaded to Even's portal, so the bearer token must
 // not be baked into it -- a build for packaging leaves VITE_DEVICE_TOKEN
 // empty and the app collects the token from the gateway itself at launch.
-// /g2/config is only reachable from the LAN and the tailnet, so the token
-// never crosses to anything that is not already inside the house.
+//
+// What comes back is the glasses' own token, not the one the robot bodies
+// carry: it opens /v1/transcribe and /v1/chat and nothing else, so a copy
+// of it cannot make the robot speak or rewrite who Tachikoma thinks people
+// are. /g2/config answers the tailnet only (Tailscale serve proxies from
+// loopback), so reaching the gateway over plain Wi-Fi returns 403 -- if
+// this ever stops finding a token, check that GATEWAY is the ts.net name.
 let TOKEN = import.meta.env.VITE_DEVICE_TOKEN ?? ''
 
 async function resolveToken(): Promise<boolean> {

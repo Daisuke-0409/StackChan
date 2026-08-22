@@ -107,6 +107,26 @@ foreach ($svc in $services) {
     }
     if ($task.State -eq "Disabled") { Enable-ScheduledTask -TaskName $svc.Task | Out-Null }
     if ($taskRunning) { Stop-ScheduledTask -TaskName $svc.Task -ErrorAction SilentlyContinue }
+
+    # Stop-ScheduledTask kills the PowerShell wrapper, NOT the python it
+    # started. A half-dead server left holding the port is worse than a
+    # dead one: the next start binds the same port anyway (Windows lets it),
+    # the OS splits connections between the two, and the old process --
+    # whose stdout pipe died with its wrapper -- drops every request it
+    # gets. That is a service which is listening and answers nothing, and
+    # it is what this script itself caused on 2026-08-22. So take the port
+    # back by force before starting anything.
+    if ($null -ne $svc.Port) {
+        $holders = @(Get-NetTCPConnection -LocalPort $svc.Port -State Listen `
+                     -ErrorAction SilentlyContinue |
+                     Select-Object -ExpandProperty OwningProcess -Unique)
+        foreach ($holder in $holders) {
+            Write-Output "$now [KILL] $($svc.Name)  ポートを掴んだままの PID $holder を止める"
+            Stop-Process -Id $holder -Force -ErrorAction SilentlyContinue
+        }
+        if ($holders.Count -gt 0) { Start-Sleep -Seconds 2 }
+    }
+
     Start-ScheduledTask -TaskName $svc.Task
     Write-Output "$now [REP.] $($svc.Name)  タスクを起動し直した"
 }
