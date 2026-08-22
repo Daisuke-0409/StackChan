@@ -19,7 +19,10 @@ if (-not (Test-Path $envFile)) {
     Write-Error "$envFile not found. Copy .env.example to .env and fill it in."
 }
 
-foreach ($line in Get-Content $envFile) {
+# -Encoding UTF8: PS 5.1 reads a BOM-less file as ANSI, which turns the
+# Japanese in .env (STT_VOCABULARY and friends) into mojibake before it
+# ever reaches the process. The file is UTF-8; say so.
+foreach ($line in Get-Content $envFile -Encoding UTF8) {
     $trimmed = $line.Trim()
     if ($trimmed -eq "" -or $trimmed.StartsWith("#")) { continue }
     $split = $trimmed.IndexOf("=")

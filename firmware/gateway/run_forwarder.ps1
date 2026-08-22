@@ -17,7 +17,10 @@ $firmwareDir = Split-Path -Parent $gatewayDir
 $envFile = Join-Path $gatewayDir ".env.forwarder"
 
 if (Test-Path $envFile) {
-    foreach ($line in Get-Content $envFile) {
+    # -Encoding UTF8: PS 5.1 reads a BOM-less file as ANSI, which turns the
+    # Japanese in .env (STT_VOCABULARY and friends) into mojibake before it
+    # ever reaches the process. The file is UTF-8; say so.
+    foreach ($line in Get-Content $envFile -Encoding UTF8) {
         $trimmed = $line.Trim()
         if ($trimmed -eq "" -or $trimmed.StartsWith("#")) { continue }
         $split = $trimmed.IndexOf("=")
@@ -54,4 +57,32 @@ Write-Host "The robot's provisioned gateway URL must point at one of these."
 Write-Host "Forwarding to: $env:FORWARDER_TARGET"
 
 Set-Location $firmwareDir
-python -u gateway/forwarder.py
+
+# Which python, decided here rather than left to PATH order -- the same rule
+# as run_gateway.ps1, for the same reason (PATH order changed once and picked
+# a broken interpreter; the Microsoft Store stub python.exe also lives on
+# PATH and exits without running anything). forwarder.py needs only the
+# standard library, so the probe just asks the candidate to actually run.
+# Set TACHIKOMA_PYTHON in the env file to override.
+$pythonCandidates = @()
+if ($env:TACHIKOMA_PYTHON) { $pythonCandidates += $env:TACHIKOMA_PYTHON }
+$pythonCandidates += (Get-Command python.exe -All -ErrorAction SilentlyContinue |
+                      Select-Object -ExpandProperty Source)
+
+$python = $null
+foreach ($candidate in $pythonCandidates) {
+    if (-not (Test-Path $candidate)) { continue }
+    if ((& $candidate -c "print('OK')" 2>$null) -contains 'OK') { $python = $candidate; break }
+}
+if (-not $python) {
+    Write-Error "No working python.exe found on PATH. Install Python or set TACHIKOMA_PYTHON."
+}
+Write-Host "python: $python"
+
+# The configuration checks above should stop the launcher; a line on the
+# server's stderr should not (PowerShell turns native stderr into an
+# ErrorRecord, and under "Stop" one harmless warning kills the process --
+# run_gateway.ps1 learned this the hard way).
+$ErrorActionPreference = "Continue"
+
+& $python -u gateway/forwarder.py
