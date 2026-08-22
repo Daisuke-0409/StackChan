@@ -99,6 +99,25 @@ foreach ($t in 'Tachikoma Gateway','VOICEVOX Engine (Tachikoma)',
 
 ---
 
+### ゲートウェイが「起動しているのに何も答えない」ときは、二重起動を疑う (2026-08-22)
+
+症状: `/health` すら応答なし（HTTPエラーではなく**接続が即切れる**）。
+ログには "listening on 0.0.0.0:8080" と出ていて、一見正常に起動している。
+実機は無言、self_check も [DEAD] を出す。
+
+原因: `Stop-ScheduledTask` は**PowerShellのラッパーしか殺さず、その下の
+python は生き残る**。次に起動したプロセスは Windows の SO_REUSEADDR で
+同じポートに bind できてしまい、OSが接続を古い方に配る。古い方は親シェルが
+死んで標準出力が壊れているので、リクエストを受けるたびログ出力で例外→接続切断。
+
+    Get-NetTCPConnection -LocalPort 8080 -State Listen   # 掴んでいるPIDを見る
+    Get-Process -Id <PID>                                # StartTime で新旧を判定
+    Stop-Process -Id <古いPID> -Force
+
+対策済み: ゲートウェイに二重起動ガードを入れた（2つ目は起動を拒否して理由を
+言う）。self_check.ps1 -Repair も、再起動前にポートを掴んだプロセスを
+強制終了するようにした。**タスクを止めただけで安心しないこと。**
+
 ## 3. デバイスが無言のとき
 
 **第一手は健康診断**。どのサービスが死んでいるか、原因込みで1画面に出る:
