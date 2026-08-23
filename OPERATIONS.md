@@ -86,6 +86,44 @@ foreach ($t in 'Tachikoma Gateway','VOICEVOX Engine (Tachikoma)',
                'Tachikoma Order Agent') { Enable-ScheduledTask -TaskName $t }
 ```
 
+### 手で打つコマンドには `-ExecutionPolicy Bypass` を必ず付ける (2026-08-24)
+
+Windows の実行ポリシーは**どのスコープでも未定義 = Restricted**。
+**禁止例** `powershell -File whatever.ps1` — 素の端末に打つと1行目に届く前に死ぬ:
+
+```
+このシステムではスクリプトの実行が無効になっているため、
+ファイル ... を読み込むことができません
+```
+
+**機械は壊れていない。壊れていたのは手順書のほうだけ**で、しかも
+**唯一の読み手 (大輔) にしか起きない**。自動で走るものはこの扉を通らない —
+自動起動タスクは元から全部 `-ExecutionPolicy Bypass` を渡しているし、
+エージェントのシェルはプロセススコープで Bypass を継いでいる。
+だから数週間、誰も気づけなかった。
+
+書いてある49箇所は直した。**50箇所目を防ぐのは `tests_commands.py`** で、
+Bypass の無い `powershell ... -File` が文書に現れたら repo スイートが落ちる。
+
+**ポリシー自体は変えない。**それは人のPCのセキュリティ設定で、
+11文字を惜しんでプロジェクトが黙って緩めていいものではない。
+
+### 会社と家に同じ検査表を当てない (2026-08-24)
+
+`self_check.ps1` は家の台帳しか持っておらず、会社で走らせると嘘をついた。
+8080 を握っているのが**転送役**なのに「Gateway OK」と読み、家の固定IP
+`192.168.2.120` が無いことを [DEAD] と言った。
+
+診断が誤るだけなら実害は小さい。**危ないのは `-Repair` のほう**で、
+修理側は「Disabled なタスクは監査C5の再発」とみなして有効化する。
+会社の `Tachikoma Gateway` が Disabled なのは**故障ではなく意図**
+(頭は家に1つ)。会社でこれが走ると**頭が2つになり、記憶が黙って枝分かれする**。
+
+事故になっていなかったのは、転送役がたまたま 8080 を握っていて
+「Gateway OK」と誤診されていたからで、**転送役が落ちた瞬間に発動する**
+状態だった。IP で拠点を見て台帳を切り替え、会社では
+`Tachikoma Gateway` を**起こさず、有効なら無効に戻す**ようにした。
+
 | 罠 | 内容 |
 |---|---|
 | `pdMS_TO_TICKS(N)` | `CONFIG_FREERTOS_HZ=100` (10ms tick) では `pdMS_TO_TICKS(5)` が整数除算で **0** になり、`vTaskDelay(0)` = yield のみになる。優先度8・core0固定でidleタスクを枯渇させ、10秒でウォッチドッグを踏んだ |
@@ -138,8 +176,8 @@ python は生き残る**。次に起動したプロセスは Windows の SO_REUS
 **第一手は健康診断**。どのサービスが死んでいるか、原因込みで1画面に出る:
 
 ```powershell
-powershell -File self_check.ps1          # 診断
-powershell -File self_check.ps1 -Repair  # 死んでいたら起こす
+powershell -ExecutionPolicy Bypass -File self_check.ps1          # 診断
+powershell -ExecutionPolicy Bypass -File self_check.ps1 -Repair  # 死んでいたら起こす
 ```
 
 普段は scheduled task「Tachikoma Health Check」が5分毎にこれを -Repair 付きで
@@ -159,5 +197,5 @@ TachikomaState: Thinking -> Error by AiRequestFailed
 起動コマンド:
 
 ```powershell
-powershell -File firmware\gateway\run_gateway.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_gateway.ps1
 ```
