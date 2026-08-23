@@ -67,7 +67,7 @@ TachikomaState: Thinking -> Error by AiRequestFailed
 Start it with the launcher, which reads `gateway/.env` (gitignored):
 
 ```powershell
-powershell -File gateway\run_gateway.ps1
+powershell -ExecutionPolicy Bypass -File gateway\run_gateway.ps1
 ```
 
 Three things silently break this if set up by hand instead:

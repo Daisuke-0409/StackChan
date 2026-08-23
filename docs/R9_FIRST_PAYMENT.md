@@ -23,7 +23,7 @@ ORDER_PAYMENT_ENABLED=1
 そして注文エージェントを再起動:
 
 ```powershell
-powershell -File orderagent\run_orderagent.ps1
+powershell -ExecutionPolicy Bypass -File orderagent\run_orderagent.ps1
 ```
 
 起動ログに `payment_enabled=True` が出れば有効。**これを戻せば練習モードに戻る。**

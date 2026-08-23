@@ -8,12 +8,12 @@
 #
 # Two ways out, neither of them a screen.
 #
-#   powershell -File gateway\copy_device_token.ps1 -SendTo oo
+#   powershell -ExecutionPolicy Bypass -File gateway\copy_device_token.ps1 -SendTo oo
 #     Sends it straight to the other machine over Taildrop. Encrypted
 #     between the two of them, no cloud in the middle, and nothing to
 #     copy by hand. The receiving side runs: tailscale file get .
 #
-#   powershell -File gateway\copy_device_token.ps1
+#   powershell -ExecutionPolicy Bypass -File gateway\copy_device_token.ps1
 #     Puts it on the clipboard for a password manager. The clipboard keeps
 #     what it is given, so overwrite it afterwards: Set-Clipboard "cleared"
 #     (an empty string is rejected by Windows PowerShell 5.1).

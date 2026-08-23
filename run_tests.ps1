@@ -1,7 +1,7 @@
 ﻿# run_tests.ps1 -- 全テストを1コマンドで。
 #
-#   powershell -File run_tests.ps1              # 全部
-#   powershell -File run_tests.ps1 notifier     # 1つだけ
+#   powershell -ExecutionPolicy Bypass -File run_tests.ps1              # 全部
+#   powershell -ExecutionPolicy Bypass -File run_tests.ps1 notifier     # 1つだけ
 #
 # 中身は tools/run_suites.py。スイートの定義をそこに1つだけ置いて、CI も
 # 同じものを呼ぶ (.github/workflows/tests.yml)。ここに一覧を書き写すと

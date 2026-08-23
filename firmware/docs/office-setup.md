@@ -176,7 +176,7 @@ idf.py -p COM3 flash
 ## 7. 起動と確認
 
 ```powershell
-powershell -File firmware\gateway\run_gateway.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_gateway.ps1
 ```
 
 起動時に現在の LAN IP を表示する。**実機に焼いた IP と一致しているか**を

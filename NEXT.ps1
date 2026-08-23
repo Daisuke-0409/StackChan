@@ -1,6 +1,6 @@
 ﻿# 迷ったらこれを実行する。いまどこまで進んでいて、次に何をすればいいかを出す。
 #
-#   powershell -File NEXT.ps1
+#   powershell -ExecutionPolicy Bypass -File NEXT.ps1
 #
 # 手順書ではなく点検表。書いてある順に済ませていけば終わる。
 # 済んだ項目は勝手に消えるので、何度実行してもいい。
@@ -63,7 +63,7 @@ if ($isOffice) {
     $cache = Join-Path $root "firmware\build\CMakeCache.txt"
     if (Test-Path $cache) {
         Ok "会社の機体のトークンはこの機械にある"
-        Need "家に送る (まだなら)" "powershell -File firmware\gateway\copy_device_token.ps1 -SendTo oo"
+        Need "家に送る (まだなら)" "powershell -ExecutionPolicy Bypass -File firmware\gateway\copy_device_token.ps1 -SendTo oo"
     }
     foreach ($t in @("Tachikoma Forwarder", "Tachikoma CRM Relay")) {
         $state = (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue).State
@@ -109,7 +109,7 @@ tailscale file get .
     $listening = Get-NetTCPConnection -State Listen -LocalPort 9000 -ErrorAction SilentlyContinue
     if ($listening) { Ok "認識器が動いている (9000番)" }
     elseif ($hasWhisper -and (Test-Path $sttEnv)) {
-        Need "認識器を起動する (初回はモデルのダウンロードあり)" "powershell -File firmware\gateway\run_local_stt.ps1"
+        Need "認識器を起動する (初回はモデルのダウンロードあり)" "powershell -ExecutionPolicy Bypass -File firmware\gateway\run_local_stt.ps1"
     }
 
     if ($conf["STT_PROVIDER"] -eq "local") { Ok "ゲートウェイは認識器を見ている" }
@@ -135,7 +135,7 @@ firmware\gateway\.env の STT_VOCABULARY を15語くらいに:
 
     # 3. CRM
     if ($conf["CRM_RELAY_TOKEN"]) { Ok "CRM の合言葉は入っている" }
-    else { Need "CRM を引けるようにする" "powershell -File firmware\gateway\setup_crm_relay_token.ps1" }
+    else { Need "CRM を引けるようにする" "powershell -ExecutionPolicy Bypass -File firmware\gateway\setup_crm_relay_token.ps1" }
 
     $gw = (Get-ScheduledTask -TaskName "Tachikoma Gateway" -ErrorAction SilentlyContinue)
     if ($gw -and $gw.State -eq "Disabled") {

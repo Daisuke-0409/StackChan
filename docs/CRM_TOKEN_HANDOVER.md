@@ -23,7 +23,7 @@
 
 ```powershell
 cd C:\Users\...\StackChan
-powershell -File gateway\setup_crm_token.ps1
+powershell -ExecutionPolicy Bypass -File gateway\setup_crm_token.ps1
 ```
 
 - CRM の config.json から読み直して `.env.crm_relay` に書き直すだけ
@@ -37,7 +37,7 @@ powershell -File gateway\setup_crm_token.ps1
 
 ```powershell
 cd C:\Users\mylit\StackChanDev\StackChan
-powershell -File firmware\gateway\setup_crm_relay_token.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\setup_crm_relay_token.ps1
 ```
 
 - 入力欄は伏せ字。打った値は画面に出ない

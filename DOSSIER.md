@@ -204,12 +204,12 @@ python firmware\patches\apply_codec_dev_fix.py
 # 8. 実機に焼く（バックアップ→ビルド→flash。README 3章）
 #    ESP-IDF export は VS Code 拡張レイアウトのため4行の環境変数が要る（README 1.8）
 # 9. ゲートウェイ起動
-powershell -File firmware\gateway\run_gateway.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_gateway.ps1
 ```
 
 テストで健全性を確認:
 ```powershell
-powershell -File run_tests.ps1
+powershell -ExecutionPolicy Bypass -File run_tests.ps1
 ```
 全スイート（ゲートウェイ／注文エージェント／PC側／リポジトリ規律）が走り、件数と
 合否が出る。3スイートとも標準ライブラリだけで通るので、同じものが CI でも走る

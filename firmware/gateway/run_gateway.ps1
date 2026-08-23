@@ -4,7 +4,7 @@
 # 0.0.0.0 -- server.py's built-in default (127.0.0.1) accepts only local
 # connections and leaves the device with "Connection reset by peer".
 #
-#   powershell -File gateway\run_gateway.ps1
+#   powershell -ExecutionPolicy Bypass -File gateway\run_gateway.ps1
 #
 # DEVICE_TOKEN must match the TACHIKOMA_DEVICE_TOKEN the firmware was
 # provisioned with, otherwise every request comes back 401. If .env does not

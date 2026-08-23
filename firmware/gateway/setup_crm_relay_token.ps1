@@ -10,7 +10,7 @@
 # file, so the value arrives by clipboard: copy it from the password
 # manager, run this, and it is written and the clipboard wiped.
 #
-#   powershell -File gateway\setup_crm_relay_token.ps1
+#   powershell -ExecutionPolicy Bypass -File gateway\setup_crm_relay_token.ps1
 #
 # Clipboard rather than a prompt because a hidden prompt refuses pastes in
 # some consoles, and a token nobody can paste gets retyped -- or worse,

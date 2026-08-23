@@ -542,7 +542,7 @@ PC 側の通常プロンプトに残る (「はい」と言っても `VoiceAppro
 ### 起動
 
 ```powershell
-powershell -File notifier\run_approval_daemon.ps1
+powershell -ExecutionPolicy Bypass -File notifier\run_approval_daemon.ps1
 ```
 
 `run_pc_ear.ps1` と同じ流儀: `firmware\gateway\.env` を読み込み

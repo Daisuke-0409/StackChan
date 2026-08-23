@@ -11,12 +11,12 @@
 # filter did not reach a nested key. The safe way to handle a secret is not
 # a better filter; it is never rendering it.
 #
-#   powershell -File gateway\setup_crm_token.ps1
+#   powershell -ExecutionPolicy Bypass -File gateway\setup_crm_token.ps1
 #
 # If the CRM is somewhere this machine cannot read -- after the move to the
 # NAS, most likely -- use -Prompt and paste it into a hidden field instead:
 #
-#   powershell -File gateway\setup_crm_token.ps1 -Prompt
+#   powershell -ExecutionPolicy Bypass -File gateway\setup_crm_token.ps1 -Prompt
 
 # Note the absence of a Japanese literal for the CRM folder. A .ps1 saved as
 # UTF-8 without a BOM is read as Shift-JIS by Windows PowerShell 5.1, which
@@ -115,4 +115,4 @@ Write-Host "CRM_RELAY_TOKEN and CRM_TOKEN written to gateway\.env.crm_relay"
 Write-Host "fingerprint: $fingerprint    (compare with the CRM side; the token itself is never printed)"
 Write-Host ""
 Write-Host "gateway\.env.crm_relay is gitignored. Start the relay with:"
-Write-Host "  powershell -File gateway\run_crm_relay.ps1"
+Write-Host "  powershell -ExecutionPolicy Bypass -File gateway\run_crm_relay.ps1"

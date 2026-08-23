@@ -201,7 +201,7 @@ copy firmware\gateway\.env.forwarder.example firmware\gateway\.env.forwarder
 ```powershell
 python -m pip install playwright
 python -m playwright install chromium
-powershell -File orderagent\run_orderagent.ps1
+powershell -ExecutionPolicy Bypass -File orderagent\run_orderagent.ps1
 ```
 
 - 設定は `firmware\gateway\.env` を共用（DEVICE_TOKEN を読むだけ）
@@ -219,7 +219,7 @@ powershell -File orderagent\run_orderagent.ps1
 ### 起動
 
 ```powershell
-powershell -File firmware\gateway\run_gateway.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_gateway.ps1
 ```
 
 起動時に出るものを2つ確認してください。
@@ -252,7 +252,7 @@ gateway memory: adopted 80456B4DE03C.json as the shared store
 動いている状態で:
 
 ```powershell
-powershell -File notifier\run_pc_ear.ps1
+powershell -ExecutionPolicy Bypass -File notifier\run_pc_ear.ps1
 ```
 
 起動時に部屋の暗騒音を約1秒測って閾値を自動調整します（**静かにして待つ**）。
@@ -308,7 +308,7 @@ idf.py -C firmware -p COM3 -b 460800 flash
 （記憶が枝分かれします）。
 
 ```powershell
-powershell -File firmware\gateway\run_forwarder.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_forwarder.ps1
 ```
 
 ブラウザで `http://localhost:8080/healthz` を開き、`{"ok":true}` が出れば動いています

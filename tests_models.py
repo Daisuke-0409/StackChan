@@ -11,7 +11,7 @@ being defended against is real and has happened: gemini-2.5-flash went
 "no longer available to new users" and 404'd in production, and finding
 every place it was written took longer than fixing it.
 
-Run with the other suites:  powershell -File run_tests.ps1
+Run with the other suites:  powershell -ExecutionPolicy Bypass -File run_tests.ps1
 """
 import re
 import unittest

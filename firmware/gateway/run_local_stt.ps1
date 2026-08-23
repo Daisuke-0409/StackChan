@@ -4,7 +4,7 @@
 # This replaces it with a recogniser. See gateway\local_stt.py for why, and
 # for what changes as a result.
 #
-#   powershell -File gateway\run_local_stt.ps1
+#   powershell -ExecutionPolicy Bypass -File gateway\run_local_stt.ps1
 #
 # First run only:
 #   pip install faster-whisper

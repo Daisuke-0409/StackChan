@@ -81,7 +81,7 @@
 
     git tag                       # 版の一覧
     git checkout v0.9.0           # その版のコードに戻す
-    powershell -File self_check.ps1 -Repair   # サービスを新しいコードで上げ直す
+    powershell -ExecutionPolicy Bypass -File self_check.ps1 -Repair   # サービスを新しいコードで上げ直す
 
 **git に入っていないものは戻らない**（戻す必要もない）:
 

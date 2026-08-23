@@ -4,7 +4,7 @@
 # keeps pointing at this PC's LAN address; this process carries the traffic to
 # the gateway at the other site over Tailscale.
 #
-#   powershell -File gateway\run_forwarder.ps1
+#   powershell -ExecutionPolicy Bypass -File gateway\run_forwarder.ps1
 #
 # FORWARDER_TARGET is the gateway's Tailscale address, not its LAN address:
 # the LAN address belongs to the other site's network and means nothing here.

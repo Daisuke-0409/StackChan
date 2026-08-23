@@ -29,7 +29,7 @@ SUITES = [
     # Repository-wide discipline (model-name drift). Named rather than
     # discovered: discovering from the root would collect orderagent a
     # second time and count it twice.
-    ("repo", ["tests_models"], "."),
+    ("repo", ["tests_models", "tests_commands"], "."),
 ]
 
 

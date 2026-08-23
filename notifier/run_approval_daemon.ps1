@@ -1,7 +1,7 @@
 # Starts the approval daemon: Claude Code asks, Tachikoma reads it aloud,
 # Daisuke answers by voice, the decision goes back to Claude Code.
 #
-#   powershell -File notifier\run_approval_daemon.ps1
+#   powershell -ExecutionPolicy Bypass -File notifier\run_approval_daemon.ps1
 #
 # Loads DEVICE_TOKEN from firmware\gateway\.env (same parsing as
 # run_gateway.ps1 / run_pc_ear.ps1), then runs approval_daemon.py on a

@@ -1,6 +1,6 @@
 # Starts the mobile-order agent (orderagent/server.py) on 127.0.0.1:8766.
 #
-#   powershell -File orderagent\run_orderagent.ps1
+#   powershell -ExecutionPolicy Bypass -File orderagent\run_orderagent.ps1
 #
 # Settings come from firmware\gateway\.env (the same file the gateway uses)
 # so DEVICE_TOKEN never needs to exist twice. Payment stays a dry run unless

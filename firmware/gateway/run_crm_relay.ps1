@@ -5,7 +5,7 @@
 # process asks the CRM over localhost and hands back only the fields the robot
 # can say aloud.
 #
-#   powershell -File gateway\run_crm_relay.ps1
+#   powershell -ExecutionPolicy Bypass -File gateway\run_crm_relay.ps1
 #
 # Settings come from gateway\.env.crm_relay (gitignored). CRM_RELAY_TOKEN is
 # required: this listens on the tailnet, and an open one would serve the

@@ -94,5 +94,5 @@ VOICEVOX Engine を入れて 50021 で起動する状態にする（音声合成
 
 ## 10. 動作確認
 
-    powershell -File NEXT.ps1          # 状態点検表
+    powershell -ExecutionPolicy Bypass -File NEXT.ps1          # 状態点検表
     # 「田中さんの墓所どこ?」で CRM、実機に話しかけて会話が返るか

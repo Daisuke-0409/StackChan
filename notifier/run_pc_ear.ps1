@@ -1,6 +1,6 @@
 # Starts the PC ear: a desk microphone that speaks through Tachikoma.
 #
-#   powershell -File notifier\run_pc_ear.ps1
+#   powershell -ExecutionPolicy Bypass -File notifier\run_pc_ear.ps1
 #
 # Loads DEVICE_TOKEN from firmware\gateway\.env (same parsing as
 # run_gateway.ps1), then runs pc_ear.py on a python that has sounddevice.

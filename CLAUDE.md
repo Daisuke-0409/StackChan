@@ -17,7 +17,7 @@ M5Stack StackChan (CoreS3 / ESP32-S3) をフォークし、独自の音声対話
 | **CLAUDE.md**（これ） | 現在地・次セッションの開始点・アーキテクチャ・未解決 | 毎セッション冒頭 |
 
 再建は RESURRECTION.md、依存は requirements/、版と戻し方は CHANGELOG.md。
-テストは `powershell -File run_tests.ps1`（件数はここが数える。文書に書き写さない）。
+テストは `powershell -ExecutionPolicy Bypass -File run_tests.ps1`（件数はここが数える。文書に書き写さない）。
 実装の正はコード。
 食い違えばコードを確認し、このファイルを更新すること。
 
@@ -186,11 +186,15 @@ robot・メガネ・スマホ・PCの4入口が1つの人格に繋がって動�
 **今日入った、明日から効くもの**:
 
 ```powershell
-powershell -File self_check.ps1          # 全サービスの健康診断(死因つき)
-powershell -File self_check.ps1 -Repair  # 死んでいたら起こす(5分毎に自動実行中)
-powershell -File run_tests.ps1           # 全798件を1コマンド
+powershell -ExecutionPolicy Bypass -File self_check.ps1          # 全サービスの健康診断(死因つき)
+powershell -ExecutionPolicy Bypass -File self_check.ps1 -Repair  # 死んでいたら起こす(5分毎に自動実行中)
+powershell -ExecutionPolicy Bypass -File run_tests.ps1           # 全件を1コマンド
 curl http://127.0.0.1:8080/health        # 走っている版を名乗る
 ```
+
+`-ExecutionPolicy Bypass` は飾りではない。**無いと素の端末では実行できない**
+(2026-08-24 に会社で判明。OPERATIONS.md の失敗台帳)。
+`self_check.ps1` は IP で家と会社を見分け、**台帳を切り替える**。
 
 **今日見つけた本物のバグ（記録として）**:
 
@@ -210,7 +214,7 @@ curl http://127.0.0.1:8080/health        # 走っている版を名乗る
 **何をすればいいか忘れたら、これを実行する** (家でも会社でも):
 
 ```powershell
-powershell -File NEXT.ps1
+powershell -ExecutionPolicy Bypass -File NEXT.ps1
 ```
 
 いまの機械の状態を見て、済んだことと次にやることだけを出す。手順書ではなく
@@ -229,7 +233,7 @@ tailscale file get .
 # 2. ローカル音声認識器を入れる (聞き取りの弱さへの本命)
 pip install faster-whisper
 copy firmware\gateway\.env.local_stt.example firmware\gateway\.env.local_stt
-powershell -File firmware\gateway
+powershell -ExecutionPolicy Bypass -File firmware\gateway
 un_local_stt.ps1
 #    初回はモデルのダウンロードがある
 
@@ -332,7 +336,7 @@ R9 (スタバ・モス) の実サイト作業は**家でしかできない** (Pl
    - `STT_VOCABULARY=タチコマ,大輔,ダイボ石材,加江田,佐土原,田野,綾,篠崎,染川,霊標,管理表,墓所,区画,宮崎,霊園`
      → **名前の混入が止まり、固有名詞の精度が上がる**
    - `CRM_RELAY_URL=http://100.76.60.88:8767` (未設定なら)
-3. `powershell -File firmware\gateway\setup_crm_relay_token.ps1`
+3. `powershell -ExecutionPolicy Bypass -File firmware\gateway\setup_crm_relay_token.ps1`
    → 指紋が **`d0db6880`** になれば成功。これで家から台帳が引ける
 4. 動作確認: 「◯◯さんの墓所どこ？」「加江田の俺の担当のお客さんいる？」
 5. **ローカル Whisper の検討** (下記)
@@ -425,7 +429,7 @@ git pull
 **次に、朝いちのトークン回収** (開発とは独立・2分):
 
 ```powershell
-powershell -File gateway\setup_crm_token.ps1
+powershell -ExecutionPolicy Bypass -File gateway\setup_crm_token.ps1
 ```
 
 → 出てくる `fingerprint: xxxxxxxx` の8文字をメモ。

@@ -268,7 +268,7 @@ Phase 3    スターバックス (プリペイドで最も安全)               
 ### 起動 (家)
 
 ```powershell
-powershell -File firmware\gateway\run_gateway.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_gateway.ps1
 ```
 
 ログオン時に自動起動するタスク: `Tachikoma Gateway` / `VOICEVOX Engine (Tachikoma)` /
@@ -279,7 +279,7 @@ powershell -File firmware\gateway\run_gateway.ps1
 転送役**だけ**。ゲートウェイは起動しない。
 
 ```powershell
-powershell -File firmware\gateway\run_forwarder.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_forwarder.ps1
 ```
 
 確認: `http://localhost:8080/health` が `{"ok":true,...}` を返すこと
@@ -288,7 +288,7 @@ powershell -File firmware\gateway\run_forwarder.ps1
 ### テスト
 
 ```powershell
-powershell -File run_tests.ps1
+powershell -ExecutionPolicy Bypass -File run_tests.ps1
 ```
 
 ゲートウェイ・注文エージェント・notifier・リポジトリ規律の全スイートが走り、
