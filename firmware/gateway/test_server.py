@@ -677,6 +677,25 @@ class CrmBridgeTests(unittest.TestCase):
         self.assertIsNone(crm_bridge.intercept("田中さんの墓所どこ？", "ダイスケ",
                                                env={}))
 
+    def test_a_dead_crm_leaves_ordinary_conversation_alone(self):
+        """R6's fourth condition, stated as a test rather than as an argument.
+
+        The office PC is off outside business hours, so the relay being
+        unreachable is the normal night-time state rather than a fault --
+        and a robot that answered "I cannot reach the ledger" to "how are
+        you" would be broken every evening. Nothing here should touch the
+        network unless a question was recognised as being about a grave,
+        so a fetch that explodes when called at all is the honest fixture.
+        """
+        def fetch(url, token):
+            raise AssertionError("a dead CRM must not be consulted for small talk")
+
+        for said in ("おはよう", "今日の天気は？", "お墓参りどこ行く？",
+                     "俺の墓はどこになるんだろうね"):
+            with self.subTest(said=said):
+                self.assertIsNone(crm_bridge.intercept(
+                    said, "ダイスケ", env=self.ENV, fetch=fetch))
+
 
 class CrmChatIntegrationTests(unittest.TestCase):
     """The chat path must not remember or forward a recognized CRM question."""
