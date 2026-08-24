@@ -16,6 +16,29 @@ $gatewayDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $firmwareDir = Split-Path -Parent $gatewayDir
 $envFile = Join-Path $gatewayDir ".env.crm_relay"
 
+# Same reasoning as run_forwarder.ps1: the launcher's lines go where the
+# server's do, and not through PowerShell's `*>>`, which writes UTF-16 and
+# leaves a log no tool can read straight through.
+function Say([string]$text) {
+    if ($env:TACHIKOMA_LOG_FILE) {
+        $stamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
+        # Add-Content, not [System.IO.File]::AppendAllText: a script calling
+        # .NET to write files is a shape behaviour-monitoring antivirus
+        # flags, and Avast blocked this very file for it on 2026-08-24
+        # (IDP.Generic). The cmdlet does the same job and looks like what it
+        # is. -Encoding UTF8 adds a BOM only when creating the file; the
+        # server writes one too and skips it when the file already exists.
+        try {
+            Add-Content -Path $env:TACHIKOMA_LOG_FILE -Value "[$stamp] $text" `
+                        -Encoding UTF8 -ErrorAction Stop
+            return
+        } catch {
+            # Fall through to the console rather than lose the line.
+        }
+    }
+    Write-Host $text
+}
+
 if (-not (Test-Path $envFile)) {
     Write-Error "$envFile not found. Copy .env.crm_relay.example to .env.crm_relay and fill it in."
 }
@@ -34,6 +57,7 @@ foreach ($line in Get-Content $envFile -Encoding UTF8) {
 }
 
 if (-not $env:CRM_RELAY_TOKEN) {
+    Say "FATAL: CRM_RELAY_TOKEN is empty in $envFile."
     Write-Error "CRM_RELAY_TOKEN is empty in $envFile. Generate one with: python -c ""import secrets; print(secrets.token_urlsafe(32))"""
 }
 
@@ -43,16 +67,16 @@ if (-not $env:CRM_RELAY_TOKEN) {
 $crmBase = if ($env:CRM_BASE_URL) { $env:CRM_BASE_URL } else { "http://127.0.0.1:8765" }
 try {
     $null = Invoke-WebRequest "$crmBase/" -TimeoutSec 3 -UseBasicParsing -ErrorAction Stop
-    Write-Host "CRM: reachable at $crmBase"
+    Say "CRM: reachable at $crmBase"
 } catch {
-    Write-Warning "CRM did not answer at $crmBase. Start it (起動.bat) or fix CRM_BASE_URL."
+    Say "WARNING: CRM did not answer at $crmBase. Start it (起動.bat) or fix CRM_BASE_URL."
 }
 
 $addresses = (Get-NetIPAddress -AddressFamily IPv4 |
     Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
     Select-Object -ExpandProperty IPAddress) -join ", "
-Write-Host "This PC's addresses: $addresses"
-Write-Host "The gateway's CRM_RELAY_URL must point at the tailnet one."
+Say "This PC's addresses: $addresses"
+Say "The gateway's CRM_RELAY_URL must point at the tailnet one."
 
 Set-Location $firmwareDir
 
@@ -73,9 +97,10 @@ foreach ($candidate in $pythonCandidates) {
     if ((& $candidate -c "print('OK')" 2>$null) -contains 'OK') { $python = $candidate; break }
 }
 if (-not $python) {
+    Say "FATAL: no working python.exe found on PATH. Install Python or set TACHIKOMA_PYTHON."
     Write-Error "No working python.exe found on PATH. Install Python or set TACHIKOMA_PYTHON."
 }
-Write-Host "python: $python"
+Say "python: $python"
 
 # The configuration checks above should stop the launcher; a line on the
 # server's stderr should not (PowerShell turns native stderr into an

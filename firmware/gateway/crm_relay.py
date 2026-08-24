@@ -59,6 +59,11 @@ import urllib.error
 import urllib.parse
 import urllib.request
 
+try:  # package import under the tests, plain when run as a script
+    from . import logfile
+except ImportError:  # pragma: no cover - depends on how it is started
+    import logfile
+
 # Where the CRM lives. Today that is this same PC; when it moves to the NAS
 # this one value changes and nothing else here does. That is the whole point
 # of routing through a setting rather than assuming co-location -- being on
@@ -353,7 +358,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.log_message("%s -> %s", urllib.parse.urlparse(self.path).path, code)
 
     def log_message(self, fmt, *args):
-        sys.stderr.write("[crm_relay] " + (fmt % args) + "\n")
+        # Stamped like the forwarder's lines: these two services now write
+        # into files read the same way, and a stamp is what makes a log
+        # able to answer "when".
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        sys.stderr.write(f"[{stamp}] crm_relay " + (fmt % args) + "\n")
 
 
 class _SingleInstanceServer(http.server.ThreadingHTTPServer):
@@ -373,15 +382,38 @@ class _SingleInstanceServer(http.server.ThreadingHTTPServer):
 
     allow_reuse_address = False
 
+    def handle_error(self, request, client_address) -> None:
+        """One line for a dropped connection, not ten of traceback.
+
+        Same fault and same fix as forwarder.py, which this file's own log
+        demonstrated within a minute of being made readable: one health
+        check from a client that closed early left a full traceback behind.
+        Kept as a copy rather than shared, because each local service here
+        owns its server class already; a fourth would be the moment to pull
+        them together.
+
+        Only the three ways a peer can vanish are quietened. Everything
+        else still prints in full: a log that hides real faults would be
+        worse than a log nobody can read.
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError)):
+            return
+        super().handle_error(request, client_address)
+
 
 def main():
+    logfile.install()   # before anything is said, so nothing is said elsewhere
     if not RELAY_TOKEN:
         sys.exit("CRM_RELAY_TOKEN is not set. This process listens on the tailnet "
                  "and would otherwise serve customer lookups to anyone who can "
                  "reach this PC. Put it in gateway/.env.crm_relay.")
 
-    print(f"Tachikoma CRM relay listening on {HOST}:{PORT} -> {CRM_BASE_URL}")
-    print("the gateway reaches this over Tailscale; the CRM is reached from this PC")
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+    print(f"[{stamp}] Tachikoma CRM relay listening on {HOST}:{PORT} -> {CRM_BASE_URL}")
+    print(f"[{stamp}] the gateway reaches this over Tailscale; "
+          f"the CRM is reached from this PC")
     server = _SingleInstanceServer((HOST, PORT), Handler)
     try:
         server.serve_forever()

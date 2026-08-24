@@ -10,11 +10,40 @@
 # the LAN address belongs to the other site's network and means nothing here.
 # Settings come from gateway\.env.forwarder if present, so the office PC needs
 # no API keys and no DEVICE_TOKEN -- it never reads what it carries.
+#
+# TACHIKOMA_LOG_FILE, if set, is where this and the server both write. The
+# scheduled task sets it; run it by hand and everything goes to the console
+# as before.
 
 $ErrorActionPreference = "Stop"
 $gatewayDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $firmwareDir = Split-Path -Parent $gatewayDir
 $envFile = Join-Path $gatewayDir ".env.forwarder"
+
+# The launcher's own lines belong in the same file the server writes, so
+# that "why is the office body silent" is one grep and not two. They cannot
+# go through PowerShell's `*>>`, which writes UTF-16 and made forwarder.log
+# unreadable to grep, tail and Python all at once (2026-08-24). Appended as
+# UTF-8 without a BOM instead: the server put one at the head already.
+function Say([string]$text) {
+    if ($env:TACHIKOMA_LOG_FILE) {
+        $stamp = Get-Date -Format "yyyy-MM-ddTHH:mm:ss"
+        # Add-Content, not [System.IO.File]::AppendAllText: a script calling
+        # .NET to write files is a shape behaviour-monitoring antivirus
+        # flags, and Avast blocked this very file for it on 2026-08-24
+        # (IDP.Generic). The cmdlet does the same job and looks like what it
+        # is. -Encoding UTF8 adds a BOM only when creating the file; the
+        # server writes one too and skips it when the file already exists.
+        try {
+            Add-Content -Path $env:TACHIKOMA_LOG_FILE -Value "[$stamp] $text" `
+                        -Encoding UTF8 -ErrorAction Stop
+            return
+        } catch {
+            # Fall through to the console rather than lose the line.
+        }
+    }
+    Write-Host $text
+}
 
 if (Test-Path $envFile) {
     # -Encoding UTF8: PS 5.1 reads a BOM-less file as ANSI, which turns the
@@ -32,6 +61,10 @@ if (Test-Path $envFile) {
 }
 
 if (-not $env:FORWARDER_TARGET) {
+    # Said into the log as well: a launcher that dies of a bad setting
+    # under the scheduled task would otherwise leave nothing behind, and
+    # the only visible symptom is a robot that never answers.
+    Say "FATAL: FORWARDER_TARGET is not set. Put it in $envFile, e.g. FORWARDER_TARGET=http://100.x.y.z:8080"
     Write-Error "FORWARDER_TARGET is not set. Put it in $envFile, e.g. FORWARDER_TARGET=http://100.x.y.z:8080"
 }
 
@@ -41,20 +74,20 @@ $tailscale = "C:\Program Files\Tailscale\tailscale.exe"
 if (Test-Path $tailscale) {
     $status = & $tailscale status 2>$null | Select-Object -First 1
     if ($LASTEXITCODE -ne 0) {
-        Write-Warning "Tailscale is installed but not logged in. Run 'tailscale up' and open the URL it prints."
+        Say "WARNING: Tailscale is installed but not logged in. Run 'tailscale up' and open the URL it prints."
     } else {
-        Write-Host "Tailscale: $status"
+        Say "Tailscale: $status"
     }
 } else {
-    Write-Warning "Tailscale not found at $tailscale. The target address will not resolve without it."
+    Say "WARNING: Tailscale not found at $tailscale. The target address will not resolve without it."
 }
 
 $addresses = (Get-NetIPAddress -AddressFamily IPv4 |
     Where-Object { $_.IPAddress -notlike '127.*' -and $_.IPAddress -notlike '169.254.*' } |
     Select-Object -ExpandProperty IPAddress) -join ", "
-Write-Host "This PC's addresses: $addresses"
-Write-Host "The robot's provisioned gateway URL must point at one of these."
-Write-Host "Forwarding to: $env:FORWARDER_TARGET"
+Say "This PC's addresses: $addresses"
+Say "The robot's provisioned gateway URL must point at one of these."
+Say "Forwarding to: $env:FORWARDER_TARGET"
 
 Set-Location $firmwareDir
 
@@ -75,9 +108,10 @@ foreach ($candidate in $pythonCandidates) {
     if ((& $candidate -c "print('OK')" 2>$null) -contains 'OK') { $python = $candidate; break }
 }
 if (-not $python) {
+    Say "FATAL: no working python.exe found on PATH. Install Python or set TACHIKOMA_PYTHON."
     Write-Error "No working python.exe found on PATH. Install Python or set TACHIKOMA_PYTHON."
 }
-Write-Host "python: $python"
+Say "python: $python"
 
 # The configuration checks above should stop the launcher; a line on the
 # server's stderr should not (PowerShell turns native stderr into an

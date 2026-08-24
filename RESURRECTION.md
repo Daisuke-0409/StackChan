@@ -70,15 +70,27 @@ VOICEVOX Engine を入れて 50021 で起動する状態にする（音声合成
 
 以下を登録（Enable-ScheduledTask で有効化。schtasks /enable は効かない事例あり）:
 
-- Tachikoma Gateway → firmware\gatewayun_gateway.ps1
+- Tachikoma Gateway → firmware\gateway\run_gateway.ps1
 - VOICEVOX Engine (Tachikoma)
-- Tachikoma Order Agent → orderagentun_orderagent.ps1
-- Tachikoma Local STT → firmware\gatewayun_local_stt.ps1
+- Tachikoma Order Agent → orderagent\run_orderagent.ps1
+- Tachikoma Local STT → firmware\gateway\run_local_stt.ps1
 - Even Terminal (Tachikoma) / Even Terminal Codex (Tachikoma)
 - **Tachikoma Health Check** → self_check.ps1 -Repair を5分毎
   （onlogonでなく繰り返しトリガ。他タスクの死活監視と自動再起動。
   これだけは最初に登録すると、残りの起動忘れも拾ってくれる）
 - (会社PCのみ) Tachikoma Forwarder / Tachikoma CRM Relay
+
+タスクの起動行は `powershell.exe -NoProfile -WindowStyle Hidden
+-ExecutionPolicy Bypass -Command "& powershell -NoProfile -ExecutionPolicy
+Bypass -File '<script>' *>> '<name>_launch.log'"`。
+**この形から不用意に離れないこと** — 環境変数をここに書き足したら
+ウイルス対策が遮断した (2026-08-24、OPERATIONS.md の失敗台帳)。
+設定は `.env.*` に置く。
+
+サービス自身のログは `TACHIKOMA_LOG_FILE` を `.env.forwarder` /
+`.env.crm_relay` に書いて指定する (例: `TACHIKOMA_LOG_FILE=C:\Users\user\tachikoma\logs\forwarder.log`)。
+未設定なら画面に出るだけなので、手で動かすときはそのままでいい。
+`*_launch.log` のほうは起動に失敗したときの受け皿で、普段はほぼ空。
 
 ## 8. Tailscale serve（メガネ・スマホ・外出先アクセス）
 

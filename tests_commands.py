@@ -61,6 +61,52 @@ def _files():
         yield path
 
 
+class NoStrayControlCharactersTest(unittest.TestCase):
+    """A path with a control character inside it is not a path.
+
+    RESURRECTION.md carried three of these for weeks:
+
+        Tachikoma Gateway -> firmware\\gateway<CR>un_gateway.ps1
+
+    A backslash-r written into a Windows path became a real carriage
+    return, and a terminal draws that by going back to the start of the
+    line -- so the damage reads as "gatewayun_gateway.ps1" and looks like
+    a typo rather than corruption. The rebuild document is exactly the
+    place where nobody would notice until they needed it. The same escape
+    has bitten a Tailscale path (\\t), a test file (\\x00) and a docstring
+    (\\U) in this repository already; this is the cheap net under all of
+    them.
+    """
+
+    def test_no_line_carries_a_control_character_inside_it(self):
+        offenders = []
+        for path in _files():
+            try:
+                # newline="" keeps the line endings intact, which is the
+                # whole point here; Path.read_text has no such argument.
+                with path.open(encoding="utf-8-sig", newline="") as handle:
+                    text = handle.read()
+            except (UnicodeDecodeError, OSError):
+                continue
+            # Split on the real line breaks first, so that CRLF endings --
+            # which are correct and everywhere on this machine -- are gone
+            # before anything left over is judged.
+            for number, line in enumerate(text.replace("\r\n", "\n").split("\n"),
+                                          start=1):
+                stray = {character for character in line
+                         if ord(character) < 32 and character != "\t"}
+                if stray:
+                    names = ", ".join(f"U+{ord(c):04X}" for c in sorted(stray))
+                    offenders.append(
+                        f"{path.relative_to(REPO)}:{number}  {names}")
+
+        self.assertEqual(
+            offenders, [],
+            "行の途中に制御文字が入っている。パスを書くときに "
+            r"\r や \t が本物の文字になったもの:" + "\n  "
+            + "\n  ".join(offenders))
+
+
 class LaunchCommandsRunTest(unittest.TestCase):
     def test_every_written_powershell_command_says_bypass(self):
         offenders = []

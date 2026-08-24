@@ -809,7 +809,7 @@ class SttRequestTests(unittest.TestCase):
 
     def test_a_plain_http_recogniser_elsewhere_is_refused(self):
         status, _ = server._stt_response(
-            b"", 16000,
+            bytes([1, 2]), 16000,
             {"STT_PROVIDER": "openai", "STT_PROVIDER_URL": "http://192.168.11.5/x",
              "STT_PROVIDER_API_KEY": "k"})
         self.assertEqual(status, 503)

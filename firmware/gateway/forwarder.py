@@ -37,6 +37,11 @@ import urllib.error
 import urllib.request
 from typing import Optional
 
+try:  # package import under the tests, plain when run as a script
+    from . import logfile
+except ImportError:  # pragma: no cover - depends on how it is started
+    import logfile
+
 TARGET = os.environ.get("FORWARDER_TARGET", "").rstrip("/")
 HOST = os.environ.get("FORWARDER_HOST", "0.0.0.0")
 PORT = int(os.environ.get("FORWARDER_PORT", "8080"))
@@ -61,7 +66,7 @@ _SKIP_RESPONSE_HEADERS = {"connection", "content-length", "keep-alive",
                           "transfer-encoding", "upgrade", "server", "date"}
 
 _stats_lock = threading.Lock()
-_stats = {"polls": 0, "forwarded": 0, "failed": 0}
+_stats = {"polls": 0, "forwarded": 0, "failed": 0, "dropped": 0}
 _last_summary = time.time()
 
 
@@ -85,9 +90,14 @@ def _summarise_if_due() -> None:
         if time.time() - _last_summary < 60:
             return
         _last_summary = time.time()
-        polls, forwarded, failed = _stats["polls"], _stats["forwarded"], _stats["failed"]
-        _stats.update(polls=0, forwarded=0, failed=0)
-    _log(f"forwarder 60s summary: speech_polls={polls} other={forwarded} failed={failed}")
+        polls, forwarded = _stats["polls"], _stats["forwarded"]
+        failed, dropped = _stats["failed"], _stats["dropped"]
+        _stats.update(polls=0, forwarded=0, failed=0, dropped=0)
+    # dropped is counted rather than merely swallowed: a connection the
+    # device closed early is routine, but a sudden pile of them is the
+    # shape of a robot that has started giving up on every reply.
+    _log(f"forwarder 60s summary: speech_polls={polls} other={forwarded} "
+         f"failed={failed} dropped={dropped}")
 
 
 class Handler(http.server.BaseHTTPRequestHandler):
@@ -214,8 +224,30 @@ class _SingleInstanceServer(http.server.ThreadingHTTPServer):
 
     allow_reuse_address = False
 
+    def handle_error(self, request, client_address) -> None:
+        """One counted line for a dropped connection, not ten of traceback.
+
+        The device hangs up on a reply it has waited too long for and asks
+        again; _respond already treats that as routine on the way out. On
+        the way in it was not handled at all, so ThreadingHTTPServer printed
+        its default traceback -- which came to 62% of a 73MB log, and buried
+        the entries that say what actually happened.
+
+        Only the three ways a peer can vanish are quietened. Everything else
+        still prints in full: a log that hides real faults would be worse
+        than a log nobody can read.
+        """
+        exc = sys.exc_info()[1]
+        if isinstance(exc, (ConnectionResetError, ConnectionAbortedError,
+                            BrokenPipeError)):
+            with _stats_lock:
+                _stats["dropped"] += 1
+            return
+        super().handle_error(request, client_address)
+
 
 def main() -> int:
+    logfile.install()   # before anything is said, so nothing is said elsewhere
     if not TARGET:
         print("FORWARDER_TARGET is not set, e.g. http://100.x.y.z:8080", file=sys.stderr)
         return 2

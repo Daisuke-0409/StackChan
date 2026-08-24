@@ -233,8 +233,7 @@ tailscale file get .
 # 2. ローカル音声認識器を入れる (聞き取りの弱さへの本命)
 pip install faster-whisper
 copy firmware\gateway\.env.local_stt.example firmware\gateway\.env.local_stt
-powershell -ExecutionPolicy Bypass -File firmware\gateway
-un_local_stt.ps1
+powershell -ExecutionPolicy Bypass -File firmware\gateway\run_local_stt.ps1
 #    初回はモデルのダウンロードがある
 
 # 3. ゲートウェイを繋ぎ替える (.env に3行)
