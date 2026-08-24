@@ -250,6 +250,41 @@ Error に落ち、`error_ms` = 4000 のあいだ**何も聞けなくなる**。
 (それは `Thinking` へ行く事象で、**`Thinking` からは返事かタイムアウトでしか
 出られない**)。代わりに `SpeechFinished` で `Listening` から `Idle` へ戻る。
 
+### 全部緑なのに機体が無言なら、ネットワークの分類を見る (2026-08-24)
+
+会社の体が **16時間半** 無言だった。その間ずっと `self_check.ps1` は全項目 OK で、
+`healthz` も `Head` も 200 を返していた。**このPCは健康で、扉が閉まっていた。**
+
+起きたこと: ネットワークが一度リセットされ (WSL のアダプタ番号も変わった)、
+Windows が会社の Wi-Fi を **Public に再分類**した。8080 を通す規則はすべて
+**Private 限定**なので適用されなくなり、機体からの接続だけが静かに落ちた。
+
+**機体側は正常**だった。WiFi も繋がっていて、15秒ごとに諦めずポーリングしていた:
+
+```
+E esp-tls: [sock=54] select() timeout
+E HTTP_CLIENT: Connection failed, sock < 0
+[SpeechAnnouncer] speech queue poll failed
+```
+
+**直し方** (管理者の PowerShell。元に戻すだけ):
+
+```powershell
+Set-NetConnectionProfile -InterfaceAlias 'Wi-Fi' -NetworkCategory Private
+```
+
+規則の側に Public を足すのは**勧めない**。このPCがどんな公衆ネットワークに
+繋がっても 8080 が開くことになり、範囲が広すぎる。
+
+**`self_check.ps1` がこれを見るようになった** (2026-08-24 に追加):
+
+- LAN 側の接続が Public に分類されていないか
+- 転送役のログが止まっていないか。**要求が来たときだけ書く作りなので、
+  ログが黙っていること自体が「機体が届いていない」の信号になる**
+
+**`-Repair` でも直さない。**ネットワークの分類とファイアウォールはこのPCの
+セキュリティ設定で、点検表が黙って広げていいものではない。人に言って、人が直す。
+
 | 罠 | 内容 |
 |---|---|
 | `pdMS_TO_TICKS(N)` | `CONFIG_FREERTOS_HZ=100` (10ms tick) では `pdMS_TO_TICKS(5)` が整数除算で **0** になり、`vTaskDelay(0)` = yield のみになる。優先度8・core0固定でidleタスクを枯渇させ、10秒でウォッチドッグを踏んだ |

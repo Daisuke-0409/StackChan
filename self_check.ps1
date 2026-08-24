@@ -106,6 +106,58 @@ if ($isOffice) {
     }
 }
 
+# --- 機体からこのPCへ届くか -------------------------------------------------
+# ここまでの検査は全部「このPCから見て」で、それだけでは足りない。2026-08-24 に
+# 全部緑のまま機体が3時間45分無言だった。原因はネットワークの再分類で、Windows が
+# 会社の Wi-Fi を Public に付け替え、8080 を通す規則が Private 限定だったため、
+# 機体からの接続だけが静かに落とされていた。PC は健康で、扉が閉まっていた。
+$lanIp = if ($isOffice) { "192.168.11.200" } else { "192.168.2.120" }
+$lanAlias = (Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue |
+             Where-Object { $_.IPAddress -eq $lanIp } |
+             Select-Object -First 1 -ExpandProperty InterfaceAlias)
+if ($lanAlias) {
+    $category = (Get-NetConnectionProfile -InterfaceAlias $lanAlias `
+                 -ErrorAction SilentlyContinue).NetworkCategory
+    if ($category -eq "Public") {
+        Write-Output "$now [DEAD] Network    $lanAlias が Public に分類されている。機体からの接続は落とされる"
+        Write-Output "$now [....] Network    管理者の PowerShell で戻す: Set-NetConnectionProfile -InterfaceAlias '$lanAlias' -NetworkCategory Private"
+        $allRequiredUp = $false
+        # -Repair でも直さない。ネットワークの分類とファイアウォールは
+        # このPCのセキュリティ設定で、点検表が黙って広げていいものではない。
+    } elseif ($category) {
+        Write-Output "$now [OK]   Network    $lanAlias は $category"
+    }
+}
+
+# 機体が実際にポーリングしているか。転送役は要求が来たときだけ書くので、
+# **ログが止まっていること自体が信号**になる (毎分1行の要約が出るはずなので)。
+if ($isOffice) {
+    $fwdLog = ""
+    $envFile = Join-Path $PSScriptRoot "firmware\gateway\.env.forwarder"
+    if (Test-Path $envFile) {
+        foreach ($line in Get-Content $envFile -Encoding UTF8) {
+            if ($line.Trim().StartsWith("TACHIKOMA_LOG_FILE=")) {
+                $fwdLog = $line.Trim().Substring(19).Trim().Trim('"')
+            }
+        }
+    }
+    if ($fwdLog -and (Test-Path $fwdLog)) {
+        $age = ((Get-Date) - (Get-Item $fwdLog).LastWriteTime).TotalMinutes
+        $lastSummary = Get-Content $fwdLog -Encoding UTF8 -Tail 40 -ErrorAction SilentlyContinue |
+                       Select-String -Pattern 'speech_polls=(\d+)' | Select-Object -Last 1
+        $polls = if ($lastSummary) { [int]$lastSummary.Matches[0].Groups[1].Value } else { -1 }
+        if ($age -gt 3) {
+            Write-Output ("$now [DEAD] Robot      転送役のログが {0:N0} 分止まっている。機体が届いていない" -f $age)
+            $allRequiredUp = $false
+        } elseif ($polls -eq 0) {
+            Write-Output "$now [DEAD] Robot      直近1分の speech_polls=0。機体が届いていない"
+            $allRequiredUp = $false
+        } elseif ($polls -gt 0) {
+            Write-Output "$now [OK]   Robot      機体は届いている (直近1分で $polls 回)"
+        }
+    }
+}
+
 foreach ($svc in $services) {
     $portUp = $false
     if ($null -ne $svc.Port) {
