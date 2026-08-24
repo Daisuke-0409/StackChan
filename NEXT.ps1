@@ -61,9 +61,26 @@ if ($dirty) { Need "保存していない変更がある" "git status" }
 if ($isOffice) {
     # --- 会社でやること ---------------------------------------------------
     $cache = Join-Path $root "firmware\build\CMakeCache.txt"
-    if (Test-Path $cache) {
-        Ok "会社の機体のトークンはこの機械にある"
-        Need "家に送る (まだなら)" "powershell -ExecutionPolicy Bypass -File firmware\gateway\copy_device_token.ps1 -SendTo oo"
+    if (Test-Path $cache) { Ok "会社の機体のトークンはこの機械にある" }
+
+    # 「トークンを家に送ったか」は、送った側では分からない。分かるのは結果の
+    # ほうで、/v1/chat と /v1/transcribe は認証が要るから、そこに 200 が出て
+    # いれば家の頭がこの機体を受け入れている。転送役のログがその証拠になる。
+    $fwdLog = (Read-Env (Join-Path $gateway ".env.forwarder"))["TACHIKOMA_LOG_FILE"]
+    $talked = $false
+    if ($fwdLog -and (Test-Path $fwdLog)) {
+        $talked = $null -ne (Get-Content $fwdLog -Encoding UTF8 -Tail 3000 -ErrorAction SilentlyContinue |
+                             Select-String -Pattern '(/v1/chat|/v1/transcribe) -> 200' |
+                             Select-Object -First 1)
+    }
+    if ($talked) {
+        Ok "会社の体は家の頭と会話できている (トークンは届いている)"
+    } else {
+        Need "会社の機体のトークンを家に送る" @"
+powershell -ExecutionPolicy Bypass -File firmware\gateway\copy_device_token.ps1 -SendTo oo
+  家で受け取る: tailscale file get .
+  (会話の記録がログに無いだけかもしれない。一度話しかけてから見直すこと)
+"@
     }
     foreach ($t in @("Tachikoma Forwarder", "Tachikoma CRM Relay")) {
         $state = (Get-ScheduledTask -TaskName $t -ErrorAction SilentlyContinue).State
@@ -136,6 +153,30 @@ firmware\gateway\.env の STT_VOCABULARY を15語くらいに:
     # 3. CRM
     if ($conf["CRM_RELAY_TOKEN"]) { Ok "CRM の合言葉は入っている" }
     else { Need "CRM を引けるようにする" "powershell -ExecutionPolicy Bypass -File firmware\gateway\setup_crm_relay_token.ps1" }
+
+    # 「モニターに出して」は、どの体に話しかけたかで画面を選ぶ。会社の機体の
+    # 番号を教えていないと、会社で話しかけたのに家の画面に出る = 誰も見ていない
+    # 画面に顧客カルテを開く、という一番まずい形になる。
+    if ($conf["CRM_OFFICE_DEVICE_IDS"]) {
+        Ok "会社の体に話しかけたら会社の画面に出る設定がある"
+    } elseif ($conf["CRM_RELAY_TOKEN"]) {
+        Need "「モニターに出して」の行き先を教える" @"
+firmware\gateway\.env に1行:
+  CRM_OFFICE_DEVICE_IDS=80456B4DE7AC
+これが無いと、会社で話しかけても家の画面にカルテが開く
+(誰も見ていない画面に顧客情報を出すことになる)
+"@
+    }
+
+    if ($conf["CRM_RELAY_URL"] -and $conf["CRM_RELAY_URL"] -notmatch "127\.0\.0\.1|localhost") {
+        Ok "CRM の宛先は tailnet を向いている"
+    } elseif ($conf["CRM_RELAY_TOKEN"]) {
+        Need "CRM の宛先を会社の tailnet アドレスにする" @"
+firmware\gateway\.env:
+  CRM_RELAY_URL=http://100.76.60.88:8767
+127.0.0.1 のままだと、家の画面に出すリンクが家からは開けない形になる
+"@
+    }
 
     $gw = (Get-ScheduledTask -TaskName "Tachikoma Gateway" -ErrorAction SilentlyContinue)
     if ($gw -and $gw.State -eq "Disabled") {
