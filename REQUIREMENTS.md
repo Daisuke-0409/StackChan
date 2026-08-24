@@ -29,7 +29,7 @@ Even G2・会社システムなど複数の入口からアクセスする。
 ## 0.2 検証環境
 
 - ゲートウェイログ: `C:\Users\mylit\StackChanDev\logs\gateway.log`（自動起動タスクが追記）
-- 実機シリアル: `capture_boot.py` 方式（dtr/rts=False で開く。**実行中0バイトに見えるのは正常**、終了時に書き出される）
+- 実機シリアル: `firmware/tools/capture_serial.py` 方式（dtr/rts=False で開く。**実行中0バイトに見えるのは正常**、終了時に書き出される）
 - 自動起動タスク: `Tachikoma Gateway` / `VOICEVOX Engine (Tachikoma)`（ともにログオン時）
 - テスト: リポジトリ直下で `powershell -ExecutionPolicy Bypass -File run_tests.ps1`（全スイート・件数も表示）
   個別に走らせたいときの呼び方は run_tests.ps1 の中に書いてある。

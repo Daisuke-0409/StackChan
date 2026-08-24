@@ -857,16 +857,40 @@ void VoiceInputController::StopRecordingAndUpload(uint32_t now)
     // call to a corresponding pause -- can't leave AudioService paused
     // after some early-return path forgets to undo it.
     Application::GetInstance().GetAudioService().SetAudioInputPaused(false);
-    tachikoma_state::GetTachikomaStateManager().Notify(tachikoma_state::TachikomaEvent::UserSpeechEnded);
 
     if (!MeetsMinimumDuration(duration_ms, kMinRecordingMs) || pcm.empty()) {
         {
             std::lock_guard<std::mutex> lock(mutex_);
             last_error_ = VoiceInputErrorCode::RecordingTooShort;
         }
-        tachikoma_state::GetTachikomaStateManager().Notify(tachikoma_state::TachikomaEvent::AiRequestFailed);
+        // A recording too brief to send is not a failed request: nothing was
+        // requested. Announcing AiRequestFailed put the machine into Error
+        // for four seconds, and the robot hears nothing while it is there --
+        // so a chair scrape or the first syllable of a sentence would eat
+        // whatever the person said next. Observed on the office body on
+        // 2026-08-24: a 400ms trigger, no upload, Error until it timed out.
+        //
+        // FollowUpTick already reached this conclusion for its own
+        // too-short case and said so: "AiRequestFailed would work too but
+        // routes through Error, which is far too much ceremony for a
+        // cough." The same reasoning applies here; only one of the two
+        // paths had it.
+        //
+        // {Listening, SpeechFinished, Idle} is the rule that leaves
+        // Listening without having produced anything, which is exactly what
+        // happened. It has to be told *instead of* UserSpeechEnded rather
+        // than after it: that event moves the machine to Thinking, and
+        // Thinking has no exit but a reply or a timeout.
+        //
+        // The cost is that tapping the head and saying nothing is now
+        // silent rather than showing an error face. Silent and listening
+        // beats expressive and deaf, and last_error_ still records it.
+        tachikoma_state::GetTachikomaStateManager().Notify(
+            tachikoma_state::TachikomaEvent::SpeechFinished);
         return;
     }
+
+    tachikoma_state::GetTachikomaStateManager().Notify(tachikoma_state::TachikomaEvent::UserSpeechEnded);
 
     const auto config = LoadConfig();
     uint32_t generation = 0;
